@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harnesscreator"
+version = "0.1.0"
+description = "Evidence-driven fuzz harness discovery, generation, and verification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "HarnessCreator contributors"}]
+dependencies = [
+  "PyYAML>=5.4",
+  # QuartetFuzz's OSS-Fuzz build/run adapter streams Docker output through
+  # rich.  Declare it here so the default backend also works in a clean
+  # HarnessCreator installation instead of depending on the developer venv.
+  "rich>=13.0",
+  "fuzz-introspector @ git+https://github.com/ossf/fuzz-introspector.git@8bc858d7dd66f390e5bbd38c44d31fce41b72103#subdirectory=src",
+]
+
+[project.scripts]
+harnesscreator = "harnesscreator.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+harnesscreator = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
