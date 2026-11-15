@@ -1,0 +1,60 @@
+{
+  "kind": "FBV2_MD4C_UAF_INSTRUMENTATION_BUILD_SPEC_V1",
+  "status": "PREFLIGHT_ONLY_NOT_BUILT_NOT_EXECUTED",
+  "created_date": "2026-11-05",
+  "upstream_revision": "fb83eb2bedcf730bc721ab91b07c80d011cbe38f",
+  "source_root": "/home/dawne/work/SunrinInfosecProject2026/fbv2_md4c_workspace/repo",
+  "source_files": {
+    "src/md4c.c": "88cb055c808278098dec86089c566c3e232b5af758e1d7b5273323b167e4ed1f",
+    "src/md4c-html.c": "bf6f4f856e7352526c08b22916d1a840054b027a28f2b2a89482f50bf23e55b0",
+    "src/md4c.h": "c434777deef7e59d611b40319c391dfa436cfa592bd28c053ba688e90e140c72",
+    "src/md4c-html.h": "6a045ecec5d8cf17a771654a31af06641df195d7ea8486a140a121b6c6e0191f",
+    "test/fuzzers/fuzz-mdhtml.c": "55363f6787505ca61b50a028a1a7fdd14cfa71112953cbd02aa8d12e00261815"
+  },
+  "instrumentation": {
+    "patch_path": "devtools/md4c_uaf_trace_source.patch",
+    "patch_sha256": "a4e7aa07861ff98e6ecc39a890a5e85dac49ae2f48b2846f3c6787b0178a5cf4",
+    "header_path": "devtools/md4c_uaf_trace_hooks.h",
+    "header_sha256": "60fdb7f2e5a634caf17da72ce6b39ee0eace6de93a204fefec6f5e92f4d74bf6",
+    "emitter_path": "devtools/md4c_uaf_trace_emitter.py",
+    "emitter_sha256": "ee5823a2c707e261329b0fac30e9a6f55e76a42ef20f81121b861a1380bc1f0c",
+    "compile_definition": "FBV2_UAF_CAUSAL_TRACE=1"
+  },
+  "original_asan_binary": {
+    "path": "/home/dawne/work/SunrinInfosecProject2026/fbv2_md4c_workspace/.fbv2_prebuilt/e7a7a6106febf46595ced79b2ce8abe391ff5e7457859aab9a91d1bb7e270fec/binaries/address/fuzz-mdhtml",
+    "sha256": "4b75a6c4e8ace630d9db101592a84d68145448090ba824abc9d597fa8a759196"
+  },
+  "original_build_receipt": {
+    "path": "/home/dawne/SunrinInfosecProject2026/reference/blind2_v2_preparation_20261027/asan_v2_build_receipt_stage_draft.json",
+    "sha256": "160920e7f1177e2a2667470ac15bab3a35aa6e42088455e970e8b475fb8ebf29"
+  },
+  "proposed_toolchain": {
+    "cc": "/usr/local/bin/clang",
+    "cxx": "/usr/local/bin/clang++",
+    "required_flags": [
+      "-O1",
+      "-g",
+      "-fno-omit-frame-pointer",
+      "-fsanitize=address,fuzzer-no-link",
+      "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION",
+      "-DFBV2_UAF_CAUSAL_TRACE=1"
+    ],
+    "link_flags": [
+      "-fsanitize=fuzzer,address"
+    ],
+    "availability_in_current_shell": "NOT_AVAILABLE"
+  },
+  "preflight": {
+    "patch_apply": "PASS",
+    "instrumented_c_syntax_with_gcc13_werror": "PASS",
+    "asan_libfuzzer_binary_build": "NOT_RUN",
+    "target_replay": "NOT_RUN",
+    "gate_verdict": "NOT_RUN"
+  },
+  "future_output": {
+    "instrumented_binary_path": null,
+    "instrumented_binary_sha256": null,
+    "build_receipt_path": null,
+    "build_receipt_sha256": null
+  }
+}

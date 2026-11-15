@@ -1,0 +1,22 @@
+{
+  "kind": "HP_ASSUMPTION_LIFECYCLE_PROVENANCE_FIXTURE_V1",
+  "credit": "NONE_PROVIDER_FREE_POSITIVE_FIXTURE",
+  "source_archive": "FBV2_HP_PARSE_OBJECT_SAFE_ASSERTION_HANDOFF_FIX_V2_REVIEW_20261105.zip",
+  "source_archive_sha256": "07807fcfa83b708b33fa00a8558d4c2368b7ba67c8790cea52e5383d8d2cd5e8",
+  "function": "parse_object",
+  "final_function_analysis": {
+    "request_id": "0b4155c573344c4984028e6f546e06d2",
+    "response_sha256": "889f868599111b6148951187959fb90c2ad34d61e73d0d0917c0c6f17d6e4d6a"
+  },
+  "assertion_generator": {
+    "request_id": "00b95103502640f3901c01289e4f7c8f",
+    "response_sha256": "2c8c8abfc1155377e040796fc51fc2d93804b815f39c4bab35b7fa5c89e0dfe4"
+  },
+  "candidate": {
+    "safe_assumption": "At the transfer completed by line 1668, the successful key pointer is held in current_item->string and not in current_item->valuestring before any subsequent parser or cleanup operation executes.",
+    "source_location": "cJSON.c:1670",
+    "security_property": "single-owner key allocation after ownership transfer"
+  },
+  "runtime_expression": "(current_item != NULL) && (current_item->string != NULL) && (current_item->valuestring == NULL)",
+  "expected_disposition": "VALIDATED_SAFE"
+}

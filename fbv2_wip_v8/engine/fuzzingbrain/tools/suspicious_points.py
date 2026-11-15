@@ -1,0 +1,669 @@
+"""
+Suspicious Points Tools
+
+MCP tools for AI Agent to create, update, and query suspicious points.
+These tools use the same AnalysisClient context as analyzer tools.
+"""
+
+import json
+from contextvars import ContextVar
+from typing import Any, Dict, List, Optional, Tuple
+
+from loguru import logger
+
+from . import tools_mcp
+from .analyzer import _get_client, _ensure_client
+
+
+# =============================================================================
+# SP Context - Track harness_name and sanitizer for SP isolation
+# Using ContextVar for async task isolation (each asyncio.Task has its own context)
+# =============================================================================
+
+_sp_harness_name: ContextVar[Optional[str]] = ContextVar(
+    "sp_harness_name", default=None
+)
+_sp_sanitizer: ContextVar[Optional[str]] = ContextVar("sp_sanitizer", default=None)
+_sp_direction_id: ContextVar[Optional[str]] = ContextVar(
+    "sp_direction_id", default=None
+)
+_sp_agent_id: ContextVar[Optional[str]] = ContextVar("sp_agent_id", default=None)
+_sp_verification_claim_token: ContextVar[Optional[str]] = ContextVar(
+    "sp_verification_claim_token", default=None)
+_sp_pov_admission_mode: ContextVar[Optional[str]] = ContextVar(
+    "sp_pov_admission_mode", default=None)
+POV_ADMISSION_MODES = frozenset({"legacy_score", "explicit_disposition"})
+
+
+def set_sp_context(
+    harness_name: str,
+    sanitizer: str,
+    direction_id: str = "",
+    agent_id: str = "",
+) -> None:
+    """
+    Set the context for SP tools.
+
+    This should be called by each worker before running agents that create SPs.
+    SPs created will be tagged with this harness_name and sanitizer, ensuring
+    each worker only processes its own SPs.
+
+    Uses ContextVar for proper isolation in async/parallel execution.
+
+    Args:
+        harness_name: Fuzzer harness name (e.g., "fuzz_png")
+        sanitizer: Sanitizer type (e.g., "address")
+        direction_id: Direction ID for linking SP to direction
+        agent_id: Agent ObjectId for tracking SP creator/verifier
+    """
+    _sp_harness_name.set(harness_name)
+    _sp_sanitizer.set(sanitizer)
+    _sp_direction_id.set(direction_id)
+    _sp_agent_id.set(agent_id)
+    logger.debug(
+        f"SP context set: harness_name={harness_name}, sanitizer={sanitizer}, direction_id={direction_id}, agent_id={agent_id[:8] if agent_id else 'none'}"
+    )
+
+
+def get_sp_context() -> Tuple[
+    Optional[str], Optional[str], Optional[str], Optional[str]
+]:
+    """Get the current SP context (harness_name, sanitizer, direction_id, agent_id)."""
+    return (
+        _sp_harness_name.get(),
+        _sp_sanitizer.get(),
+        _sp_direction_id.get(),
+        _sp_agent_id.get(),
+    )
+
+
+def set_sp_verification_claim_token(claim_token: Optional[str]) -> None:
+    """Bind a trusted verifier lease capability to this async task.
+
+    The token is supplied by the worker after the atomic DB claim.  It is not
+    an MCP argument and must never be exposed in model-visible SP JSON.
+    """
+    _sp_verification_claim_token.set(claim_token)
+
+
+def get_sp_verification_claim_token() -> Optional[str]:
+    return _sp_verification_claim_token.get()
+
+
+def set_sp_pov_admission_mode(mode: Optional[str]):
+    """Bind the signed Verifier admission mode to this async task.
+
+    Returns the ContextVar token; the caller must reset it when the Verifier
+    turn ends so one agent's mode can never leak into another task.
+    """
+    if mode is not None and mode not in POV_ADMISSION_MODES:
+        raise ValueError("unknown PoV admission mode")
+    return _sp_pov_admission_mode.set(mode)
+
+
+def reset_sp_pov_admission_mode(token) -> None:
+    _sp_pov_admission_mode.reset(token)
+
+
+def get_sp_pov_admission_mode() -> Optional[str]:
+    return _sp_pov_admission_mode.get()
+
+
+def _admission_mode_error(is_checked: Any, disposition: Any
+                          ) -> Optional[Dict[str, Any]]:
+    """Reject a checked explicit-mode verdict without an enabled disposition.
+
+    This runs before any DB call: a checked verdict without one would be
+    persisted first and then stop the whole queue in the pipeline.
+    """
+    mode = get_sp_pov_admission_mode()
+    if mode is not None and mode not in POV_ADMISSION_MODES:
+        return {"success": False, "error": "unknown PoV admission mode"}
+    if (mode == "explicit_disposition" and is_checked is True and
+            disposition not in {"TESTABLE_UNCERTAIN", "SUPPORTED"}):
+        return {"success": False,
+                "error": ("verification_disposition is required with "
+                          "is_checked=True; use TESTABLE_UNCERTAIN when the "
+                          "evidence is not positive, otherwise SUPPORTED")}
+    return None
+
+
+def set_sp_agent_id(agent_id: str) -> None:
+    """
+    Set only the agent_id in SP context.
+
+    Called by agents on startup for tracking SP creator/verifier.
+    Does NOT touch direction_id — direction leak is prevented by
+    Layer 2 (guard in create_suspicious_point_impl) and
+    Layer 3 (SPVerifier/POVAgent don't have create_suspicious_point tool).
+
+    Args:
+        agent_id: Agent ObjectId for tracking SP creator/verifier
+    """
+    _sp_agent_id.set(agent_id)
+    logger.debug(f"SP agent_id set: {agent_id[:8] if agent_id else 'none'}")
+
+
+# Aliases for mcp_factory compatibility
+_get_sp_context = get_sp_context
+
+
+def _ensure_sp_context() -> Optional[Dict[str, Any]]:
+    """Ensure SP context is set, return error dict if not."""
+    harness_name, sanitizer, _, _ = get_sp_context()
+    if harness_name is None or sanitizer is None:
+        return {
+            "success": False,
+            "error": "SP context not set. Call set_sp_context() first.",
+        }
+    return None
+
+
+# =============================================================================
+# Suspicious Point Tools - Implementation Functions
+# =============================================================================
+
+
+def create_suspicious_point_impl(
+    function_name: str,
+    vuln_type: str,
+    description: str,
+    score: float = 0.5,
+    important_controlflow: List[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Implementation of create_suspicious_point (without MCP decorator)."""
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        harness_name, sanitizer, direction_id, agent_id = get_sp_context()
+        result = client.create_suspicious_point(
+            function_name=function_name,
+            description=description,
+            vuln_type=vuln_type,
+            score=score,
+            important_controlflow=important_controlflow or [],
+            harness_name=harness_name or "",
+            sanitizer=sanitizer or "",
+            direction_id=direction_id or "",
+            agent_id=agent_id or "",
+        )
+
+        merged = result.get("merged", False)
+        sp_id = result.get("id")
+
+        if merged:
+            logger.info(f"[MERGED SP] {sp_id[:8]} <- {function_name} ({vuln_type})")
+            return {"success": True, "merged": True, "id": sp_id}
+        else:
+            logger.info(
+                f"[NEW SP] {sp_id[:8]} -> {function_name} ({vuln_type}, score={score})"
+            )
+            return {"success": True, "created": True, "id": sp_id}
+    except (BrokenPipeError, ConnectionError, OSError) as e:
+        logger.warning(
+            f"SP creation skipped (connection closed, task may have ended): {type(e).__name__}"
+        )
+        return {"success": False, "error": "analyzer connection closed"}
+    except Exception as e:
+        logger.error(f"Failed to create suspicious point: {e}")
+        return {"success": False, "error": str(e)[:100]}
+
+
+def update_suspicious_point_impl(
+    suspicious_point_id: str,
+    score: float = None,
+    is_checked: bool = None,
+    is_real: bool = None,
+    is_important: bool = None,
+    verification_notes: str = None,
+    verification_disposition: str = None,
+    refutation_evidence: dict = None,
+    pov_guidance: str = None,
+    reachability_status: str = None,
+    reachability_multiplier: float = None,
+    reachability_reason: str = None,
+) -> Dict[str, Any]:
+    """Implementation of update_suspicious_point (without MCP decorator)."""
+    if is_real is not None and is_real is not False:
+        return {"success": False, "error": "Verifier cannot confirm a physical exploit; is_real must be False"}
+    if verification_disposition == "REFUTED":
+        return {
+            "success": False,
+            "error": "terminal REFUTED is disabled; use TESTABLE_UNCERTAIN",
+        }
+    if refutation_evidence is not None:
+        return {"success": False, "error": "refutation_evidence is disabled"}
+    dispositions = {"TESTABLE_UNCERTAIN", "SUPPORTED"}
+    if (verification_disposition is not None and
+            verification_disposition not in dispositions):
+        return {"success": False, "error": "invalid verification_disposition"}
+    mode_error = _admission_mode_error(is_checked, verification_disposition)
+    if mode_error is not None:
+        return mode_error
+    if ((is_important or verification_disposition in {
+            "TESTABLE_UNCERTAIN", "SUPPORTED"}) and not pov_guidance):
+        return {
+            "success": False,
+            "error": (
+                "pov_guidance is required for PoV-eligible dispositions "
+                "or when is_important=True"),
+        }
+
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        # Get agent_id from context for tracking verified_by_agent_id
+        _, _, _, agent_id = get_sp_context()
+        claim_token = get_sp_verification_claim_token()
+        result = client.update_suspicious_point(
+            sp_id=suspicious_point_id,
+            is_checked=is_checked,
+            is_real=is_real,
+            is_important=is_important,
+            score=score,
+            verification_notes=verification_notes,
+            verification_disposition=verification_disposition,
+            refutation_evidence=refutation_evidence,
+            pov_guidance=pov_guidance,
+            reachability_status=reachability_status,
+            reachability_multiplier=reachability_multiplier,
+            reachability_reason=reachability_reason,
+            agent_id=agent_id or "",  # Track which agent verified this SP
+            claim_token=claim_token or "",
+            pov_admission_mode=get_sp_pov_admission_mode() or "",
+        )
+
+        update_json = json.dumps(
+            {
+                "id": suspicious_point_id,
+                "is_checked": is_checked,
+                "is_real": is_real,
+                "is_important": is_important,
+                "score": score,
+                "verification_notes": verification_notes,
+                "verification_disposition": verification_disposition,
+                "refutation_evidence": refutation_evidence,
+                "pov_guidance": pov_guidance,
+            },
+            ensure_ascii=False,
+        )
+
+        updated = result.get("updated", False) if result else False
+        if updated:
+            logger.info(f"[UPDATE SUSPICIOUS POINT] {update_json}")
+        else:
+            logger.warning(
+                f"[UPDATE SUSPICIOUS POINT FAILED] Server returned: {result}"
+            )
+
+        return {"success": updated, "updated": updated, "server_result": result}
+    except Exception as e:
+        logger.error(f"Failed to update suspicious point: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def list_suspicious_points_impl(
+    filter_unchecked: bool = False,
+    filter_real: bool = False,
+    filter_important: bool = False,
+) -> Dict[str, Any]:
+    """Implementation of list_suspicious_points (without MCP decorator)."""
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        result = client.list_suspicious_points(
+            filter_unchecked=filter_unchecked,
+            filter_real=filter_real,
+            filter_important=filter_important,
+        )
+        return {
+            "success": True,
+            "suspicious_points": result.get("suspicious_points", []),
+            "count": result.get("count", 0),
+        }
+    except Exception as e:
+        logger.error(f"Failed to list suspicious points: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def get_suspicious_point_impl(suspicious_point_id: str) -> Dict[str, Any]:
+    """Implementation of get_suspicious_point (without MCP decorator)."""
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        result = client.get_suspicious_point(suspicious_point_id)
+        if result is None:
+            return {
+                "success": False,
+                "error": f"Suspicious point '{suspicious_point_id}' not found",
+            }
+        return {"success": True, "suspicious_point": result}
+    except Exception as e:
+        logger.error(f"Failed to get suspicious point: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# =============================================================================
+# Suspicious Point Tools - MCP Decorated
+# =============================================================================
+
+
+@tools_mcp.tool
+def create_suspicious_point(
+    function_name: str,
+    description: str,
+    vuln_type: str,
+    score: float = 0.5,
+    important_controlflow: List[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Create a new suspicious point when you identify a potential vulnerability.
+
+    Use control flow descriptions instead of line numbers.
+
+    Args:
+        function_name: The function containing the suspicious code
+        description: Detailed description of the potential vulnerability.
+                    Describe using control flow, not line numbers.
+                    Example: "The length parameter from user input flows into
+                    memcpy without bounds checking after the if-else branch"
+        vuln_type: Type of vulnerability. One of:
+            - buffer-overflow
+            - use-after-free
+            - integer-overflow
+            - null-pointer-dereference
+            - format-string
+            - double-free
+            - uninitialized-memory
+            - out-of-bounds-read
+            - out-of-bounds-write
+        score: Confidence score (0.0-1.0). Higher means more likely to be real.
+            - 0.8-1.0: Very confident, clear vulnerability pattern
+            - 0.5-0.8: Moderate confidence, needs verification
+            - 0.0-0.5: Low confidence, suspicious but uncertain
+        important_controlflow: List of related functions/variables that affect this bug.
+            Format: [{"type": "function"|"variable", "name": "xxx", "location": "description"}]
+
+    Returns:
+        {"success": True, "id": "xxx"} on success
+        {"success": False, "error": "..."} on failure
+    """
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        # Include harness_name, sanitizer, and agent_id from context
+        harness_name, sanitizer, direction_id, agent_id = get_sp_context()
+        result = client.create_suspicious_point(
+            function_name=function_name,
+            description=description,
+            vuln_type=vuln_type,
+            score=score,
+            important_controlflow=important_controlflow or [],
+            harness_name=harness_name or "",
+            sanitizer=sanitizer or "",
+            direction_id=direction_id or "",
+            agent_id=agent_id or "",
+        )
+
+        merged = result.get("merged", False)
+        sp_id = result.get("id")
+
+        if merged:
+            logger.info(f"[MERGED SP] {sp_id[:8]} <- {function_name} ({vuln_type})")
+            return {"success": True, "merged": True, "id": sp_id}
+        else:
+            logger.info(
+                f"[NEW SP] {sp_id[:8]} -> {function_name} ({vuln_type}, score={score})"
+            )
+            return {"success": True, "created": True, "id": sp_id}
+    except (BrokenPipeError, ConnectionError, OSError) as e:
+        logger.warning(
+            f"SP creation skipped (connection closed, task may have ended): {type(e).__name__}"
+        )
+        return {"success": False, "error": "analyzer connection closed"}
+    except Exception as e:
+        logger.error(f"Failed to create suspicious point: {e}")
+        return {"success": False, "error": str(e)[:100]}
+
+
+@tools_mcp.tool
+def update_suspicious_point(
+    suspicious_point_id: str,
+    is_checked: bool = None,
+    is_real: bool = None,
+    is_important: bool = None,
+    score: float = None,
+    verification_notes: str = None,
+    verification_disposition: str = None,
+    refutation_evidence: dict = None,
+    pov_guidance: str = None,
+) -> Dict[str, Any]:
+    """
+    Update a suspicious point after verification.
+
+    Call this after analyzing a suspicious point to mark it as verified.
+
+    Args:
+        suspicious_point_id: The ID of the suspicious point to update
+        is_checked: Set to True when verification is complete
+        is_real: Exploit-confirmed state. The SP Verifier leaves this False;
+            successful physical PoV validation is required before it can become True.
+        is_important: Set to True if this is a high-priority vulnerability (will proceed to POV)
+        score: Updated confidence score based on analysis
+        verification_notes: Notes explaining the verification result.
+            Example: "Confirmed: no bounds check before memcpy, attacker-controlled length"
+            Example: "Not positively supported: caller may validate length; physical PoV decides"
+        pov_guidance: REQUIRED for TESTABLE_UNCERTAIN or SUPPORTED, and whenever
+            is_important=True. Brief guidance for POV agent:
+            1. Input direction: What kind of input to generate
+            2. How to reach the vuln: What input structure/values help the payload
+               pass through earlier checks and reach the vulnerable code
+            Keep it simple, 1-3 sentences. POV agent uses this as reference only.
+
+    Returns:
+        {"success": True, "updated": True} on success
+        {"success": False, "error": "..."} on failure
+    """
+    err = _ensure_client()
+    if err:
+        return err
+
+    if is_real is not None and is_real is not False:
+        return {"success": False, "error": "Verifier cannot confirm a physical exploit; is_real must be False"}
+
+    # Every enabled explicit disposition is PoV-eligible, so it needs guidance
+    # even when priority metadata is low.
+    if verification_disposition == "REFUTED":
+        return {
+            "success": False,
+            "error": "terminal REFUTED is disabled; use TESTABLE_UNCERTAIN",
+        }
+    if refutation_evidence is not None:
+        return {"success": False, "error": "refutation_evidence is disabled"}
+    dispositions = {"TESTABLE_UNCERTAIN", "SUPPORTED"}
+    if (verification_disposition is not None and
+            verification_disposition not in dispositions):
+        return {"success": False, "error": "invalid verification_disposition"}
+    mode_error = _admission_mode_error(is_checked, verification_disposition)
+    if mode_error is not None:
+        return mode_error
+    if ((is_important is True or verification_disposition in {
+            "TESTABLE_UNCERTAIN", "SUPPORTED"}) and not pov_guidance):
+        return {
+            "success": False,
+            "error": "pov_guidance is REQUIRED for PoV-eligible dispositions or when is_important=True. Please provide brief guidance for POV agent: what input to generate and how to reach the vulnerability.",
+        }
+
+    try:
+        client = _get_client()
+        # Get agent_id from context for tracking verified_by_agent_id
+        _, _, _, agent_id = get_sp_context()
+        claim_token = get_sp_verification_claim_token()
+        result = client.update_suspicious_point(
+            sp_id=suspicious_point_id,
+            is_checked=is_checked,
+            is_real=is_real,
+            is_important=is_important,
+            score=score,
+            verification_notes=verification_notes,
+            verification_disposition=verification_disposition,
+            refutation_evidence=refutation_evidence,
+            pov_guidance=pov_guidance,
+            agent_id=agent_id or "",  # Track which agent verified this SP
+            claim_token=claim_token or "",
+            pov_admission_mode=get_sp_pov_admission_mode() or "",
+        )
+
+        # Log the update with server result
+        update_json = json.dumps(
+            {
+                "id": suspicious_point_id,
+                "is_checked": is_checked,
+                "is_real": is_real,
+                "is_important": is_important,
+                "score": score,
+                "verification_notes": verification_notes,
+                "verification_disposition": verification_disposition,
+                "refutation_evidence": refutation_evidence,
+                "pov_guidance": pov_guidance,
+            },
+            ensure_ascii=False,
+        )
+
+        # Check if server actually updated the DB
+        updated = result.get("updated", False) if result else False
+        if updated:
+            logger.info(f"[UPDATE SUSPICIOUS POINT] {update_json}")
+        else:
+            logger.warning(
+                f"[UPDATE SUSPICIOUS POINT FAILED] Server returned: {result}, params: {update_json}"
+            )
+
+        return {
+            "success": updated,
+            "updated": updated,
+            "server_result": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to update suspicious point: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@tools_mcp.tool
+def list_suspicious_points(
+    filter_unchecked: bool = False,
+    filter_real: bool = False,
+    filter_important: bool = False,
+) -> Dict[str, Any]:
+    """
+    List suspicious points for the current task with optional filters.
+
+    Args:
+        filter_unchecked: If True, only return points that haven't been verified yet
+        filter_real: If True, only return confirmed real vulnerabilities
+        filter_important: If True, only return high-priority points
+
+    Returns:
+        {
+            "success": True,
+            "suspicious_points": [...],  # List of suspicious point dicts
+            "count": N,                  # Number of points returned
+        }
+    """
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        result = client.list_suspicious_points(
+            filter_unchecked=filter_unchecked,
+            filter_real=filter_real,
+            filter_important=filter_important,
+        )
+        return {
+            "success": True,
+            "suspicious_points": result.get("suspicious_points", []),
+            "count": result.get("count", 0),
+        }
+    except Exception as e:
+        logger.error(f"Failed to list suspicious points: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+@tools_mcp.tool
+def get_suspicious_point(suspicious_point_id: str) -> Dict[str, Any]:
+    """
+    Get details of a specific suspicious point.
+
+    Args:
+        suspicious_point_id: The ID of the suspicious point
+
+    Returns:
+        {"success": True, "suspicious_point": {...}} on success
+        {"success": False, "error": "..."} if not found
+    """
+    err = _ensure_client()
+    if err:
+        return err
+
+    try:
+        client = _get_client()
+        result = client.get_suspicious_point(suspicious_point_id)
+        if result is None:
+            return {
+                "success": False,
+                "error": f"Suspicious point '{suspicious_point_id}' not found",
+            }
+        return {
+            "success": True,
+            "suspicious_point": result,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get suspicious point: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# Export public API
+__all__ = [
+    # Context
+    "set_sp_context",
+    "set_sp_agent_id",
+    "get_sp_context",
+    "_get_sp_context",
+    "_ensure_sp_context",
+    # SP tools (MCP decorated)
+    "create_suspicious_point",
+    "update_suspicious_point",
+    "list_suspicious_points",
+    "get_suspicious_point",
+    # SP tools (implementation, for mcp_factory)
+    "create_suspicious_point_impl",
+    "update_suspicious_point_impl",
+    "list_suspicious_points_impl",
+    "get_suspicious_point_impl",
+]

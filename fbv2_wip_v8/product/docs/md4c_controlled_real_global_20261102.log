@@ -1,0 +1,2 @@
+{"phase": "STARTED", "run_dir": "/tmp/fbv2-queue-gate-controlled-jur9zqca", "global_fuzz_seconds_cap": 15, "global_physical_reservation_seconds": 35}
+{"run_dir": "/tmp/fbv2-queue-gate-controlled-jur9zqca", "role_events": ["direction_fixture", "seed_fixture", "sp_fixture", "verifier_fixture", "pov_fixture", "qualified_runtime_real"], "pov_id": "6ae872a3e2bd993e2b64aaf1", "gate_status": "TARGET_OOB_OBSERVED_PENDING_CAUSAL_EVIDENCE", "global_status": "RAN", "physical_finished": 6, "physical_wall_seconds": 17.715242832986405}

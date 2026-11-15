@@ -1,0 +1,513 @@
+"""Assertion feedback must preserve SP history and enter the existing verifier/PoV queue."""
+import asyncio
+from dataclasses import asdict
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+from vulnerabilityanalysis.models import FunctionAnalysis, PoC, RuntimeResult, SuspiciousPoint, VerificationResult
+from vulnerabilityanalysis.final_verification import crash_fingerprint
+from vulnerabilityanalysis.scan import apply_assertion_sp_feedback
+from vulnerabilityanalysis.scheduler import (semantic_sp_duplicate, sp_dedup_relations,
+                                             ranked_sp_dedup_relations)
+
+
+def point(sp_id="sp-old", *, line=6, cause="ptr freed before use", status="OPEN",
+          hypothesis="A freed pointer is read after removal"):
+    return SuspiciousPoint(sp_id, "worker", "direction", "target", "target.c",
+        f"target.c:{line}", "read ptr after removal", hypothesis,
+        ["ptr is freed"], "input bytes", [cause], [], [], [], status=status,
+        source_line=line, source_excerpt="return *ptr;")
+
+
+class Roles:
+    last_request_count = 1
+
+    def __init__(self):
+        self.calls = []
+        self.verifications = {}
+        self.harness_seen = None
+        self.reanalysis_feedback = None
+        self.analysis_scope = None
+
+    async def analyze_function(self, *args, **kwargs):
+        self.calls.append("analyze")
+        self.harness_seen = (kwargs.get("harness_source"), kwargs.get("harness_source_path"))
+        self.analysis_scope = kwargs.get("analysis_scope")
+        self.reanalysis_feedback = json.loads(args[4][-1]["source"])
+        return FunctionAnalysis("target", "target", "target.c", "reviewed", "input bytes",
+            [], [], ["ptr remains valid"], [],
+            security_sensitive_operations=["input-linked read"])
+
+    async def generate_sp(self, *args, **kwargs):
+        self.calls.append("generate")
+        self.harness_seen = (kwargs.get("harness_source"), kwargs.get("harness_source_path"))
+        return [point("sp-new")]
+
+    async def verify_sp(self, candidate, *args, **kwargs):
+        self.calls.append("verify")
+        self.verifications[candidate.sp_id] = VerificationResult(candidate.sp_id,
+            "UNKNOWN", "UNKNOWN", [], [], [], [], ["impact unknown"], "UNKNOWN",
+            "RUNTIME_TRACE", "dynamic evidence required")
+        return candidate
+
+    async def generate_poc(self, candidate, *args, **kwargs):
+        self.calls.append("poc")
+        return PoC("poc-new", candidate.sp_id,
+                   "def build():\n    return b'A'\n", None, None, "probe")
+
+
+class FeedbackLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.run = self.root / "run"
+        for name in ("assertions", "sp", "analysis", "verification"):
+            (self.run / name).mkdir(parents=True)
+        self.source = self.root / "target.c"
+        self.source.write_text("#include <stddef.h>\nvoid target(char *ptr) {\n"
+            " if (ptr) {\n  ptr++;\n }\n return *ptr;\n}\n")
+        self.harness = self.root / "harness.c"
+        self.harness.write_text("void target(char *); void entry(char *p) { target(p); }\n")
+        (self.run / "run.json").write_text('{"run_id":"feedback-test"}')
+        (self.run / "scan.json").write_text('{"pending_sp_ids":[],"selected_sp_ids":[]}')
+        (self.run / "sp/candidates.json").write_text("[]")
+        (self.run / "analysis/target.json").write_text(json.dumps(asdict(
+            FunctionAnalysis("target", "target", "target.c", "unknown", "input bytes",
+                [], [], ["ptr remains valid"], []))))
+        witness = self.run / "assertions" / "a" / "executions" / "e"
+        witness.mkdir(parents=True)
+        self.input = witness / "input.bin"
+        self.input.write_bytes(b"A")
+        runtime = witness / "original_runtime.json"
+        runtime.write_text('{"exit_code":0,"failure_classification":"NO_CRASH"}')
+        (witness / "triage.json").write_text(json.dumps({
+            "classification": "INSUFFICIENT_EVIDENCE", "original_runtime": str(runtime),
+            "input_sha256": "witness-hash", "input_path": str(self.input),
+            "safe_judgment": "ptr remains valid", "source_review": "unknown",
+            "state_trace": "unknown"}))
+        self.link = {"assertion_id": "a", "worker_id": "worker", "direction_id": "direction",
+                     "input_runtime": str(witness / "runtime.json"), "related_sp_ids": [],
+                     "relation": "UNKNOWN"}
+        (self.run / "assertions/results.json").write_text(json.dumps([
+            {"assertion_id": "a", "source_location": "target.c:6"}]))
+        self.write_links()
+        self.kwargs = dict(function_name="target", source=self.source.read_text(),
+            source_path=self.source, source_start_line=1, context=[],
+            harness_source=self.harness.read_text(), harness_source_path=self.harness,
+            target_repository=self.root, max_llm_calls=4)
+
+    def write_links(self):
+        (self.run / "assertions/sp_linkage.json").write_text(json.dumps([self.link]))
+
+    def run_feedback(self, roles, **overrides):
+        return asyncio.run(apply_assertion_sp_feedback(
+            self.run, roles, **{**self.kwargs, **overrides}))
+
+    def test_semantic_dedup_requires_same_type_statement_and_root_cause(self):
+        first = point("sp-one")
+        same = point("sp-two", hypothesis="After removal, a released ptr is used")
+        different_cause = point("sp-three", cause="ptr invalidated by resize")
+        different_line = point("sp-four", line=7)
+        different_type = point("sp-five", hypothesis="NULL pointer dereference at read")
+        different_statement = point("sp-six")
+        different_statement.source_excerpt = "return ptr[1];"
+        self.assertTrue(semantic_sp_duplicate(same, first))
+        self.assertFalse(semantic_sp_duplicate(different_cause, first))
+        self.assertFalse(semantic_sp_duplicate(different_line, first))
+        self.assertFalse(semantic_sp_duplicate(different_type, first))
+        self.assertFalse(semantic_sp_duplicate(different_statement, first))
+        self.assertEqual(len(sp_dedup_relations([first, same, different_cause, different_line,
+                                                 different_type, different_statement])), 1)
+        self.assertEqual(first.status, "OPEN")
+
+    def test_tinyproxy_different_crash_and_sp_operations_stay_separate(self):
+        # Post-blind OSS artifact, read only: the observed crash was at 803,
+        # whereas the original hypothesis concerns a later read at 806.
+        artifact = (Path(__file__).resolve().parents[2] / "result" /
+            "vulnerabilityanalysis/20261009T051404Z-dd8b6502/sp/sp-a4ff121e327e3408.json")
+        if not artifact.is_file():
+            self.skipTest("historical TinyProxy result is unavailable")
+        original = SuspiciousPoint(**json.loads(artifact.read_text()))
+        observed = SuspiciousPoint(**{**asdict(original), "sp_id": "observed-803",
+            "code_location": "src/reqs.c:803", "source_line": 803,
+            "source_excerpt": "orderedmap_remove (hashofheaders, ptr);"})
+        self.assertFalse(semantic_sp_duplicate(observed, original))
+        self.assertEqual(sp_dedup_relations([original, observed]), [])
+
+    def test_opposite_causal_order_is_not_removed_before_verification(self):
+        released_then_read = point("sp-release-first", cause="ptr freed before read")
+        read_then_released = point("sp-read-first", cause="ptr read before freed")
+        self.assertFalse(semantic_sp_duplicate(read_then_released, released_then_read))
+        self.assertEqual(sp_dedup_relations([released_then_read, read_then_released]), [])
+
+    def test_initial_duplicate_rep_uses_existing_priority_and_keeps_both_records(self):
+        first = point("sp-first")
+        stronger = point("sp-stronger")
+        stronger.runtime_reachable = True
+        stronger.supporting_evidence = ["source-backed runtime witness"]
+        source = self.source.read_text()
+        forward = ranked_sp_dedup_relations([first, stronger], source=source,
+                                            source_start_line=1)
+        reverse = ranked_sp_dedup_relations([stronger, first], source=source,
+                                            source_start_line=1)
+        self.assertEqual(forward[0]["sp_id"], "sp-first")
+        self.assertEqual(forward[0]["duplicate_of"], "sp-stronger")
+        self.assertEqual(reverse, forward)
+        self.assertGreater(stronger.priority_score, first.priority_score)
+        self.assertEqual({first.status, stronger.status}, {"OPEN"})
+
+    def test_initial_duplicate_rep_keeps_prior_verification_on_resume(self):
+        prior = point("sp-prior")
+        newer = point("sp-newer")
+        newer.runtime_reachable = True
+        relations = ranked_sp_dedup_relations(
+            [prior, newer], source=self.source.read_text(),
+            source_start_line=1, protected_ids={prior.sp_id})
+        self.assertEqual(relations[0]["sp_id"], "sp-newer")
+        self.assertEqual(relations[0]["duplicate_of"], "sp-prior")
+
+    def test_initial_duplicate_rep_never_chooses_refuted_over_open(self):
+        refuted = point("sp-refuted", status="REFUTED")
+        refuted.runtime_reachable = True
+        open_point = point("sp-open")
+        relations = ranked_sp_dedup_relations(
+            [refuted, open_point], source=self.source.read_text(),
+            source_start_line=1)
+        self.assertEqual(relations[0]["sp_id"], "sp-refuted")
+        self.assertEqual(relations[0]["duplicate_of"], "sp-open")
+
+    def test_related_sp_states_preserve_original(self):
+        for status, expected in (("VERIFYING", "PENDING_ACTIVE_CANDIDATE"),
+                                 ("POC_PENDING", "PENDING_ACTIVE_CANDIDATE"),
+                                 ("RUNTIME_PENDING", "PENDING_ACTIVE_CANDIDATE"),
+                                 ("REFUTED", "PENDING_REFUTATION_REVIEW"),
+                                 ("VERIFIED", "PENDING_ROOT_CAUSE_RELATION_REVIEW"),
+                                 ("OPEN", "REVERIFIED_WITH_NEW_EVIDENCE")):
+            with self.subTest(status=status):
+                old = point(status=status)
+                (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+                self.link["related_sp_ids"] = [old.sp_id]
+                self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+                self.write_links()
+                (self.run / "assertions/sp_feedback.json").unlink(missing_ok=True)
+                roles = Roles()
+                report = self.run_feedback(roles, max_llm_calls=1)
+                self.assertEqual(report["feedback"][0]["status"], expected)
+                self.assertEqual(json.loads((self.run / "sp/candidates.json").read_text())[0],
+                                 asdict(old))
+                self.assertEqual(roles.calls, ["verify"] if status == "OPEN" else [])
+                again = self.run_feedback(roles, max_llm_calls=1)
+                self.assertEqual(again["status"], "NO_NEW_EVIDENCE")
+
+    def test_new_assertion_input_reopens_feedback_without_reusing_old_evidence(self):
+        old = point(status="OPEN")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        roles = Roles()
+        self.run_feedback(roles, max_llm_calls=1)
+        triage_path = self.input.parent / "triage.json"
+        triage = json.loads(triage_path.read_text())
+        triage["input_sha256"] = "different-witness-hash"
+        triage_path.write_text(json.dumps(triage))
+        self.input.write_bytes(b"B")
+        again = self.run_feedback(roles, max_llm_calls=1)
+        self.assertEqual(again["feedback"][0]["status"],
+                         "REVERIFIED_WITH_NEW_EVIDENCE")
+        self.assertEqual(roles.calls, ["verify", "verify"])
+
+    def test_refuted_reverification_requires_direct_reachability_conflict(self):
+        old = point(status="REFUTED")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        (self.run / "verification/sp-old.json").write_text(json.dumps({
+            "verdict": "REFUTED", "reachability": "UNREACHABLE",
+            "contradiction_scope": "WHOLE_HYPOTHESIS", "source_citations": []}))
+        triage_path = self.input.parent / "triage.json"
+        triage = json.loads(triage_path.read_text())
+        triage["assertion_status"] = "VIOLATED"
+        triage["runtime_expression_measured"] = False
+        triage_path.write_text(json.dumps(triage))
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=1)
+        self.assertEqual(report["feedback"][0]["status"],
+                         "REFUTATION_REVIEWED_WITH_NEW_REACHABILITY_EVIDENCE")
+        self.assertEqual(roles.calls, ["verify"])
+        self.assertEqual(json.loads((self.run / "sp/candidates.json").read_text())[0],
+                         asdict(old))
+
+    def test_new_sp_runs_verifier_and_existing_pov_runtime(self):
+        roles = Roles()
+        report = self.run_feedback(roles, run_command=[sys.executable, "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()", "{input}"])
+        self.assertEqual(roles.calls, ["analyze", "generate", "verify", "poc"])
+        self.assertEqual(roles.harness_seen, (self.harness.read_text(), self.harness))
+        self.assertEqual(report["feedback"][0]["verified_sp_ids"], ["sp-new"])
+        self.assertTrue((self.run / "runtime/poc-new.json").is_file())
+        self.assertNotEqual(json.loads((self.run / "sp/sp-new.json").read_text())["status"],
+                            "VERIFIED")
+        scan = json.loads((self.run / "scan.json").read_text())
+        self.assertEqual(scan["pending_sp_ids"], [])
+        self.assertEqual(scan["sp_verification_status"]["sp-new"], "VERIFIER_EXECUTED")
+        self.assertIn("sp-new", scan["selected_sp_ids"])
+        self.assertEqual(scan["poc_count"], 1)
+
+    def test_refuted_new_sp_does_not_enter_pov(self):
+        class RefutingRoles(Roles):
+            async def verify_sp(self, candidate, *args, **kwargs):
+                await super().verify_sp(candidate, *args, **kwargs)
+                candidate.status = "REFUTED"
+                self.verifications[candidate.sp_id].verdict = "REFUTED"
+                self.verifications[candidate.sp_id].recommended_next_action = "REFUTE"
+                return candidate
+
+        roles = RefutingRoles()
+        report = self.run_feedback(roles, run_command=[sys.executable, "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()", "{input}"])
+        self.assertEqual(roles.calls, ["analyze", "generate", "verify"])
+        self.assertEqual(report["pending_sp_ids"], [])
+        self.assertFalse((self.run / "poc/pocs.json").exists())
+
+    def test_possible_defect_without_related_sp_reanalyzes_before_generation(self):
+        triage_path = self.input.parent / "triage.json"
+        triage = json.loads(triage_path.read_text())
+        triage["classification"] = "SECURITY_DEFECT_POSSIBLE"
+        triage_path.write_text(json.dumps(triage))
+        runtime_path = self.input.parent / "original_runtime.json"
+        runtime = json.loads(runtime_path.read_text())
+        runtime["stack_trace"] = f"{self.source}:6"
+        runtime_path.write_text(json.dumps(runtime))
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=2)
+        self.assertEqual(roles.calls, ["analyze", "generate"])
+        self.assertEqual(report["feedback"][0]["new_sp_ids"], ["sp-new"])
+
+    def test_feedback_batch_id_collision_preserves_raw_without_overwriting(self):
+        class CollidingRoles(Roles):
+            async def generate_sp(self, *args, **kwargs):
+                self.calls.append("generate")
+                return [point("sp-new", cause="freed before read"),
+                        point("sp-new", cause="read before freed")]
+
+        roles = CollidingRoles()
+        with self.assertRaisesRegex(ValueError, "duplicate SP ID"):
+            self.run_feedback(roles, max_llm_calls=2)
+        self.assertEqual(roles.calls, ["analyze", "generate"])
+        raw_files = [path for path in (self.run / "sp").glob("feedback_generation_*.json")
+                     if "id_collision" not in path.name]
+        self.assertEqual(len(raw_files), 1)
+        raw = json.loads(raw_files[0].read_text())
+        self.assertEqual(len(raw), 2)
+        self.assertEqual(raw[0]["sp_id"], raw[1]["sp_id"])
+        self.assertFalse((self.run / "sp/sp-new.json").exists())
+        self.assertEqual(json.loads((self.run / "sp/candidates.json").read_text()), [])
+        original_sha = hashlib.sha256(raw_files[0].read_bytes()).hexdigest()
+        second = Roles()
+        with self.assertRaisesRegex(ValueError, "prior incomplete SP feedback generation"):
+            self.run_feedback(second, max_llm_calls=2)
+        self.assertEqual(second.calls, [])
+        self.assertEqual(hashlib.sha256(raw_files[0].read_bytes()).hexdigest(),
+                         original_sha)
+
+    def test_feedback_existing_id_cannot_hide_different_cause(self):
+        existing = point("sp-new", line=9, cause="freed before read")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(existing)]))
+        (self.run / "sp/sp-new.json").write_text(json.dumps(asdict(existing)))
+
+        class ConflictingRoles(Roles):
+            async def generate_sp(self, *args, **kwargs):
+                self.calls.append("generate")
+                return [point("sp-new", cause="read before freed")]
+
+        with self.assertRaisesRegex(ValueError, "existing SP ID"):
+            self.run_feedback(ConflictingRoles(), max_llm_calls=2)
+        self.assertEqual(json.loads((self.run / "sp/sp-new.json").read_text()),
+                         asdict(existing))
+        raw_files = [path for path in (self.run / "sp").glob("feedback_generation_*.json")
+                     if "id_collision" not in path.name]
+        self.assertEqual(len(raw_files), 1)
+        self.assertEqual(len(json.loads(raw_files[0].read_text())), 1)
+
+    def test_feedback_existing_id_cannot_hide_changed_input_relation(self):
+        existing = point("sp-new", line=9)
+        existing.external_input_relation = "input cannot reach result"
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(existing)]))
+        (self.run / "sp/sp-new.json").write_text(json.dumps(asdict(existing)))
+
+        class InputRelationRoles(Roles):
+            async def generate_sp(self, *args, **kwargs):
+                self.calls.append("generate")
+                candidate = point("sp-new", line=9)
+                candidate.external_input_relation = "input bytes directly choose result"
+                return [candidate]
+
+        with self.assertRaisesRegex(ValueError, "existing SP ID"):
+            self.run_feedback(InputRelationRoles(), max_llm_calls=2)
+        self.assertEqual(json.loads((self.run / "sp/sp-new.json").read_text()),
+                         asdict(existing))
+
+    def test_completed_feedback_rechecks_raw_generation_sha_before_reuse(self):
+        first = self.run_feedback(Roles(), max_llm_calls=2)
+        raw_path = Path(first["feedback"][0]["generated_candidates_artifact"])
+        self.assertTrue(raw_path.is_file())
+        raw_path.write_text("[]\n")
+        second = Roles()
+        with self.assertRaisesRegex(ValueError, "prior SP feedback generation artifact changed"):
+            self.run_feedback(second, max_llm_calls=2)
+        self.assertEqual(second.calls, [])
+
+    def test_feedback_reanalysis_receives_assertion_predicate_and_measurement(self):
+        triage_path = self.input.parent / "triage.json"
+        triage = json.loads(triage_path.read_text())
+        triage.update({"insertion_location": "target.c:6",
+                       "runtime_expression": "ptr != 0",
+                       "runtime_expression_measured": False,
+                       "instrumented_assertion_location_reached": True})
+        triage_path.write_text(json.dumps(triage))
+        roles = Roles()
+        scope = {"selected_function": {"role": "CORE", "source_risk": "HIGH"}}
+        self.run_feedback(roles, max_llm_calls=2, analysis_scope=scope)
+        self.assertEqual(roles.analysis_scope, scope)
+        self.assertEqual(roles.reanalysis_feedback["assertion_source_location"], "target.c:6")
+        self.assertEqual(roles.reanalysis_feedback["runtime_expression"], "ptr != 0")
+        self.assertIs(roles.reanalysis_feedback["runtime_expression_measured"], False)
+        self.assertEqual(roles.reanalysis_feedback["runtime_expression_observation"],
+                         "EVALUATED_FALSE")
+        self.assertIs(roles.reanalysis_feedback["instrumented_assertion_location_reached"], True)
+
+    def test_open_after_pov_failure_reuses_new_witness_once(self):
+        old = point(status="OPEN")
+        old.status_history = ["OPEN", "POC_PENDING", "RUNTIME_PENDING", "OPEN"]
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=1,
+            run_command=[sys.executable, "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()", "{input}"])
+        row = report["feedback"][0]
+        self.assertEqual(row["pov_retry"], "EXECUTED_WITH_NEW_ASSERTION_INPUT")
+        self.assertTrue((self.run / "runtime" / f"{row['poc_id']}.json").is_file())
+        self.assertEqual(json.loads((self.run / "sp/candidates.json").read_text())[0],
+                         asdict(old))
+        again = self.run_feedback(roles, max_llm_calls=1,
+            run_command=[sys.executable, "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()", "{input}"])
+        self.assertEqual(again["status"], "NO_NEW_EVIDENCE")
+        self.assertEqual(len(json.loads((self.run / "poc/pocs.json").read_text())), 1)
+
+    def test_open_after_pov_failure_does_not_replay_same_input(self):
+        old = point(status="OPEN")
+        old.status_history = ["OPEN", "RUNTIME_PENDING", "OPEN"]
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        prior = self.run / "poc" / "old.bin"
+        prior.parent.mkdir(parents=True)
+        prior.write_bytes(self.input.read_bytes())
+        (self.run / "poc/pocs.json").write_text(json.dumps([
+            {"sp_id": old.sp_id, "generated_input": str(prior)}]))
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=1,
+            run_command=[sys.executable, "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()", "{input}"])
+        self.assertEqual(report["feedback"][0]["pov_retry"],
+                         "BLOCKED_SAME_INPUT_NO_NEW_EVIDENCE")
+        self.assertFalse((self.run / "runtime").exists())
+
+    def test_verified_accepts_only_same_confirmed_crash_fingerprint(self):
+        old = point(status="VERIFIED")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        observed = RuntimeResult(1, "", "AddressSanitizer: heap-use-after-free\n"
+            "#0 0x123 in target /tmp/target.c:6\n", None, False,
+            "heap-use-after-free", "", "SANITIZER_CRASH")
+        runtime_path = Path(self.link["input_runtime"]).parent / "original_runtime.json"
+        runtime_path.write_text(json.dumps(asdict(observed)))
+        root = self.run / "root_cause" / "sp-old.json"
+        root.parent.mkdir()
+        root.write_text(json.dumps({"sp_id": "sp-old", "verdict": "CONFIRMED",
+                                    "crash_id": crash_fingerprint(observed)}))
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=1)
+        self.assertEqual(report["feedback"][0]["status"],
+                         "EVIDENCE_ADDED_TO_VERIFIED_ROOT_CAUSE")
+        self.assertEqual(roles.calls, [])
+        self.assertEqual(json.loads((self.run / "sp/candidates.json").read_text())[0],
+                         asdict(old))
+
+    def test_budget_keeps_new_sp_pending_for_resume(self):
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=2)
+        self.assertEqual(roles.calls, ["analyze", "generate"])
+        self.assertEqual(report["pending_sp_ids"], ["sp-new"])
+        self.assertEqual(json.loads((self.run / "scan.json").read_text())["pending_sp_ids"],
+                         ["sp-new"])
+        self.assertEqual(json.loads((self.run / "sp/sp-new.json").read_text())["status"],
+                         "OPEN")
+
+    def test_related_sp_feedback_charges_sp_role_only(self):
+        old = point(status="OPEN")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=3,
+                                   max_sp_calls=1, max_hp_calls=0)
+        self.assertEqual(roles.calls, ["verify"])
+        self.assertEqual(report["llm_calls"], 1)
+        self.assertEqual(report["sp_llm_calls"], 1)
+        self.assertEqual(report["hp_llm_calls"], 0)
+
+    def test_related_sp_feedback_does_not_spend_hp_as_sp(self):
+        old = point(status="OPEN")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        self.link["related_sp_ids"] = [old.sp_id]
+        self.link["relation"] = "EXACT_NEGATED_PREDICATE_AT_SOURCE_LOCATION"
+        self.write_links()
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=3,
+                                   max_sp_calls=0, max_hp_calls=3)
+        self.assertEqual(roles.calls, [])
+        self.assertEqual(report["feedback"][0]["status"], "PENDING_LLM_BUDGET")
+        self.assertEqual(report["llm_calls"], 0)
+
+    def test_unrelated_feedback_reserves_hp_and_sp_before_reanalysis(self):
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=3,
+                                   max_sp_calls=0, max_hp_calls=2)
+        self.assertEqual(roles.calls, [])
+        self.assertEqual(report["feedback"][0]["status"],
+                         "PENDING_REANALYSIS_BUDGET")
+        self.assertEqual(report["llm_calls"], 0)
+
+    def test_new_semantic_duplicate_is_recorded_without_reverification(self):
+        old = point("sp-old")
+        (self.run / "sp/candidates.json").write_text(json.dumps([asdict(old)]))
+        (self.run / "assertions/results.json").write_text(json.dumps([
+            {"assertion_id": "a", "source_location": "target.c:9"}]))
+        roles = Roles()
+        report = self.run_feedback(roles, max_llm_calls=4)
+        self.assertEqual(roles.calls, ["analyze", "generate"])
+        relations = json.loads((self.run / "sp/dedup_relations.json").read_text())
+        self.assertEqual(relations[0]["duplicate_of"], "sp-old")
+        self.assertEqual(relations[0]["sp_id"], "sp-new")
+        self.assertEqual(report["pending_sp_ids"], [])
+        self.assertEqual(len(json.loads((self.run / "sp/candidates.json").read_text())), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

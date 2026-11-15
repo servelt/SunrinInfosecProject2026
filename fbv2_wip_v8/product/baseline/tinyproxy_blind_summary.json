@@ -1,0 +1,228 @@
+{
+  "generated_at": "2026-10-09T06:08:33.679311+00:00",
+  "experiment_plan": "result/vulnerabilityanalysis/20261009T051404Z-dd8b6502/experiment_plan.json",
+  "target_commit": "90adf28663874e6d34d3eebeae6279906443aea5",
+  "harness_kind": "REGRESSION_FIXTURE",
+  "budget": {
+    "max_functions": 15,
+    "max_calls_per_function": 8,
+    "max_sp_verification_per_function": 2,
+    "max_calls_total": 120,
+    "max_wall_seconds": 2700
+  },
+  "stop_reason": "RuntimeError: GLOBAL_WALL_TIME_LIMIT",
+  "completed_functions": 9,
+  "partially_processed_function": {
+    "function": "relay_connection",
+    "run_id": "20261009T053447Z-10cf0e9c",
+    "sp_generated": 6,
+    "verifier_artifacts": 1,
+    "runtime_artifacts": 1,
+    "scan_complete": false
+  },
+  "pool_size": 17,
+  "uncompleted_functions": 8,
+  "completed_function_details": [
+    {
+      "function": "remove_connection_headers",
+      "run_id": "20261009T051404Z-dd8b6502",
+      "priority_score": 98.0,
+      "llm_calls": 7,
+      "sp_generated": 4,
+      "source_locations_validated": 4,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 2,
+      "poc_executed": 2
+    },
+    {
+      "function": "process_server_headers",
+      "run_id": "20261009T051709Z-41210631",
+      "priority_score": 94.0,
+      "llm_calls": 8,
+      "sp_generated": 7,
+      "source_locations_validated": 6,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 5,
+      "poc_executed": 2
+    },
+    {
+      "function": "process_request",
+      "run_id": "20261009T051907Z-09df11c0",
+      "priority_score": 95.0,
+      "llm_calls": 7,
+      "sp_generated": 7,
+      "source_locations_validated": 7,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 5,
+      "poc_executed": 2
+    },
+    {
+      "function": "handle_connection",
+      "run_id": "20261009T052118Z-f828cf6c",
+      "priority_score": 96.0,
+      "llm_calls": 8,
+      "sp_generated": 5,
+      "source_locations_validated": 5,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 3,
+      "poc_executed": 2
+    },
+    {
+      "function": "extract_url",
+      "run_id": "20261009T052347Z-8b5153d0",
+      "priority_score": 92.0,
+      "llm_calls": 8,
+      "sp_generated": 7,
+      "source_locations_validated": 6,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 5,
+      "poc_executed": 1
+    },
+    {
+      "function": "strip_username_password",
+      "run_id": "20261009T052622Z-5e115e11",
+      "priority_score": 88.0,
+      "llm_calls": 8,
+      "sp_generated": 4,
+      "source_locations_validated": 4,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 2,
+      "poc_executed": 2
+    },
+    {
+      "function": "process_client_headers",
+      "run_id": "20261009T052758Z-50b637af",
+      "priority_score": 87.0,
+      "llm_calls": 8,
+      "sp_generated": 4,
+      "source_locations_validated": 0,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 2,
+      "poc_executed": 1
+    },
+    {
+      "function": "write_via_header",
+      "run_id": "20261009T053002Z-9d9ffc7d",
+      "priority_score": 88.0,
+      "llm_calls": 7,
+      "sp_generated": 6,
+      "source_locations_validated": 6,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 4,
+      "poc_executed": 2
+    },
+    {
+      "function": "get_all_headers",
+      "run_id": "20261009T053216Z-734e0b0e",
+      "priority_score": 85.0,
+      "llm_calls": 8,
+      "sp_generated": 6,
+      "source_locations_validated": 6,
+      "sp_conditions_validated": 0,
+      "sp_verified": 2,
+      "sp_pending_unverified": 4,
+      "poc_executed": 2
+    }
+  ],
+  "totals_completed_only": {
+    "sp_generated": 50,
+    "source_locations_validated": 44,
+    "sp_conditions_validated": 0,
+    "sp_verified": 18,
+    "sp_pending_unverified": 32,
+    "poc_executed": 16
+  },
+  "sp_status_completed_only": {
+    "OPEN": 49,
+    "POC_PENDING": 1
+  },
+  "verifier_verdicts": {
+    "UNKNOWN": 17,
+    "PLAUSIBLE": 1
+  },
+  "verifier_next_actions": {
+    "REQUEST_CONTEXT": 18
+  },
+  "runtime_classifications": {
+    "UNKNOWN": 15,
+    "SANITIZER_CRASH": 1
+  },
+  "unknown_location_sps": [
+    {
+      "function": "process_server_headers",
+      "sp_id": "sp-a6ff82139d6eb5fa"
+    },
+    {
+      "function": "extract_url",
+      "sp_id": "sp-4c154e506eca47b7"
+    },
+    {
+      "function": "process_client_headers",
+      "sp_id": "sp-2aad2b1d93d3f83a"
+    },
+    {
+      "function": "process_client_headers",
+      "sp_id": "sp-4c5ab66191e75c81"
+    },
+    {
+      "function": "process_client_headers",
+      "sp_id": "sp-f6c5cb396da6dc12"
+    },
+    {
+      "function": "process_client_headers",
+      "sp_id": "sp-f7da5189a1b7fd99"
+    }
+  ],
+  "reachability": {
+    "function_reached_on_poc": "UNKNOWN: process harness is not supported by direct-input GDB tracing",
+    "sp_location_reached_on_poc": "UNKNOWN",
+    "sp_condition_reached_on_poc": "UNKNOWN",
+    "validated_sp_conditions": 0
+  },
+  "fuzzer": {
+    "status": "BLOCKED_INCOMPATIBLE_HARNESS",
+    "runtime_coverage_change": "UNKNOWN",
+    "time_seconds": 0
+  },
+  "assertion_runtime": {
+    "status": "NOT_EXECUTED_IN_THIS_SCAN",
+    "proposed_count": 11
+  },
+  "model_usage": {
+    "logical_requests_total": 74,
+    "luna": 57,
+    "sol": 17,
+    "ollama": 0,
+    "request_statuses": {
+      "COMPLETED": 74
+    },
+    "transport_request_count": "UNKNOWN",
+    "token_usage": "UNKNOWN",
+    "elapsed_seconds": 2906.351
+  },
+  "asan": {
+    "observed_crashes": 1,
+    "poc_id": "poc-de0a27ab19b8ba30",
+    "oracle": "heap-use-after-free",
+    "crash_triage": "UNKNOWN",
+    "workflow_verified_count": 0,
+    "fresh_replay": "result/vulnerabilityanalysis/20261009T051404Z-dd8b6502/post_blind_replay/result.json",
+    "cause_of_triage_unknown": "ASAN DWARF source path is byte-identical build copy but target_repository is clean checkout path"
+  },
+  "tests": {
+    "command": "PYTHONPATH=vulnerabilityanalysis/src python3 -m unittest discover -s vulnerabilityanalysis/tests -q",
+    "total": 119,
+    "passed": 117,
+    "skipped": 2,
+    "failed": 0,
+    "errors": 0
+  }
+}

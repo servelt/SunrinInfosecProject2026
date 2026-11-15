@@ -1,0 +1,31 @@
+{
+  "candidate_id": "crash-0297f01c920dd4f2",
+  "candidate_origin": "POST_RUNTIME_SANITIZER",
+  "candidate_status_after": "VERIFIED",
+  "candidate_status_before": "OPEN",
+  "fixed_poc": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T103247Z-tinyproxy-crash-final-gate/fixed_poc/crash-0297f01c920dd4f2/fixed.json",
+  "independent_replay": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T103247Z-tinyproxy-crash-final-gate/independent/crash-0297f01c920dd4f2/validation.json",
+  "new_direct_server_evidence": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T104551Z-tinyproxy-security-property/direct_server_summary.json",
+  "original_sp_id": "sp-a4ff121e327e3408",
+  "prior_artifacts_modified": false,
+  "root_cause": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T103247Z-tinyproxy-crash-final-gate/root_cause/crash-0297f01c920dd4f2/observed.json",
+  "scope": "verified ASAN UAF for permitted loopback network client; public-internet reachability and non-ASAN impact not evaluated",
+  "security_property": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T104551Z-tinyproxy-security-property/security_property_result.json",
+  "source_runtime": "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T103247Z-tinyproxy-crash-final-gate/runtime/poc-de0a27ab19b8ba30.json",
+  "verified": true,
+  "satisfied_conditions": {
+    "related_runtime_path": "LIFETIME_RELATED root-cause relationship, not original SP at reqs.c:806",
+    "target_crash": "ASAN heap-use-after-free in TinyProxy target source; direct server exit -6",
+    "root_cause": "CONFIRMED for separate observed crash candidate at orderedmap.c:89 \u2192 hsearch.c:74",
+    "fixed_poc": "142-byte input and binary hashes match retained fixed artifact",
+    "independent_replay": "REPRODUCED in fresh process, retained artifact; new direct-server replay also reproduced same source-level UAF",
+    "security_property": "CONFIRMED for allowed network client on loopback; EXTERNAL_INPUT, HARNESS_VALIDITY, SECURITY_IMPACT evidence artifacts all present"
+  },
+  "outside_verified_scope": [
+    "original SP at reqs.c:806 remains OPEN; crash occurred before its strlen",
+    "non-loopback accessibility depends on deployment Listen and ACL settings and was not tested",
+    "behavior without ASAN was not tested",
+    "new fixture retry timed out at 10 seconds; no new fixture-based runtime verdict from that attempt",
+    "ASAN symbolization changed inline frame names, so direct raw fingerprint differs from fixture fingerprint"
+  ]
+}

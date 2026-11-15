@@ -1,0 +1,114 @@
+{
+  "source": "historical libyaml FBv2/HP-path-OFF analysis; counts are not validated invariants",
+  "by_function": [
+    {
+      "function": "yaml_parser_scan",
+      "run_id": "20261010T103028Z-4e197682",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "POSSIBLE_BUG": 1,
+        "EXPLICIT_SAFE_JUDGMENT": 1,
+        "UNKNOWN": 1
+      }
+    },
+    {
+      "function": "yaml_parser_fetch_block_scalar",
+      "run_id": "20261010T103344Z-696bc68b",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "UNKNOWN": 4
+      }
+    },
+    {
+      "function": "yaml_parser_fetch_plain_scalar",
+      "run_id": "20261010T103830Z-worker-continuation",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "UNKNOWN": 2,
+        "EXPLICIT_SAFE_JUDGMENT": 1
+      }
+    },
+    {
+      "function": "yaml_parser_fetch_flow_scalar",
+      "run_id": "20261010T104147Z-5a2824e8",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "EXPLICIT_SAFE_JUDGMENT": 1,
+        "POSSIBLE_BUG": 1,
+        "UNKNOWN": 2
+      }
+    },
+    {
+      "function": "yaml_token_delete",
+      "run_id": "20261010T104449Z-8bc8717f",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "UNKNOWN": 1,
+        "EXPLICIT_SAFE_JUDGMENT": 2
+      }
+    },
+    {
+      "function": "yaml_parser_scan_to_next_token",
+      "run_id": "20261010T105025Z-worker-retry-corrected",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "UNKNOWN": 3
+      }
+    },
+    {
+      "function": "yaml_parser_fetch_next_token",
+      "run_id": "20261010T1100Z-fullscan-final-continuation",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "UNKNOWN": 3
+      }
+    },
+    {
+      "function": "yaml_parser_delete",
+      "run_id": "20261010T110324Z-9631d638",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "POSSIBLE_BUG": 1,
+        "UNKNOWN": 1
+      }
+    },
+    {
+      "function": "yaml_free",
+      "run_id": "20261010T110547Z-86d3792d",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "EXPLICIT_SAFE_JUDGMENT": 1,
+        "UNKNOWN": 3
+      }
+    },
+    {
+      "function": "yaml_parser_initialize",
+      "run_id": "20261010T110847Z-87720b6a",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "EXPLICIT_SAFE_JUDGMENT": 2,
+        "UNKNOWN": 2
+      }
+    },
+    {
+      "function": "yaml_malloc",
+      "run_id": "20261010T111107Z-d7e3ef07",
+      "explicit_safe_assumption_count": 0,
+      "hypothesis_judgments": {
+        "EXPLICIT_SAFE_JUDGMENT": 1,
+        "UNKNOWN": 2
+      }
+    },
+    {
+      "function": "yaml_parser_set_input_string",
+      "run_id": "20261010T111312Z-b692c528",
+      "explicit_safe_assumption_count": 1,
+      "hypothesis_judgments": {
+        "EXPLICIT_SAFE_JUDGMENT": 2
+      }
+    }
+  ],
+  "total_safe_assumption_strings": 6,
+  "oss_validated_invariants_in_this_campaign": 0,
+  "assertion_executions_in_this_campaign": 0
+}

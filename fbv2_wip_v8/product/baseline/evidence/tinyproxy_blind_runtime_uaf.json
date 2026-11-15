@@ -1,0 +1,62 @@
+{
+  "coverage": null,
+  "crash_triage": {
+    "allocation_stack": [
+      "#1 0x58c1c4d9e6c2 in orderedmap_append /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:58:7",
+      "#2 0x58c1c4d924df in add_header_to_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:662:16",
+      "#3 0x58c1c4d924df in get_all_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:703:32",
+      "#4 0x58c1c4d90453 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1645:13",
+      "#5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2",
+      "#1 0x58c1c4d8550a in child_main_loop /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:211:21",
+      "#2 0x58c1c4d99623 in main /tmp/va-tinyproxy-clean-eval-saeucXan/src/main.c:407:9",
+      "#3 0x725c82a2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16",
+      "#4 0x725c82a2a28a in __libc_start_main csu/../csu/libc-start.c:360:3"
+    ],
+    "category": "UNKNOWN",
+    "crash_relation": "LIFETIME_RELATED",
+    "free_stack": [
+      "#1 0x58c1c4d9ea36 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:89:2",
+      "#2 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25",
+      "#3 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9",
+      "#4 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13",
+      "#5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2"
+    ],
+    "relevant_stack_frames": [
+      "#0 0x58c1c4d9da71 in keyhash /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:74:9",
+      "#1 0x58c1c4d9da71 in htab_find_elem /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:144:16",
+      "#2 0x58c1c4d9da71 in htab_delete /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:170:19",
+      "#3 0x58c1c4d9eb26 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:95:2",
+      "#4 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25",
+      "#5 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9",
+      "#6 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13",
+      "#7 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2",
+      "#9 0x725c82a9cb83 in start_thread nptl/pthread_create.c:447:8"
+    ],
+    "sp_linked": false,
+    "top_source_frame": "/tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c",
+    "verification_eligible": false
+  },
+  "execution_seconds": 2.3711206509906333,
+  "exit_code": 250,
+  "failure_classification": "SANITIZER_CRASH",
+  "function_reached": null,
+  "runtime_profile": {
+    "sanitizers": [
+      "ASAN"
+    ],
+    "source": "explicit_runtime_configuration"
+  },
+  "sanitizer": "AddressSanitizer: heap-use-after-free on address 0x5020000360b0 at pc 0x58c1c4d9da72 bp 0x725c8262fae0 sp 0x725c8262fad8",
+  "signal": null,
+  "source_artifact_sanitizers": [
+    "ASAN"
+  ],
+  "sp_condition_reached": null,
+  "sp_location_reached": null,
+  "sp_reached": null,
+  "stack_trace": "    #0 0x58c1c4d9da71 in keyhash /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:74:9\n    #1 0x58c1c4d9da71 in htab_find_elem /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:144:16\n    #2 0x58c1c4d9da71 in htab_delete /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:170:19\n    #3 0x58c1c4d9eb26 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:95:2\n    #4 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25\n    #5 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9\n    #6 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13\n    #7 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #8 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n    #9 0x725c82a9cb83 in start_thread nptl/pthread_create.c:447:8\n    #10 0x725c82b29ecb in clone3 misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78\n    #0 0x58c1c4d4427a in free (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xd127a) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d9ea36 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:89:2\n    #2 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25\n    #3 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9\n    #4 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13\n    #5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #6 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n    #0 0x58c1c4d2c21e in strdup (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xb921e) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d9e6c2 in orderedmap_append /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:58:7\n    #2 0x58c1c4d924df in add_header_to_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:662:16\n    #3 0x58c1c4d924df in get_all_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:703:32\n    #4 0x58c1c4d90453 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1645:13\n    #5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #6 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n    #0 0x58c1c4d29e85 in pthread_create (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xb6e85) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d8550a in child_main_loop /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:211:21\n    #2 0x58c1c4d99623 in main /tmp/va-tinyproxy-clean-eval-saeucXan/src/main.c:407:9\n    #3 0x725c82a2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n    #4 0x725c82a2a28a in __libc_start_main csu/../csu/libc-start.c:360:3\n    #5 0x58c1c4ca96c4 in _start (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0x366c4) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)",
+  "stderr": "=================================================================\n==63266==ERROR: AddressSanitizer: heap-use-after-free on address 0x5020000360b0 at pc 0x58c1c4d9da72 bp 0x725c8262fae0 sp 0x725c8262fad8\nREAD of size 1 at 0x5020000360b0 thread T2\n    #0 0x58c1c4d9da71 in keyhash /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:74:9\n    #1 0x58c1c4d9da71 in htab_find_elem /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:144:16\n    #2 0x58c1c4d9da71 in htab_delete /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:170:19\n    #3 0x58c1c4d9eb26 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:95:2\n    #4 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25\n    #5 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9\n    #6 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13\n    #7 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #8 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n    #9 0x725c82a9cb83 in start_thread nptl/pthread_create.c:447:8\n    #10 0x725c82b29ecb in clone3 misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78\n\n0x5020000360b0 is located 0 bytes inside of 11-byte region [0x5020000360b0,0x5020000360bb)\nfreed by thread T2 here:\n    #0 0x58c1c4d4427a in free (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xd127a) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d9ea36 in orderedmap_remove /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:89:2\n    #2 0x58c1c4d9662d in remove_connection_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:803:25\n    #3 0x58c1c4d94207 in process_client_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:944:9\n    #4 0x58c1c4d90c97 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1742:13\n    #5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #6 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n\npreviously allocated by thread T2 here:\n    #0 0x58c1c4d2c21e in strdup (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xb921e) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d9e6c2 in orderedmap_append /tmp/va-tinyproxy-clean-eval-saeucXan/src/orderedmap.c:58:7\n    #2 0x58c1c4d924df in add_header_to_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:662:16\n    #3 0x58c1c4d924df in get_all_headers /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:703:32\n    #4 0x58c1c4d90453 in handle_connection /tmp/va-tinyproxy-clean-eval-saeucXan/src/reqs.c:1645:13\n    #5 0x58c1c4d8585c in child_thread /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:56:2\n    #6 0x58c1c4d41ffc in asan_thread_start(void*) asan_interceptors.cpp.o\n\nThread T2 created by T0 here:\n    #0 0x58c1c4d29e85 in pthread_create (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0xb6e85) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n    #1 0x58c1c4d8550a in child_main_loop /tmp/va-tinyproxy-clean-eval-saeucXan/src/child.c:211:21\n    #2 0x58c1c4d99623 in main /tmp/va-tinyproxy-clean-eval-saeucXan/src/main.c:407:9\n    #3 0x725c82a2a1c9 in __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n    #4 0x725c82a2a28a in __libc_start_main csu/../csu/libc-start.c:360:3\n    #5 0x58c1c4ca96c4 in _start (/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy+0x366c4) (BuildId: 68cf3cb120ac42b700e160f4c23ab3a6e1062f07)\n\nSUMMARY: AddressSanitizer: heap-use-after-free /tmp/va-tinyproxy-clean-eval-saeucXan/src/hsearch.c:74:9 in keyhash\nShadow bytes around the buggy address:\n  0x502000035e00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000035e80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000035f00: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000035f80: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000036000: fa fa 00 02 fa fa 00 00 fa fa 05 fa fa fa 00 00\n=>0x502000036080: fa fa 00 03 fa fa[fd]fd fa fa fd fa fa fa fd fa\n  0x502000036100: fa fa 00 07 fa fa 02 fa fa fa 00 00 fa fa 02 fa\n  0x502000036180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000036200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000036280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\n  0x502000036300: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07 \n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n==63266==ABORTING\n",
+  "stdout": "ERROR     Oct 09 14:16:43.479 [63266]: read_request_line: Client (file descriptor: 4) closed socket before read.\n",
+  "target_reached": null,
+  "timed_out": false
+}

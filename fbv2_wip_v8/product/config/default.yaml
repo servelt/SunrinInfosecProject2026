@@ -1,0 +1,75 @@
+scheduler:
+  high_slots: 4
+  aging_slots: 1
+  high_min_source_signals: 2
+  weights:
+    entry: 40
+    core: 45
+    core_without_source: 2
+    runtime_reached: 20
+    static_reached: 8
+    depth_base: 0
+    depth_penalty: 0
+    memory_operation: 12
+    pointer_lifetime_operation: 10
+    length_index_operation: 6
+    parser_operation: 5
+    state_write: 5
+    prior_analysis_penalty: 8
+    aging: 1
+deep_verification:
+  high_slots: 4
+  aging_slots: 1
+  weights:
+    runtime_reached: 50
+    security_relevance_hint: 8
+    trigger_specificity_hint: 6
+    static_support_hint: 2
+    unverified_contradiction_hint: 1
+    required_state_complexity: 1
+    source_mutation_before_read: 12
+    verified_evidence: 10
+    verification_cost: 1
+    aging: 1
+budget:
+  max_functions_per_scan: 3
+  max_llm_calls_per_function: 8
+  max_context_expansion: 2
+  max_sp_verify_attempts: 2
+  max_poc_revisions: 2
+  max_runtime_attempts: 2
+  max_gdb_attempts: 1
+  max_fuzz_time: 30
+runtime:
+  timeout_seconds: 10
+fuzzing:
+  global_enabled: false
+  global_seconds: 3
+llm:
+  provider: codex
+  effort: medium
+  timeout_seconds: 300
+# Codex app-server role profile mapped by task strength from the preserved
+# Flash/full/coding role plan.  The default provider is Codex; there is no
+# automatic Ollama fallback.
+models:
+  direction_generator: {model: gpt-5.6-luna, reasoning: high}
+  function_analysis: {model: gpt-5.6-sol, reasoning: max}
+  sp_generation: {model: gpt-5.6-luna, reasoning: high}
+  assertion_generator: {model: gpt-5.6-sol, reasoning: max}
+  sp_verifier: {model: gpt-5.6-sol, reasoning: low}
+  poc_generator: {model: gpt-5.6-sol, reasoning: max}
+  runtime_analysis: {model: gpt-5.6-sol, reasoning: max}
+  gdb_analysis: {model: gpt-5.6-sol, reasoning: max}
+  root_cause_verifier: {model: gpt-5.6-sol, reasoning: max}
+# Ollama Max cloud profile. Only roles already present in this workflow call an LLM.
+models_ollama_cloud:
+  direction_generator: {model: glm-5.3-flash, reasoning: high}
+  function_analysis: {model: glm-5.3-flash, reasoning: high}
+  sp_generation: {model: glm-5.3-flash, reasoning: high}
+  assertion_generator: {model: glm-5.3, reasoning: max}
+  sp_verifier: {model: glm-5.3, reasoning: low}
+  poc_generator: {model: glm-5.3, reasoning: max}
+  runtime_analysis: {model: glm-5.3, reasoning: max}
+  gdb_analysis: {model: glm-5.3, reasoning: max}
+  root_cause_verifier: {model: glm-5.3, reasoning: max}

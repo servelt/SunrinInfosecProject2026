@@ -1,0 +1,151 @@
+--- V7/engine/devtools/campaign_model_gate.py
++++ V8/engine/devtools/campaign_model_gate.py
+@@ -1198,6 +1198,7 @@
+     factory._fbv2_campaign_invocation_lock = (
+         None if parallel_agents else invocation_lock)
+     factory._fbv2_campaign_gate = gate
++    factory._fbv2_campaign_boundary_lock = boundary_lock
+     return factory
+ 
+ 
+--- V7/engine/devtools/original_hp_live_optin.py
++++ V8/engine/devtools/original_hp_live_optin.py
+@@ -1046,6 +1046,17 @@
+ 
+     client_type = _hp_client_type(check)
+ 
++    boundary_lock = None
++    if getattr(getattr(bound, "executor", None),
++               "parallel_hp_async_factory", None) is not None:
++        factory = getattr(getattr(bound, "strategy", None),
++                          "llm_client_factory", None)
++        boundary_lock = getattr(factory, "_fbv2_campaign_boundary_lock", None)
++        if (getattr(factory, "_fbv2_campaign_gate", None) is not
++                bound.model_gate or not isinstance(boundary_lock,
++                                                  asyncio.Lock)):
++            raise ValueError("HP parallel model boundary is not shared")
++
+     def build(work):
+         check()
+         event_dir = bound.identity.run_dir / "model_events"
+@@ -1064,7 +1075,8 @@
+             event_log_path=event_dir / f"hp_{role}_{uuid4().hex}.jsonl")
+         provider = CampaignLedgeredProvider(
+             transport, bound.model_gate, role=role,
+-            owner_id=f"hp:{work.function_id}:{work.direction_id}:{role}")
++            owner_id=f"hp:{work.function_id}:{work.direction_id}:{role}",
++            boundary_lock=boundary_lock)
+         return AgentPipeline(provider, max_context_requests=2)
+ 
+     return build
+--- V7/engine/fuzzingbrain/worker/strategies/pov_fullscan.py
++++ V8/engine/fuzzingbrain/worker/strategies/pov_fullscan.py
+@@ -1374,6 +1374,12 @@
+             for index in range(max((len(group) for group in groups), default=0))
+             for group in groups if index < len(group)
+         ]
++        if self._full_nohint_sp:
++            # Prefer sanitizer-relevant source surfaces across the entire
++            # phase.  The interleaved position remains the stable tie breaker,
++            # so equal scores retain Direction breadth and model order.
++            interleaved.sort(
++                key=lambda item: -self._function_campaign_priority(item[0]))
+         unique = []
+         seen = set()
+         for func, direction_id in interleaved:
+--- V7/engine/tests/test_campaign_model_gate.py
++++ V8/engine/tests/test_campaign_model_gate.py
+@@ -1056,6 +1056,10 @@
+                                                parallel_agents=True)
+         sp = factory("sp", "function-A")
+         verifier = factory("verifier", "candidate-B")
++        self.assertIs(sp._fbv2_campaign_boundary_lock,
++                      factory._fbv2_campaign_boundary_lock)
++        self.assertIs(verifier._fbv2_campaign_boundary_lock,
++                      factory._fbv2_campaign_boundary_lock)
+         tool = {"type": "function", "function": {
+             "name": "read_source", "parameters": {"type": "object",
+                 "properties": {"path": {"type": "string"}},
+--- V7/engine/tests/test_original_hp_signed_optin.py
++++ V8/engine/tests/test_original_hp_signed_optin.py
+@@ -242,6 +242,55 @@
+     assert observed[0]["timeout_seconds"] != bound.caps.model_wall_seconds
+ 
+ 
++def test_parallel_hp_pipeline_shares_sp_host_tool_boundary(tmp_path, monkeypatch):
++    run_dir = tmp_path / "run"
++    event_dir = run_dir / "model_events"
++    event_dir.mkdir(parents=True, mode=0o700)
++    hp = {"enabled": True, "max_items": 1, "max_model_calls": 4,
++          "assets": {}}
++    spec_path = tmp_path / "spec.json"
++    spec_path.write_text(json.dumps({"hp": hp}, sort_keys=True))
++    gate = object()
++    lock = asyncio.Lock()
++
++    def sp_factory(_role, _owner):
++        raise AssertionError("pipeline construction must not start SP")
++
++    sp_factory._fbv2_campaign_gate = gate
++    sp_factory._fbv2_campaign_boundary_lock = lock
++
++    class Transport:
++        def __init__(self, **_kwargs):
++            pass
++
++    monkeypatch.setattr(hp_live, "_hp_client_type", lambda _check: Transport)
++    monkeypatch.setattr(hp_live, "validate_hp_spec",
++                        lambda *_args, **_kwargs: None)
++    bound = SimpleNamespace(
++        identity=SimpleNamespace(
++            run_dir=run_dir, task_path=tmp_path, codex_role_models=None,
++            codex_model="fixture", codex_effort="max",
++            product_src=tmp_path / "product-src",
++            codex_executable=tmp_path / "codex",
++            codex_executable_sha256="a" * 64),
++        caps=SimpleNamespace(model_turn_seconds=600,
++                             bounded_nohint_dev=False),
++        model_gate=gate, recheck=lambda: None,
++        strategy=SimpleNamespace(llm_client_factory=sp_factory),
++        executor=SimpleNamespace(parallel_hp_async_factory=object()))
++    work = SimpleNamespace(function_id="function", direction_id="direction")
++
++    for role in ("function_analysis", "assertion_generator"):
++        pipeline = hp_live._pipeline_factory(
++            bound, hp, role, spec_path, _sha(spec_path))(work)
++        assert pipeline.provider._boundary_lock is lock
++
++    sp_factory._fbv2_campaign_gate = object()
++    with pytest.raises(ValueError, match="boundary is not shared"):
++        hp_live._pipeline_factory(
++            bound, hp, "function_analysis", spec_path, _sha(spec_path))
++
++
+ def test_signed_hp_run_claim_is_one_shot_and_result_is_separate(
+         tmp_path, monkeypatch):
+     source, hp = _assets(tmp_path)
+--- V7/engine/tests/test_fullscan_client_factory.py
++++ V8/engine/tests/test_fullscan_client_factory.py
+@@ -690,6 +690,22 @@
+     assert [(func.function_id, direction_id)
+             for func, direction_id in work] == [
+                 ("shared", "D1"), ("unique", "D2")]
++
++
++def test_full_nohint_prioritizes_function_risk_across_directions():
++    strategy, _ = make_strategy(RecordingFactory())
++    strategy._full_nohint_sp = True
++    low = SimpleNamespace(function_id="low", name="low", content="int f(void) { return 0; }")
++    high = SimpleNamespace(function_id="high", name="high",
++                           content="void f(char *p, int i) { p[i] = 1; free(p); }")
++    pools = [
++        (SimpleNamespace(direction_id="D1"), {"small/new": [low]}),
++        (SimpleNamespace(direction_id="D2"), {"small/new": [high]}),
++    ]
++
++    assert [(func.function_id, direction_id) for func, direction_id in
++            strategy._phase_work_for_directions(pools, "small/new")] == [
++                ("high", "D2"), ("low", "D1")]
+ 
+ 
+ def test_full_nohint_deduplicates_same_function_across_phases():

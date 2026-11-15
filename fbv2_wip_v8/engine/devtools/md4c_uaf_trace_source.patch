@@ -1,0 +1,61 @@
+--- a/src/md4c.c
++++ b/src/md4c.c
+@@ -32,6 +32,7 @@
+ #include <string.h>
+ 
+ #include "md4c.h"
++#include "md4c_uaf_trace_hooks.h"
+ 
+ 
+ /*****************************
+@@ -5740,15 +5741,22 @@
+ 
+     if(ctx->n_block_bytes + n_bytes > ctx->alloc_block_bytes) {
+         void* new_block_bytes;
++        void* old_block_bytes = ctx->block_bytes;
++        size_t old_alloc_block_bytes = ctx->alloc_block_bytes;
++        int fbv2_realloc_line;
+ 
+         ctx->alloc_block_bytes = (ctx->alloc_block_bytes > 0
+                 ? ctx->alloc_block_bytes + ctx->alloc_block_bytes / 2
+                 : 512);
++        fbv2_realloc_line = __LINE__ + 1;
+         new_block_bytes = realloc(ctx->block_bytes, ctx->alloc_block_bytes);
+         if(new_block_bytes == NULL) {
+             MD_LOG("realloc() failed.");
+             return NULL;
+         }
++        FBV2_TRACE_REALLOC_AT(old_block_bytes, old_alloc_block_bytes,
++                              new_block_bytes, ctx->alloc_block_bytes,
++                              fbv2_realloc_line);
+ 
+         /* Fix the ->current_block after the reallocation. */
+         if(ctx->current_block != NULL) {
+@@ -5832,6 +5840,8 @@
+     MD_SIZE n = 0;
+     OFF ignored;
+ 
++    FBV2_TRACE_STALE(lines);
++
+     while(n < n_lines) {
+         int n_consumed = 0;
+ 
+@@ -5884,6 +5894,10 @@
+         ctx->current_block = NULL;
+     } else {
+         /* Remove some initial lines from the block. */
++        FBV2_TRACE_ACCESS(lines, lines + n,
++                          (n_lines - n) * sizeof(MD_LINE),
++                          "memmove",
++                          "md_consume_link_reference_definitions");
+         memmove(lines, lines + n, (n_lines - n) * sizeof(MD_LINE));
+         ctx->current_block->n_lines -= n;
+         ctx->n_block_bytes -= n * sizeof(MD_LINE);
+@@ -7331,6 +7345,7 @@
+     memset(&ctx, 0, sizeof(MD_CTX));
+     ctx.text = text;
+     ctx.size = size;
++    FBV2_TRACE_INPUT(text, size);
+     memcpy(&ctx.parser, parser, sizeof(MD_PARSER));
+     ctx.userdata = userdata;
+     ctx.code_indent_offset = (ctx.parser.flags & MD_FLAG_NOINDENTEDCODEBLOCKS) ? (OFF)(-1) : 4;

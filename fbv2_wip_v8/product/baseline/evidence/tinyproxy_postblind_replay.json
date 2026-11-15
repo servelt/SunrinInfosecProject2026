@@ -1,0 +1,17 @@
+{
+  "input_sha256": "2de144deb6b63e8a1573ea0a84ee89768e727309def3eb41652b4dbfd0242859",
+  "binary_sha256": "e358416fa54585957a35820d06722e9f8d6847312c6c85e55e22f92805c88ab5",
+  "command": [
+    "python3",
+    "/home/dawne/SunrinInfosecProject2026/vulnerabilityanalysis/tests/fixtures/tinyproxy/runner.py",
+    "/tmp/va-tinyproxy-clean-eval-saeucXan/src/tinyproxy",
+    "/home/dawne/SunrinInfosecProject2026/result/vulnerabilityanalysis/20261009T051404Z-dd8b6502/poc/poc-de0a27ab19b8ba30/input.bin"
+  ],
+  "exit_code": 250,
+  "timed_out": false,
+  "seconds": 2.313,
+  "asan_heap_uaf": true,
+  "keyhash_frame": true,
+  "orderedmap_remove_frame": true,
+  "source": "fresh subprocess after blind scan; not workflow independent validation"
+}

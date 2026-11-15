@@ -1,0 +1,36 @@
+{
+  "kind": "HP_ASSUMPTION_LIFECYCLE_PROVENANCE_FIXTURE_V1",
+  "credit": "NONE_PROVIDER_FREE_NEGATIVE_FIXTURE",
+  "source_archive": "FBV2_HP_PARSE_ARRAY_VERTICAL_CONTROL_REVIEW_20261106.zip",
+  "source_archive_sha256": "90cbe6dc065ace0f9d837ef067d760281fd96b47adcb75bd47a32fb9b2eb3d8d",
+  "function": "parse_array",
+  "candidate": {
+    "safe_assumption": "At line 1474 on the supplied parse_value path, input_buffer->offset is at least 1 before the size_t decrement, so input_buffer->offset-- cannot underflow.",
+    "source_location": "cJSON.c:1474",
+    "security_property": "Memory safety: size_t offset arithmetic must not underflow before subsequent buffer addressing."
+  },
+  "rounds": [
+    {
+      "request_id": "85ee355bea7d4bc8909c322471ed6567",
+      "response_sha256": "4f1dcb77e949230731e2a613e63b72819f7142ddfd6c70f5df4a42813af8bf5a",
+      "observed": "EXPLICIT_SAFE_JUDGMENT"
+    },
+    {
+      "request_id": "bcf5a974192f461397d812b75f86a7bc",
+      "response_sha256": "567793fa36b159f8d7ecee364417267e582883e47874e09f35c9e273409920c0",
+      "observed": "RECLASSIFIED_VALIDATION",
+      "validation": "After the accessible opening bracket, offset is incremented before either decrement at lines 1469 or 1474, so those decrements cannot underflow on the supplied path."
+    },
+    {
+      "request_id": "76ce9590a77c4a92be0ad6571f15ce3f",
+      "response_sha256": "149000e34459dee43a71b7497ea1a478c7a1dbd6101f12250f78c533dd4ac3b7",
+      "observed": "RECLASSIFIED_VALIDATION"
+    },
+    {
+      "request_id": "3a10ace33c2a4b56901a7bdfaef85e3c",
+      "response_sha256": "90f0eb2243bd7c662e18e798218664f7b0080d89b68dc1a9cb6552815ed15d0b",
+      "observed": "NO_SAFE_RESTATEMENT"
+    }
+  ],
+  "expected_disposition": "RECLASSIFIED_VALIDATION"
+}

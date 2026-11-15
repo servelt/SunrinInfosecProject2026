@@ -1,0 +1,1242 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from dataclasses import asdict
+from pathlib import Path
+from jsonschema.exceptions import ValidationError
+from jsonschema import validate as validate_json
+
+from vulnerabilityanalysis.agents import AgentPipeline as ProductAgentPipeline, _VERDICT, _bounded_harness_source
+from vulnerabilityanalysis.llm import OllamaCloudError
+from vulnerabilityanalysis.models import FunctionAnalysis, SuspiciousPoint
+
+
+class ScriptedProvider:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.roles = []
+        self.requests = []
+
+    async def generate(self, request):
+        self.roles.append(request.role)
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+    async def close_session(self, session_key):
+        pass
+
+    async def close(self):
+        pass
+
+
+class AgentPipeline(ProductAgentPipeline):
+    """Historical fixtures in this file exercise explicit offline reply replay."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('legacy_offline_replay', True)
+        super().__init__(*args, **kwargs)
+
+
+class AgentSeparationTest(unittest.TestCase):
+    def test_function_analysis_receives_absolute_source_lines_for_hp_handoff(self):
+        response = {"summary": "reviewed", "input_flow": "input to indexed read",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": [], "unknowns": [], "input_sources": [],
+                    "security_sensitive_operations": [], "validations": [],
+                    "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        provider = ScriptedProvider([response])
+        source = "int parse(void) {\n  return 1;\n}\n"
+        asyncio.run(AgentPipeline(provider).analyze_function(
+            "fn", "parse", "target.c", source, source_start_line=205))
+        payload = provider.requests[0].payload
+        self.assertEqual(payload["source_start_line"], 205)
+        self.assertEqual(payload["source"],
+                         "205: int parse(void) {\n206:   return 1;\n207: }")
+
+    def test_function_analysis_records_requests_omitted_by_per_turn_limit(self):
+        requests = [{"target": f"helper_{index}", "request_type": "CALLEE",
+                     "reason": "inspect", "expected_information": "source"}
+                    for index in range(3)]
+        response = {"summary": "reviewed", "input_flow": "input", "state_dependencies": [],
+                    "context_requests": requests, "safe_assumptions": [], "unknowns": [],
+                    "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        pipeline = AgentPipeline(ScriptedProvider([response]), max_context_requests=2)
+        analysis = asyncio.run(pipeline.analyze_function(
+            "fn", "target", "target.c", "int target(void) { return 0; }"))
+        self.assertEqual([item.target for item in analysis.context_requests],
+                         ["helper_0", "helper_1"])
+        self.assertEqual(pipeline.last_context_request_omitted,
+                         [requests[2]])
+
+    def test_function_analysis_preserves_hypothesis_judgment_without_inventing_safety(self):
+        response = {"summary": "reviewed", "input_flow": "input bytes to state",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": ["callee body missing"], "input_sources": ["input bytes"],
+                    "security_sensitive_operations": ["state read"], "validations": [],
+                    "memory_operations": [], "evidence": ["target.c:2 reads state"],
+                    "hypothesis_evaluations": [{
+                        "source_location": "target.c:2", "security_property": "valid state",
+                        "hypothesis": "input may invalidate state", "judgment": "UNKNOWN",
+                        "reason": "callee body missing", "safe_assumption": ""}]}
+        analysis = asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+            "fn", "target", "target.c", "void target(void) {}"))
+        self.assertEqual(analysis.hypothesis_evaluations, response["hypothesis_evaluations"])
+        self.assertEqual(analysis.safe_assumptions, [])
+
+    def test_unlinked_model_safety_claim_is_preserved_as_unknown(self):
+        response = {"summary": "reviewed", "input_flow": "input bytes to state",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": ["A broad claim not justified by the recorded verdict"],
+                    "unknowns": [], "input_sources": ["input bytes"],
+                    "security_sensitive_operations": [], "validations": [],
+                    "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": [{
+                        "source_location": "target.c:2", "security_property": "valid state",
+                        "hypothesis": "input may invalidate state",
+                        "judgment": "UNKNOWN", "reason": "callee body missing",
+                        "safe_assumption": ""}]}
+        analysis = asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+            "fn", "target", "target.c", "void target(void) {}"))
+        self.assertEqual(analysis.safe_assumptions, [])
+        self.assertIn("A broad claim", analysis.unknowns[-1])
+
+    def test_explicit_safe_row_omitted_from_top_level_is_auditable_but_not_promoted(self):
+        response = {"summary": "reviewed", "input_flow": "input to callee",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": [], "unknowns": [], "input_sources": [],
+                    "security_sensitive_operations": [], "validations": [],
+                    "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": [{
+                        "source_location": "target.c:2", "security_property": "lifetime",
+                        "hypothesis": "callee retains the buffer", "judgment": "EXPLICIT_SAFE_JUDGMENT",
+                        "reason": "model judged a synchronous call",
+                        "safe_assumption": "callee does not retain the buffer"}]}
+        provider = ScriptedProvider([response])
+        pipeline = AgentPipeline(provider)
+        analysis = asyncio.run(pipeline.analyze_function(
+            "fn", "target", "target.c", "void target(void) {}"))
+        assertions = asyncio.run(pipeline.generate_assertions(
+            analysis, "w", "d", "void target(void) {}"))
+        self.assertEqual(analysis.safe_assumptions, [])
+        self.assertEqual(assertions, [])
+        self.assertEqual(provider.roles, ["function_analysis"])
+        self.assertTrue(any("Unlisted explicit safe assumption" in item and
+                            "callee does not retain the buffer" in item
+                            for item in analysis.unknowns))
+
+    def test_unlisted_safe_row_does_not_displace_a_linked_generator_candidate(self):
+        linked = "index remains within the destination allocation"
+        unlisted = "callee does not retain the destination"
+        response = {"summary": "reviewed", "input_flow": "input to output",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": [linked], "unknowns": [], "input_sources": [],
+                    "security_sensitive_operations": [], "validations": [],
+                    "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": [
+                        {"source_location": "target.c:2", "security_property": "bounds",
+                         "hypothesis": "index can exceed output", "judgment": "EXPLICIT_SAFE_JUDGMENT",
+                         "reason": "model judged the bound", "safe_assumption": linked},
+                        {"source_location": "target.c:3", "security_property": "lifetime",
+                         "hypothesis": "callee retains output", "judgment": "EXPLICIT_SAFE_JUDGMENT",
+                         "reason": "model judged synchronous use", "safe_assumption": unlisted}]}
+        provider = ScriptedProvider([response, {"assertions": []}])
+        pipeline = AgentPipeline(provider)
+        source = "void target(void) {}"
+        analysis = asyncio.run(pipeline.analyze_function("fn", "target", "target.c", source))
+        assertions = asyncio.run(pipeline.generate_assertions(analysis, "w", "d", source))
+        self.assertEqual(analysis.safe_assumptions, [linked])
+        self.assertTrue(any(unlisted in item for item in analysis.unknowns))
+        self.assertEqual(provider.roles, ["function_analysis", "assertion_generator"])
+        expected_payload = asdict(analysis)
+        expected_payload["unknowns"] = []
+        expected_payload["safe_assumption_ids"] = [
+            {"safe_id": 0, "safe_assumption": linked}]
+        self.assertEqual(provider.requests[1].payload["analysis"], expected_payload)
+        self.assertEqual(assertions, [])
+
+    def test_linked_safe_assumption_reaches_generator_without_payload_changes(self):
+        linked = "index is less than output length"
+        response = {"summary": "reviewed", "input_flow": "input index",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": [linked], "unknowns": ["other path unknown"],
+                    "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": [{
+                        "source_location": "target.c:2", "security_property": "bounds",
+                        "hypothesis": "index exceeds output", "judgment": "EXPLICIT_SAFE_JUDGMENT",
+                        "reason": "model judged caller bound", "safe_assumption": linked}]}
+        provider = ScriptedProvider([response, {"assertions": []}])
+        pipeline = AgentPipeline(provider)
+        source = "void target(void) {}"
+        analysis = asyncio.run(pipeline.analyze_function("fn", "target", "target.c", source))
+        asyncio.run(pipeline.generate_assertions(analysis, "w", "d", source))
+        self.assertEqual(provider.roles, ["function_analysis", "assertion_generator"])
+        expected_payload = asdict(analysis)
+        expected_payload["safe_assumption_ids"] = [
+            {"safe_id": 0, "safe_assumption": linked}]
+        self.assertEqual(provider.requests[1].payload["analysis"], expected_payload)
+
+    def test_unknown_or_possible_bug_without_safe_judgment_does_not_call_generator(self):
+        for judgment in ("UNKNOWN", "POSSIBLE_BUG"):
+            with self.subTest(judgment=judgment):
+                response = {"summary": "reviewed", "input_flow": "input index",
+                            "state_dependencies": [], "context_requests": [],
+                            "safe_assumptions": [], "unknowns": [], "input_sources": [],
+                            "security_sensitive_operations": [], "validations": [],
+                            "memory_operations": [], "evidence": [],
+                            "hypothesis_evaluations": [{
+                                "source_location": "target.c:2", "security_property": "bounds",
+                                "hypothesis": "index exceeds output", "judgment": judgment,
+                                "reason": "needs caller contract", "safe_assumption": ""}]}
+                provider = ScriptedProvider([response])
+                pipeline = AgentPipeline(provider)
+                source = "void target(void) {}"
+                analysis = asyncio.run(pipeline.analyze_function(
+                    "fn", "target", "target.c", source))
+                assertions = asyncio.run(pipeline.generate_assertions(
+                    analysis, "w", "d", source))
+                self.assertEqual(analysis.safe_assumptions, [])
+                self.assertEqual(assertions, [])
+                self.assertEqual(provider.roles, ["function_analysis"])
+
+    def test_safety_claim_without_evaluated_hypothesis_is_not_assertion_candidate(self):
+        response = {"summary": "reviewed", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [],
+                    "safe_assumptions": ["caller always validates length"],
+                    "unknowns": [], "input_sources": [],
+                    "security_sensitive_operations": [], "validations": [],
+                    "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        analysis = asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+            "fn", "target", "target.c", "void target(void) {}"))
+        self.assertEqual(analysis.safe_assumptions, [])
+        self.assertIn("caller always validates length", analysis.unknowns[-1])
+
+    def test_middle_harness_entry_and_input_helper_are_sent_to_analyzer(self):
+        response = {"summary": "unknown", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        harness = ("/* unrelated prefix */\n" * 170 +
+                   "static unsigned char convert(unsigned char byte) { return byte ^ 1; }\n" +
+                   "int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {\n"
+                   "  if (size) target(convert(data[0]));\n  return 0;\n}\n" +
+                   "/* unrelated suffix */\n" * 170)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "harness.c"
+            path.write_text(harness)
+            provider = ScriptedProvider([response])
+            asyncio.run(AgentPipeline(provider).analyze_function(
+                "fn", "target", "target.c", "void target(unsigned char x) {}",
+                harness_source=harness, harness_source_path=path))
+            payload = provider.requests[0].payload
+            excerpt = payload["harness_source"]
+            self.assertTrue(payload["harness_source_truncated"])
+            self.assertIn("LLVMFuzzerTestOneInput", excerpt)
+            self.assertIn("target(convert(data[0]))", excerpt)
+            self.assertIn("static unsigned char convert", excerpt)
+            self.assertLessEqual(len(excerpt), 4096)
+
+    def test_long_harness_keeps_registered_local_callback_after_direct_helpers(self):
+        response = {"summary": "unknown", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        harness = (
+            "/* unrelated prefix */\n" * 140 +
+            "static int direct_helper(int n) { return n + 1; }\n" +
+            "static void* limited_malloc(void* ctx, unsigned long size) {\n"
+            "  if (size > 8000000) return 0;\n"
+            "  return malloc(size);\n"
+            "}\n" +
+            "static int unrelated_helper(void) { return 7; }\n" +
+            "int LLVMFuzzerTestOneInput(const unsigned char* data, size_t size) {\n"
+            "  set_allocator(limited_malloc);\n"
+            "  if (size) parse(data, direct_helper((int)size));\n"
+            "  return 0;\n"
+            "}\n" +
+            "/* unrelated suffix */\n" * 140)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "harness.c"
+            path.write_text(harness)
+            provider = ScriptedProvider([response])
+            asyncio.run(AgentPipeline(provider).analyze_function(
+                "fn", "parse", "target.c", "void parse(void) {}",
+                harness_source=harness, harness_source_path=path))
+            excerpt = provider.requests[0].payload["harness_source"]
+            self.assertIn("set_allocator(limited_malloc)", excerpt)
+            self.assertIn("static int direct_helper", excerpt)
+            self.assertIn("static void* limited_malloc", excerpt)
+            self.assertNotIn("static int unrelated_helper", excerpt)
+            self.assertLessEqual(len(excerpt), 4096)
+
+    def test_harness_excerpt_does_not_choose_ambiguous_callback_definition(self):
+        harness = ("/* padding */\n" * 350 +
+                   "#if 0\nstatic int callback(void) { return 1; }\n"
+                   "#else\nstatic int callback(void) { return 2; }\n#endif\n"
+                   "int LLVMFuzzerTestOneInput(void) { register_callback(callback); return 0; }\n")
+        excerpt, truncated = _bounded_harness_source(harness)
+        self.assertTrue(truncated)
+        self.assertIn("register_callback(callback)", excerpt)
+        self.assertNotIn("static int callback", excerpt)
+
+    def test_harness_excerpt_does_not_choose_conditionally_defined_callback(self):
+        harness = ("/* padding */\n" * 350 +
+                   "#if 0\nstatic int callback(void) { return 1; }\n#endif\n"
+                   "int LLVMFuzzerTestOneInput(void) { register_callback(callback); return 0; }\n")
+        excerpt, truncated = _bounded_harness_source(harness)
+        self.assertTrue(truncated)
+        self.assertIn("register_callback(callback)", excerpt)
+        self.assertNotIn("static int callback", excerpt)
+
+    def test_long_harness_keeps_input_boundary_and_later_target_call(self):
+        response = {"summary": "unknown", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        harness = ("int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {\n"
+                   + "/* padding */\n" * 400
+                   + "if (size > 1) parse(data, size);\nreturn 0;\n}\n")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "harness.c"
+            path.write_text(harness)
+            provider = ScriptedProvider([response])
+            asyncio.run(AgentPipeline(provider).analyze_function(
+                "fn", "parse", "target.c", "int parse(void) { return 0; }",
+                harness_source=harness, harness_source_path=path))
+            payload = provider.requests[0].payload
+            self.assertTrue(payload["harness_source_truncated"])
+            self.assertIn("LLVMFuzzerTestOneInput", payload["harness_source"])
+            self.assertIn("parse(data, size)", payload["harness_source"])
+            self.assertIn("HARNESS SOURCE OMITTED", payload["harness_source"])
+            self.assertLessEqual(len(payload["harness_source"]), 4096)
+
+    def test_python_process_harness_keeps_middle_input_delivery_function(self):
+        response = {"summary": "unknown", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        path = Path(__file__).parent / "fixtures/tinyproxy/runner.py"
+        provider = ScriptedProvider([response])
+        asyncio.run(AgentPipeline(provider).analyze_function(
+            "fn", "target", "target.c", "void target(void) {}",
+            harness_source=path.read_text(), harness_source_path=path))
+        payload = provider.requests[0].payload
+        excerpt = payload["harness_source"]
+        self.assertTrue(payload["harness_source_truncated"])
+        self.assertIn("payload = input_file.read_bytes()", excerpt)
+        self.assertIn("proc = subprocess.Popen", excerpt)
+        self.assertIn('client = socket.create_connection(("127.0.0.1", proxy_port)', excerpt)
+        self.assertIn("client.sendall(payload)", excerpt)
+        self.assertIn('if __name__ == "__main__":', excerpt)
+        self.assertLessEqual(len(excerpt), 4096)
+
+    def test_function_analysis_receives_verified_harness_input_path(self):
+        response = {"summary": "queue read", "input_flow": "bytes enter parser state",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        harness_source = "int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { return parse(data, size); }"
+        with tempfile.TemporaryDirectory() as temp:
+            harness_path = Path(temp) / "harness.c"
+            harness_path.write_text(harness_source)
+            provider = ScriptedProvider([response])
+            asyncio.run(AgentPipeline(provider).analyze_function(
+                "fn", "parse", "target.c", "int parse(void) { return 0; }",
+                harness_source=harness_source, harness_source_path=harness_path))
+            payload = provider.requests[0].payload
+            self.assertEqual(payload["harness_source"], harness_source)
+            self.assertEqual(payload["harness_source_file"], str(harness_path.resolve()))
+            self.assertFalse(payload["harness_source_truncated"])
+
+    def test_function_analysis_receives_scheduler_scope_as_untrusted_provenance(self):
+        response = {"summary": "unknown", "input_flow": "unknown",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        scope = {
+            "worker": {"sanitizer": "ASAN", "harness_entry_functions": ["entry"]},
+            "direction": {"name": "decode", "entry_functions": ["entry"],
+                          "core_functions": ["parse"], "related_functions": [],
+                          "risk_level": "HIGH"},
+            "selected_function": {"function_id": "fn", "function_name": "parse",
+                                  "role": "CORE", "priority_reasons": ["core role +30"]},
+            "provenance_note": "metadata only",
+        }
+        provider = ScriptedProvider([response])
+        asyncio.run(AgentPipeline(provider).analyze_function(
+            "fn", "parse", "target.c", "int parse(void) { return 0; }",
+            analysis_scope=scope))
+        self.assertEqual(provider.requests[0].payload["analysis_scope"], scope)
+
+    def test_sp_roles_receive_existing_harness_input_path(self):
+        harness_source = "int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { return parse(data, size); }"
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        harness_path = Path(temp.name) / "harness.c"
+        harness_path.write_text(harness_source)
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [], [], [])
+        verdict = {"status": "UNKNOWN", "supporting_evidence": [],
+                   "contradicting_evidence": [], "unknowns": ["guard not established"],
+                   "rationale": "needs source evidence", "reachability": "UNKNOWN",
+                   "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                   "contradiction_snippet": "", "contradiction_scope": "UNKNOWN",
+                   "context_requests": [], "recommended_next_action": "RUNTIME_TRACE"}
+        provider = ScriptedProvider([{"suspicious_points": []}, verdict])
+        pipeline = AgentPipeline(provider)
+        asyncio.run(pipeline.generate_sp(analysis, "w", "d", "int parse(void) { return 0; }",
+                                         harness_source=harness_source,
+                                         harness_source_path=harness_path))
+        point = SuspiciousPoint("sp-input", "w", "d", "parse", "target.c", "UNKNOWN",
+                                "operation", "hypothesis", [], "UNKNOWN", [], [], [], [])
+        asyncio.run(pipeline.verify_sp(point, "int parse(void) { return 0; }", [],
+                                       harness_source=harness_source,
+                                       harness_source_path=harness_path))
+        self.assertEqual([request.payload["harness_source"] for request in provider.requests],
+                         [harness_source, harness_source])
+        self.assertTrue(all(not request.payload["harness_source_truncated"]
+                            for request in provider.requests))
+        self.assertEqual([request.payload["harness_source_file"] for request in provider.requests],
+                         [str(harness_path.resolve()), str(harness_path.resolve())])
+        self.assertEqual(point.status, "OPEN")
+
+    def test_verifier_checks_real_and_invented_harness_citations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            harness_dir = root / "fixture"
+            harness_dir.mkdir()
+            harness_path = harness_dir / "harness.c"
+            harness_source = "int LLVMFuzzerTestOneInput(void) { return parse(); }\n"
+            harness_path.write_text(harness_source)
+            target = root / "target.c"
+            source = "int parse(void) { return 0; }\n"
+            target.write_text(source)
+            sp = SuspiciousPoint("sp-harness-citation", "w", "d", "parse", str(target),
+                                 f"{target}:1", "return 0", "candidate", [], "UNKNOWN", [],
+                                 [], [], [])
+            response = {"status": "UNKNOWN", "supporting_evidence": [
+                f"{harness_path}:1 invokes parse via `return parse()`",
+                "fixture/harness.c:1 invokes parse via `return parse()`",
+                "fuzzer_harness.c:1 invokes parse"],
+                "contradicting_evidence": ["fuzzer_harness.c:1 rejects parse"],
+                "unknowns": ["state unresolved"],
+                "rationale": "harness reaches parse", "reachability": "YES",
+                "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                "contradiction_snippet": "", "contradiction_scope": "UNKNOWN",
+                "context_requests": [], "recommended_next_action": "RUNTIME_TRACE"}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(
+                sp, source, [], source_path=target, harness_source=harness_source,
+                harness_source_path=harness_path))
+            checks = pipeline.verifications[sp.sp_id].evidence_source_checks
+            self.assertEqual(result.status, "OPEN")
+            self.assertEqual([row["status"] for row in checks], [
+                "SOURCE_LOCATION_VERIFIED", "SOURCE_LOCATION_VERIFIED",
+                "SOURCE_FILE_MISSING", "SOURCE_FILE_MISSING"])
+            self.assertEqual(checks[0]["location"], f"{harness_path}:1")
+            self.assertEqual(checks[1]["location"], f"{harness_path}:1")
+            self.assertEqual(result.supporting_evidence, response["supporting_evidence"][:2])
+            self.assertEqual(result.contradicting_evidence, [])
+            self.assertTrue(any("Unverified source citation" in item for item in result.unknowns))
+
+    def test_unsigned_declaration_refutes_only_signed_overflow_subclaim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            header = root / "state.h"
+            header_source = "#include <stddef.h>\ntypedef struct {\n    size_t count;\n} state_t;\n"
+            header.write_text(header_source)
+            target = root / "target.c"
+            source = "void scan(state_t *state) {\n    state->count++;\n}\n"
+            target.write_text(source)
+            sp = SuspiciousPoint("sp-type", "w", "d", "scan", str(target),
+                                 f"{target}:2", "state->count++", "signed overflow or unsafe wrap",
+                                 [], "input controls iterations", [], [], [], [])
+            response = {"status": "REFUTED", "supporting_evidence": [],
+                        "contradicting_evidence": [f"{header}:3 declares count as size_t"],
+                        "unknowns": ["unsigned wrap impact remains untested"],
+                        "rationale": "signed undefined behavior is a false subclaim",
+                        "reachability": "UNKNOWN", "controllability": "UNKNOWN",
+                        "guards": [], "required_state": [],
+                        "contradiction_snippet": "size_t count;",
+                        "contradiction_scope": "PARTIAL", "context_requests": [],
+                        "recommended_next_action": "REFUTE"}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(
+                sp, source, [{"source_file": str(header), "source": header_source}],
+                source_path=target))
+            verification = pipeline.verifications[sp.sp_id]
+            self.assertEqual(result.status, "OPEN")
+            self.assertEqual(verification.verdict, "UNKNOWN")
+            self.assertEqual(verification.recommended_next_action, "RUNTIME_TRACE")
+            self.assertEqual(verification.evidence_source_checks[0]["status"],
+                             "SOURCE_LOCATION_VERIFIED")
+
+    def test_verifier_malformed_json_preserves_raw_response_and_retries_once(self):
+        valid = {"status": "UNKNOWN", "supporting_evidence": [],
+                 "contradicting_evidence": [], "unknowns": ["state not measured"],
+                 "rationale": "needs runtime", "reachability": "UNKNOWN",
+                 "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                 "contradiction_snippet": "", "contradiction_scope": "UNKNOWN",
+                 "context_requests": [], "recommended_next_action": "RUNTIME_TRACE"}
+        raw = json.dumps(valid) + "\n" + json.dumps({"extra": "second object"})
+
+        class ContractProvider:
+            def __init__(self):
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    try:
+                        json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        raise OllamaCloudError("Ollama Cloud returned invalid JSON") from exc
+                return valid
+
+        provider = ContractProvider()
+        point = SuspiciousPoint("sp-json-contract", "w", "d", "parse", "target.c",
+                                "target.c:2", "data[i]", "index may exceed bound",
+                                [], "external input", [], [], [], [])
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = AgentPipeline(provider, schema_error_dir=Path(temp))
+            result = asyncio.run(pipeline.verify_sp(point, "int parse(){return data[i;}", [],
+                                                    schema_retries=1))
+            self.assertEqual(result.status, "OPEN")
+            self.assertEqual(pipeline.last_request_count, 2)
+            self.assertIn("single JSON object", provider.requests[1].instructions)
+            saved = list(Path(temp).glob("sp_verifier_schema_error*.json"))
+            self.assertEqual(len(saved), 1)
+            diagnostic = json.loads(saved[0].read_text())
+            self.assertEqual(diagnostic["type"], "INVALID_JSON_RESPONSE")
+            self.assertEqual(diagnostic["invalid_response"], raw)
+
+    def test_verifier_schema_error_preserves_response_and_retries_once(self):
+        valid = {"status": "UNKNOWN", "supporting_evidence": [],
+                 "contradicting_evidence": [], "unknowns": ["caller not checked"],
+                 "rationale": "needs caller", "reachability": "UNKNOWN",
+                 "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                 "contradiction_snippet": "", "contradiction_scope": "UNKNOWN",
+                 "context_requests": [], "recommended_next_action": "RUNTIME_TRACE"}
+        invalid = dict(valid, contradiction_scope_note="only one branch was checked",
+                       contradiction_snippet_source="target.c:2")
+
+        class ContractProvider:
+            def __init__(self):
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    try:
+                        validate_json(invalid, request.output_schema)
+                    except ValidationError as exc:
+                        raise OllamaCloudError(f"schema validation: {exc.message}") from exc
+                return valid
+
+        provider = ContractProvider()
+        point = SuspiciousPoint("sp-contract", "w", "d", "parse", "target.c",
+                                "target.c:2", "data[i]", "index may exceed bound",
+                                [], "external input", [], [], [], [])
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = AgentPipeline(provider, schema_error_dir=Path(temp))
+            result = asyncio.run(pipeline.verify_sp(point, "int parse(){return data[i];}", [],
+                                                    schema_retries=1))
+            self.assertEqual(result.status, "OPEN")
+            self.assertEqual(pipeline.last_request_count, 2)
+            self.assertEqual(len(provider.requests), 2)
+            self.assertIn("contradiction_scope_note", provider.requests[1].instructions)
+            self.assertEqual(provider.requests[1].payload["previous_invalid_response"], invalid)
+            saved = list(Path(temp).glob("sp_verifier_schema_error*.json"))
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(json.loads(saved[0].read_text())["invalid_response"], invalid)
+
+    def test_verifier_schema_error_without_budget_keeps_candidate_open(self):
+        invalid = {"status": "UNKNOWN", "contradiction_scope_note": "partial only"}
+
+        class ContractProvider:
+            def __init__(self):
+                self.requests = []
+
+            async def generate(self, request):
+                self.requests.append(request)
+                try:
+                    validate_json(invalid, request.output_schema)
+                except ValidationError as exc:
+                    raise OllamaCloudError(f"schema validation: {exc.message}") from exc
+
+        provider = ContractProvider()
+        point = SuspiciousPoint("sp-contract", "w", "d", "parse", "target.c",
+                                "target.c:2", "data[i]", "index may exceed bound",
+                                [], "external input", [], [], [], [])
+        with tempfile.TemporaryDirectory() as temp:
+            pipeline = AgentPipeline(provider, schema_error_dir=Path(temp))
+            with self.assertRaises(OllamaCloudError):
+                asyncio.run(pipeline.verify_sp(point, "int parse(){return data[i];}", [],
+                                                    schema_retries=0))
+            self.assertEqual(point.status, "OPEN")
+            self.assertEqual(len(provider.requests), 1)
+            self.assertEqual(len(list(Path(temp).glob("sp_verifier_schema_error*.json"))), 1)
+
+    def test_sp_condition_note_is_preserved_as_unknown(self):
+        source = "int parse(int i) {\n    return data[i];\n}\n"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.c"
+            path.write_text(source)
+            analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [], [], [])
+            row = {"source_file": "target.c", "source_line": 2,
+                   "source_excerpt": "    return data[i];", "sp_condition": "",
+                   "sp_condition_note": "index bound is not observable at this line",
+                   "suspicious_operation": "data[i]", "vulnerability_hypothesis": "index may be large",
+                   "trigger_conditions": ["i exceeds bound"], "external_input_relation": "i from input",
+                   "required_state": [], "security_property": "bounds", "supporting_evidence": [],
+                   "contradicting_evidence": [], "unknowns": []}
+            provider = ScriptedProvider([{"suspicious_points": [row]}])
+            points = asyncio.run(AgentPipeline(provider).generate_sp(
+                analysis, "w", "d", source, source_path=path, source_start_line=1))
+            self.assertEqual(provider.requests[0].payload["source"],
+                             "1: int parse(int i) {\n2:     return data[i];\n3: }")
+            self.assertEqual(points[0].code_location, "target.c:2")
+            self.assertIsNone(points[0].sp_condition)
+            self.assertTrue(any("not observable" in x for x in points[0].unknowns))
+
+    def test_rejected_sp_location_preserves_model_coordinates_and_condition_unknown(self):
+        source = "int parse(int i) {\n    return data[i];\n}\n"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.c"
+            path.write_text(source)
+            analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [], [], [])
+            row = {"source_file": "target.c", "source_line": 2,
+                   "source_excerpt": "return data[i + 1];", "sp_condition": "i >= count",
+                   "suspicious_operation": "data[i]", "vulnerability_hypothesis": "OOB",
+                   "trigger_conditions": ["i >= count"], "external_input_relation": "input",
+                   "required_state": [], "security_property": "bounds",
+                   "supporting_evidence": [], "contradicting_evidence": [], "unknowns": []}
+            points = asyncio.run(AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+                                 .generate_sp(analysis, "w", "d", source,
+                                              source_path=path, source_start_line=1))
+            self.assertEqual(points[0].code_location, "UNKNOWN")
+            self.assertIsNone(points[0].sp_condition)
+            self.assertTrue(any("model source_file='target.c', source_line=2" in value
+                                and "source_excerpt is not the exact source line" in value
+                                for value in points[0].unknowns))
+            self.assertTrue(any("model sp_condition='i >= count'" in value
+                                for value in points[0].unknowns))
+
+    def test_sp_generation_saves_prevalidation_output_and_rejection_reason(self):
+        source = "int parse(int i) {\n    return data[i];\n}\n"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.c"
+            path.write_text(source)
+            logs = Path(temp) / "logs"
+            analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input",
+                                        [], [], [], [])
+            row = {"source_file": "target.c", "source_line": 2,
+                   "source_excerpt": "return data[i + 1];", "sp_condition": "i >= count",
+                   "suspicious_operation": "data[i]", "vulnerability_hypothesis": "OOB",
+                   "trigger_conditions": ["i >= count"], "external_input_relation": "input",
+                   "required_state": [], "security_property": "bounds",
+                   "supporting_evidence": [], "contradicting_evidence": [], "unknowns": []}
+            points = asyncio.run(AgentPipeline(
+                ScriptedProvider([{"suspicious_points": [row]}]), schema_error_dir=logs
+            ).generate_sp(analysis, "w", "d", source, source_path=path,
+                          source_start_line=1))
+            response = json.loads(next(logs.glob("sp_generation_*_response.json")).read_text())
+            checks = json.loads(next(logs.glob("sp_generation_*_location_validation.json")).read_text())
+            self.assertEqual(response["suspicious_points"][0], row)
+            self.assertFalse(checks[0]["location_valid"])
+            self.assertIn("source_excerpt is not the exact source line",
+                          checks[0]["rejection_reasons"])
+            self.assertEqual(checks[0]["original_sp_condition"], "i >= count")
+            self.assertIsNone(checks[0]["validated_sp_condition"])
+            self.assertEqual(points[0].status, "OPEN")
+
+    def test_function_analysis_preserves_model_note_without_accepting_arbitrary_fields(self):
+        response = {"summary": "reads input", "input_flow": "byte controls index",
+                    "state_dependencies": [], "context_requests": [], "safe_assumptions": [],
+                    "unknowns": [], "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": [],
+                    "input_flow_note": "caller guard not yet shown"}
+        analysis = asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+            "fn", "parse", "target.c", "int parse(void) { return 0; }"))
+        self.assertTrue(any("caller guard not yet shown" in text for text in analysis.unknowns))
+        response["unexpected_control"] = "do something else"
+        with self.assertRaises(ValidationError):
+            asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+                "fn", "parse", "target.c", "int parse(void) { return 0; }"))
+
+    def test_function_analysis_preserves_scalar_list_field_as_single_item(self):
+        response = {"summary": "reads input", "input_flow": "byte controls index",
+                    "state_dependencies": "parser->error controls the branch",
+                    "context_requests": [], "safe_assumptions": [], "unknowns": [],
+                    "input_sources": [], "security_sensitive_operations": [],
+                    "validations": [], "memory_operations": [], "evidence": [],
+                    "hypothesis_evaluations": []}
+        analysis = asyncio.run(AgentPipeline(ScriptedProvider([response])).analyze_function(
+            "fn", "parse", "target.c", "int parse(void) { return 0; }"))
+        self.assertEqual(analysis.state_dependencies, ["parser->error controls the branch"])
+
+    def test_sp_source_line_must_match_real_function_source(self):
+        source = "int parse(const int *data, int i, int size) {\n    return data[i];\n}\n"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.c"
+            path.write_text(source)
+            analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [], [], [])
+            row = {"source_file": "target.c", "source_line": 2,
+                   "source_excerpt": "return data[i];", "sp_condition": "i >= size",
+                   "suspicious_operation": "data[i]", "vulnerability_hypothesis": "index may be large",
+                   "trigger_conditions": ["i >= size"], "external_input_relation": "i from input",
+                   "required_state": [], "security_property": "bounds", "supporting_evidence": [],
+                   "contradicting_evidence": [], "unknowns": []}
+            pipeline = AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+            points = asyncio.run(pipeline.generate_sp(analysis, "w", "d", source,
+                source_path=path, source_start_line=1))
+            self.assertEqual(points[0].code_location, "target.c:2")
+            self.assertEqual(points[0].sp_condition, "i >= size")
+            self.assertEqual(points[0].source_line, 2)
+
+            row["source_line"] = 99
+            pipeline = AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+            points = asyncio.run(pipeline.generate_sp(analysis, "w", "d", source,
+                source_path=path, source_start_line=1))
+            self.assertEqual(points[0].code_location, "UNKNOWN")
+            self.assertIsNone(points[0].source_line)
+            self.assertIsNone(points[0].sp_condition)
+            self.assertTrue(any("location" in item.lower() for item in points[0].unknowns))
+
+            row["source_line"] = 2
+            row["sp_condition"] = "i++ >= size"
+            pipeline = AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+            points = asyncio.run(pipeline.generate_sp(analysis, "w", "d", source,
+                source_path=path, source_start_line=1))
+            self.assertEqual(points[0].code_location, "target.c:2")
+            self.assertIsNone(points[0].sp_condition)
+
+    def test_sp_condition_rejects_undeclared_field_and_out_of_scope_symbol(self):
+        source = ("typedef struct { int index; } mark_t;\n"
+                  "typedef struct { mark_t mark; } parser_t;\n"
+                  "int parse(parser_t *parser) {\n"
+                  "    return parser->mark.index;\n"
+                  "}\n")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "target.c"
+            path.write_text(source)
+            analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input",
+                                        [], [], [], [])
+            row = {"source_file": "target.c", "source_line": 4,
+                   "source_excerpt": "    return parser->mark.index;",
+                   "sp_condition": "parser->mark.index != parser->mark.pointer",
+                   "suspicious_operation": "mark access", "vulnerability_hypothesis": "bad state",
+                   "trigger_conditions": ["mark mismatch"], "external_input_relation": "unknown",
+                   "required_state": [], "security_property": "memory safety",
+                   "supporting_evidence": [], "contradicting_evidence": [], "unknowns": []}
+            logs = Path(temp) / "logs"
+            pipeline = AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]),
+                                     schema_error_dir=logs)
+            points = asyncio.run(pipeline.generate_sp(analysis, "w", "d", source,
+                source_path=path, source_start_line=1))
+            self.assertEqual(points[0].status, "OPEN")
+            self.assertEqual(points[0].code_location, "target.c:4")
+            self.assertIsNone(points[0].sp_condition)
+            self.assertTrue(any("no member named 'pointer'" in item for item in points[0].unknowns))
+            checks = json.loads(next(logs.glob("*_location_validation.json")).read_text())
+            self.assertEqual(checks[0]["original_sp_condition"], row["sp_condition"])
+            self.assertIsNone(checks[0]["validated_sp_condition"])
+            self.assertIn("no member named 'pointer'", checks[0]["condition_rejection_reason"])
+
+            row["sp_condition"] = "missing_local > 0"
+            points = asyncio.run(AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+                                 .generate_sp(analysis, "w", "d", source,
+                                              source_path=path, source_start_line=1))
+            self.assertIsNone(points[0].sp_condition)
+            self.assertTrue(any("undeclared identifier 'missing_local'" in item
+                                for item in points[0].unknowns))
+
+            row["sp_condition"] = "parser->mark.index >= 0"
+            points = asyncio.run(AgentPipeline(ScriptedProvider([{"suspicious_points": [row]}]))
+                                 .generate_sp(analysis, "w", "d", source,
+                                              source_path=path, source_start_line=1))
+            self.assertEqual(points[0].sp_condition, "parser->mark.index >= 0")
+
+    def test_one_function_generates_structured_candidate(self):
+        provider = ScriptedProvider([
+            {"summary": "reads an index", "input_flow": "i from input", "state_dependencies": [],
+             "context_requests": [], "safe_assumptions": ["i < n"], "unknowns": ["caller guard"],
+             "input_sources": [], "security_sensitive_operations": [], "validations": [],
+             "memory_operations": [], "evidence": [], "hypothesis_evaluations": [{
+                 "source_location": "target.c:1", "security_property": "bounded index",
+                 "hypothesis": "index may exceed size", "judgment": "EXPLICIT_SAFE_JUDGMENT",
+                 "reason": "mocked caller contract", "safe_assumption": "i < n"}]},
+            {"suspicious_points": [{"source_file": "target.c", "source_line": 0,
+              "source_excerpt": "", "sp_condition": "", "suspicious_operation": "a[i]",
+              "vulnerability_hypothesis": "i may exceed n", "trigger_conditions": ["i >= n"],
+              "external_input_relation": "input i", "required_state": [], "security_property": "bounds",
+              "supporting_evidence": ["no local guard"],
+              "contradicting_evidence": [], "unknowns": ["caller guard"]}]},
+        ])
+        pipeline = AgentPipeline(provider)
+        analysis = asyncio.run(pipeline.analyze_function("fn", "parse", "target.c", "int parse(){return a[i];}"))
+        points = asyncio.run(pipeline.generate_sp(analysis, "w", "d", "int parse(){return a[i];}"))
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0].status, "OPEN")
+        self.assertEqual(provider.roles, ["function_analysis", "sp_generation"])
+
+    def test_verifier_cannot_refute_for_lack_of_poc(self):
+        sp = SuspiciousPoint("sp-1", "w", "d", "parse", "target.c", "target.c:12", "data[i]",
+                             "index may exceed bound", ["i large"], "input controls i", [], [], [], [])
+        provider = ScriptedProvider([{"status": "REFUTED", "contradicting_evidence": [],
+                                     "supporting_evidence": [], "unknowns": ["PoC unavailable"],
+                                     "rationale": "no PoC", "reachability": "UNKNOWN",
+                                     "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                                     "contradiction_snippet": "", "contradiction_scope": "UNKNOWN",
+                                     "context_requests": [], "recommended_next_action": "GENERATE_POC"}])
+        pipeline = AgentPipeline(provider)
+        result = asyncio.run(pipeline.verify_sp(sp, "int parse(){ return data[i]; }", []))
+        self.assertEqual(result.status, "OPEN")
+        self.assertEqual(provider.roles, ["sp_verifier"])
+
+    def test_unknown_verdict_cannot_recommend_refute_when_context_is_needed(self):
+        sp = SuspiciousPoint("sp-1", "w", "d", "parse", "target.c", "target.c:2", "data[i]",
+                             "index may exceed bound", ["i large"], "input controls i", [], [], [], [])
+        response = {"status": "UNKNOWN", "contradicting_evidence": ["one subclaim is false"],
+                    "supporting_evidence": [], "unknowns": ["caller guard unknown"],
+                    "rationale": "need caller", "reachability": "UNKNOWN", "controllability": "UNKNOWN",
+                    "guards": [], "required_state": [], "contradiction_snippet": "return data[i];",
+                    "contradiction_scope": "PARTIAL", "recommended_next_action": "REFUTE",
+                    "context_requests": [{"target": "caller", "request_type": "CALLER",
+                                          "reason": "check guard", "expected_information": "bound"}]}
+        pipeline = AgentPipeline(ScriptedProvider([response]))
+        result = asyncio.run(pipeline.verify_sp(sp, "int parse(){return data[i];}", []))
+        self.assertEqual(result.status, "OPEN")
+        self.assertEqual(pipeline.verifications[sp.sp_id].recommended_next_action, "REQUEST_CONTEXT")
+        self.assertEqual(pipeline.verifications[sp.sp_id].context_requests[0].target, "caller")
+
+    def test_partial_contradiction_cannot_refute_whole_sp(self):
+        sp = SuspiciousPoint("sp-2", "w", "d", "parse", "target.c", "target.c:2", "data[i]",
+                             "two part hypothesis", ["i large"], "input controls i", [], [], [], [])
+        response = {"status": "REFUTED", "contradicting_evidence": ["one branch is guarded"],
+                    "supporting_evidence": [], "unknowns": [], "rationale": "partial guard",
+                    "reachability": "UNKNOWN", "controllability": "UNKNOWN", "guards": [],
+                    "required_state": [], "contradiction_snippet": "return data[i];",
+                    "contradiction_scope": "PARTIAL", "recommended_next_action": "REFUTE",
+                    "context_requests": []}
+        pipeline = AgentPipeline(ScriptedProvider([response]))
+        result = asyncio.run(pipeline.verify_sp(sp, "int parse(){return data[i];}", []))
+        self.assertEqual(result.status, "OPEN")
+        self.assertEqual(pipeline.verifications[sp.sp_id].recommended_next_action, "RUNTIME_TRACE")
+
+    def test_whole_hypothesis_contradiction_with_remaining_unknown_is_not_refuted(self):
+        sp = SuspiciousPoint("sp-3", "w", "d", "parse", "target.c", "target.c:2", "data[i]",
+                             "index may exceed bound", ["i large"], "input controls i", [], [], [], [])
+        response = {"status": "REFUTED", "contradicting_evidence": ["guard handles one branch"],
+                    "supporting_evidence": [], "unknowns": ["other caller unexamined"],
+                    "rationale": "one branch is guarded", "reachability": "UNKNOWN",
+                    "controllability": "UNKNOWN", "guards": [], "required_state": [],
+                    "contradiction_snippet": "return data[i];", "contradiction_scope": "WHOLE_HYPOTHESIS",
+                    "context_requests": [], "recommended_next_action": "REFUTE"}
+        pipeline = AgentPipeline(ScriptedProvider([response]))
+        result = asyncio.run(pipeline.verify_sp(sp, "int parse(){return data[i];}", []))
+        self.assertEqual(result.status, "OPEN")
+        self.assertEqual(pipeline.verifications[sp.sp_id].recommended_next_action, "RUNTIME_TRACE")
+
+    def test_verifier_requires_verbatim_source_and_records_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'target.c'
+            source = 'int parse(int i) {\n    if (i >= 8) return 0;\n    return data[i];\n}\n'
+            path.write_text(source)
+            sp = SuspiciousPoint('sp-source', 'w', 'd', 'parse', str(path), f'{path}:3',
+                'data[i]', 'i >= 8 may index past the array', ['i >= 8'],
+                'external i', [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': ['guard at target.c:2 limits i'], 'unknowns': [],
+                'rationale': 'guard', 'reachability': 'YES', 'controllability': 'YES',
+                'guards': [], 'required_state': [], 'contradiction_scope': 'WHOLE_HYPOTHESIS',
+                'recommended_next_action': 'REFUTE', 'context_requests': [],
+                'contradiction_snippet': 'if (i >= 8) ... return 0;'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(sp, source, [], source_path=path,
+                                                   source_root=path.parent))
+            verification = pipeline.verifications[sp.sp_id]
+            self.assertEqual(result.status, 'OPEN')
+            self.assertEqual(verification.source_citations, [])
+            self.assertTrue(any('verbatim' in item for item in verification.unknowns))
+            response['contradiction_snippet'] = 'if (i >= 8) return 0;'
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(sp, source, [], source_path=path,
+                                                   source_root=path.parent))
+            verification = pipeline.verifications[sp.sp_id]
+            self.assertEqual(result.status, 'REFUTED')
+            self.assertEqual(verification.source_citations[0]['location'], f'{path}:2')
+            self.assertEqual(verification.evidence_source_checks[0]['status'],
+                             'SOURCE_LOCATION_VERIFIED')
+
+    def test_verifier_does_not_accept_code_quoted_at_wrong_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'scanner.c'
+            source = ('int fetch(parser_t *parser)\n'
+                      '{\n'
+                      '    parser->token_available = 1;\n'
+                      '    return 1;\n'
+                      '}\n')
+            path.write_text(source)
+            point = SuspiciousPoint('sp-wrong-line', 'w', 'd', 'fetch', str(path),
+                f'{path}:3', 'parser->token_available = 1', 'candidate', [],
+                'UNKNOWN', [], [], [], [])
+            claim = f'{path}:1 sets `parser->token_available = 1;`'
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': [claim], 'unknowns': [],
+                'rationale': 'claimed contradiction', 'reachability': 'UNKNOWN',
+                'controllability': 'UNKNOWN', 'guards': [], 'required_state': [],
+                'contradiction_snippet': 'parser->token_available = 1;',
+                'contradiction_scope': 'WHOLE_HYPOTHESIS', 'context_requests': [],
+                'recommended_next_action': 'REFUTE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(point, source, [], source_path=path))
+            verification = pipeline.verifications[point.sp_id]
+            self.assertEqual(result.status, 'OPEN')
+            self.assertEqual(result.contradicting_evidence, [])
+            self.assertEqual(verification.evidence_source_checks[0]['status'],
+                             'SOURCE_CLAIM_UNVERIFIED')
+            self.assertIn(claim, verification.contradicting_evidence)
+            self.assertTrue(any('not anchored' in value for value in verification.unknowns))
+
+            response['contradicting_evidence'] = [f'{path}:3 sets `parser->token_available = 1;`']
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            point = SuspiciousPoint('sp-correct-line', 'w', 'd', 'fetch', str(path),
+                f'{path}:3', 'parser->token_available = 1', 'candidate', [],
+                'UNKNOWN', [], [], [], [])
+            result = asyncio.run(pipeline.verify_sp(point, source, [], source_path=path))
+            self.assertEqual(pipeline.verifications[point.sp_id].evidence_source_checks[0]['status'],
+                             'SOURCE_LOCATION_VERIFIED')
+
+            alias = Path(temp) / 'source-alias.c'
+            alias.symlink_to(path)
+            response['contradicting_evidence'] = [f'{alias}:3 sets `parser->token_available = 1;`']
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            point = SuspiciousPoint('sp-alias-line', 'w', 'd', 'fetch', str(alias),
+                f'{alias}:3', 'parser->token_available = 1', 'candidate', [],
+                'UNKNOWN', [], [], [], [])
+            asyncio.run(pipeline.verify_sp(point, source, [], source_path=alias))
+            self.assertEqual(pipeline.verifications[point.sp_id].evidence_source_checks[0]['status'],
+                             'SOURCE_LOCATION_VERIFIED')
+
+    def test_verifier_resolves_repository_relative_source_citation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source_dir = Path(temp) / 'src'
+            source_dir.mkdir()
+            path = source_dir / 'target.c'
+            source = 'int parse(int i) {\n    if (i >= 8) return 0;\n    return data[i];\n}\n'
+            path.write_text(source)
+            sp = SuspiciousPoint('sp-relative', 'w', 'd', 'parse', 'src/target.c',
+                'src/target.c:3', 'data[i]', 'i >= 8 may index past the array',
+                ['i >= 8'], 'external i', [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': ['src/target.c:2 guard limits i'], 'unknowns': [],
+                'rationale': 'guard', 'reachability': 'YES', 'controllability': 'YES',
+                'guards': [], 'required_state': [], 'contradiction_scope': 'WHOLE_HYPOTHESIS',
+                'recommended_next_action': 'REFUTE', 'context_requests': [],
+                'contradiction_snippet': 'if (i >= 8) return 0;'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            result = asyncio.run(pipeline.verify_sp(sp, source, [], source_path=path,
+                                                   source_root=source_dir.parent))
+            self.assertEqual(result.status, 'REFUTED')
+            check = pipeline.verifications[sp.sp_id].evidence_source_checks[0]
+            self.assertEqual(check['status'], 'SOURCE_LOCATION_VERIFIED')
+            self.assertEqual(check['location'], f'{path}:2')
+
+    def test_verifier_rejects_existing_but_unsupplied_absolute_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / 'target' / 'target.c'
+            target.parent.mkdir()
+            source = 'int parse(int i) {\n    return data[i];\n}\n'
+            target.write_text(source)
+            foreign = root / 'foreign' / 'guard.c'
+            foreign.parent.mkdir()
+            foreign.write_text('if (i >= 8) return 0;\n')
+            point = SuspiciousPoint('sp-foreign', 'w', 'd', 'parse', str(target),
+                f'{target}:2', 'data[i]', 'i may exceed the array bound', [],
+                'external i', [], [], [], [])
+            response = {'status': 'UNKNOWN', 'supporting_evidence': [
+                f'{foreign}:1 guard exists: `if (i >= 8) return 0;`'],
+                'contradicting_evidence': [], 'unknowns': [], 'rationale': 'foreign guard',
+                'reachability': 'UNKNOWN', 'controllability': 'UNKNOWN', 'guards': [],
+                'required_state': [], 'contradiction_snippet': '',
+                'contradiction_scope': 'UNKNOWN', 'context_requests': [],
+                'recommended_next_action': 'RUNTIME_TRACE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            asyncio.run(pipeline.verify_sp(point, source, [], source_path=target,
+                                           source_root=target.parent))
+            check = pipeline.verifications[point.sp_id].evidence_source_checks[0]
+            self.assertEqual(check['status'], 'SOURCE_PROVENANCE_UNVERIFIED')
+            self.assertEqual(point.supporting_evidence, [])
+
+    def test_verifier_rejects_context_from_other_target_revision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / 'current' / 'src' / 'target.c'
+            target.parent.mkdir(parents=True)
+            source = 'int parse(int i) {\n    return data[i];\n}\n'
+            target.write_text(source)
+            old = root / 'old' / 'src' / 'target.c'
+            old.parent.mkdir(parents=True)
+            old_source = 'int parse(int i) {\n    if (i >= 8) return 0;\n    return data[i];\n}\n'
+            old.write_text(old_source)
+            point = SuspiciousPoint('sp-old-revision', 'w', 'd', 'parse', str(target),
+                f'{target}:2', 'data[i]', 'missing upper-bound guard', [],
+                'external i', [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': [
+                    f'{old}:2 guard blocks the trigger: `if (i >= 8) return 0;`'],
+                'unknowns': [], 'rationale': 'old guard', 'reachability': 'YES',
+                'controllability': 'YES', 'guards': [], 'required_state': [],
+                'contradiction_snippet': 'if (i >= 8) return 0;',
+                'contradiction_scope': 'WHOLE_HYPOTHESIS', 'context_requests': [],
+                'recommended_next_action': 'REFUTE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            asyncio.run(pipeline.verify_sp(point, source,
+                [{'source_file': str(old), 'source': old_source}],
+                source_path=target, source_root=target.parents[1]))
+            self.assertEqual(point.status, 'OPEN')
+            check = pipeline.verifications[point.sp_id].evidence_source_checks[0]
+            self.assertEqual(check['status'], 'SOURCE_PROVENANCE_UNVERIFIED')
+
+    def test_verifier_accepts_supplied_context_in_current_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / 'src' / 'target.c'
+            header = root / 'include' / 'guard.h'
+            target.parent.mkdir()
+            header.parent.mkdir()
+            source = 'int parse(int i) {\n    return data[i];\n}\n'
+            guard = 'int guarded(int i) {\n    if (i >= 8) return 0;\n    return parse(i);\n}\n'
+            target.write_text(source)
+            header.write_text(guard)
+            point = SuspiciousPoint('sp-current-context', 'w', 'd', 'parse', str(target),
+                f'{target}:2', 'data[i]', 'guarded caller may pass i >= 8', ['i >= 8'],
+                'external i', [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': [
+                    f'{header}:2 blocks i >= 8: `if (i >= 8) return 0;`'],
+                'unknowns': [], 'rationale': 'guarded caller blocks the stated trigger',
+                'reachability': 'YES', 'controllability': 'YES', 'guards': [],
+                'required_state': [], 'contradiction_snippet': 'if (i >= 8) return 0;',
+                'contradiction_scope': 'WHOLE_HYPOTHESIS', 'context_requests': [],
+                'recommended_next_action': 'REFUTE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            asyncio.run(pipeline.verify_sp(point, source,
+                [{'source_file': str(header), 'source': guard}], source_path=target,
+                source_root=root))
+            self.assertEqual(point.status, 'REFUTED')
+
+    def test_verifier_rejects_stale_context_at_current_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / 'src' / 'target.c'
+            target.parent.mkdir()
+            source = 'int parse(int i) {\n    return data[i];\n}\n'
+            target.write_text(source)
+            context = root / 'src' / 'check.c'
+            current = 'int check(int i) {\n    if (i >= 8) return 0;\n    return i;\n}\n'
+            stale = 'int check(int i) {\n    if (i >= 8) return 0;\n    if (i < 0) return 0;\n    return i;\n}\n'
+            context.write_text(current)
+            point = SuspiciousPoint('sp-stale-context', 'w', 'd', 'parse', str(target),
+                f'{target}:2', 'data[i]', 'negative i may index before data', ['i < 0'],
+                'external i', [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': [
+                    f'{context}:3 blocks negative i: `if (i < 0) return 0;`'],
+                'unknowns': [], 'rationale': 'stale lower-bound guard',
+                'reachability': 'YES', 'controllability': 'YES', 'guards': [],
+                'required_state': [], 'contradiction_snippet': 'if (i < 0) return 0;',
+                'contradiction_scope': 'WHOLE_HYPOTHESIS', 'context_requests': [],
+                'recommended_next_action': 'REFUTE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            asyncio.run(pipeline.verify_sp(point, source,
+                [{'source_file': str(context), 'source': stale}], source_path=target,
+                source_root=root))
+            self.assertEqual(point.status, 'OPEN')
+
+    def test_verifier_refutation_needs_every_contradicting_claim_cited(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / 'target.c'
+            source = 'int parse(int i) {\n    if (i >= 8) return 0;\n    return data[i];\n}\n'
+            target.write_text(source)
+            point = SuspiciousPoint('sp-uncited', 'w', 'd', 'parse', str(target),
+                f'{target}:3', 'data[i]', 'unbounded index', [], 'external i',
+                [], [], [], [])
+            response = {'status': 'REFUTED', 'supporting_evidence': [],
+                'contradicting_evidence': [
+                    f'{target}:2 checks the upper bound: `if (i >= 8) return 0;`',
+                    'A lower-bound check also exists elsewhere and fully protects access.'],
+                'unknowns': [], 'rationale': 'both bounds are checked',
+                'reachability': 'YES', 'controllability': 'YES', 'guards': [],
+                'required_state': [], 'contradiction_snippet': 'if (i >= 8) return 0;',
+                'contradiction_scope': 'WHOLE_HYPOTHESIS', 'context_requests': [],
+                'recommended_next_action': 'REFUTE'}
+            pipeline = AgentPipeline(ScriptedProvider([response]))
+            asyncio.run(pipeline.verify_sp(point, source, [], source_path=target,
+                                           source_root=target.parent))
+            self.assertEqual(point.status, 'OPEN')
+            self.assertIn('NO_SOURCE_CITATION', [item['status'] for item in
+                pipeline.verifications[point.sp_id].evidence_source_checks])
+
+    def test_safe_assumption_generates_separate_assertion(self):
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [],
+                                    ["len is always below capacity"], [])
+        provider = ScriptedProvider([{"assertions": [{"safe_assumption": "len is always below capacity",
+                              "runtime_expression": "len <= capacity", "source_line": 10,
+                              "required_context": [], "rationale": "check local bound"}]}])
+        pipeline = AgentPipeline(provider)
+        assertions = asyncio.run(pipeline.generate_assertions(analysis, "w", "d", "int parse(){return 0;}"))
+        self.assertEqual(len(assertions), 1)
+        self.assertEqual(assertions[0].runtime_expression, "len <= capacity")
+        self.assertEqual(provider.roles, ["assertion_generator"])
+
+    def test_assertion_generator_receives_original_source_line_numbers(self):
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [],
+                                    ["bound is safe"], [])
+        provider = ScriptedProvider([{"assertions": []}])
+        asyncio.run(AgentPipeline(provider).generate_assertions(
+            analysis, "w", "d", "int parse(void) {\n  return 0;\n}",
+            source_start_line=40))
+        self.assertEqual(provider.requests[0].payload["source"],
+                         "40: int parse(void) {\n41:   return 0;\n42: }")
+
+    def test_assertion_generator_receives_harness_boundary_and_context(self):
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [],
+                                    ["input-dependent bound is safe"], [])
+        provider = ScriptedProvider([{"assertions": []}])
+        harness = ("int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {\n"
+                   "  if (size) parse(data[0]);\n  return 0;\n}\n")
+        context = [{"target": "caller", "source": "void caller(void) { parse(1); }"}]
+        with tempfile.TemporaryDirectory() as temp:
+            harness_path = Path(temp) / "harness.c"
+            harness_path.write_text(harness)
+            asyncio.run(AgentPipeline(provider).generate_assertions(
+                analysis, "w", "d", "int parse(int x) { return x; }",
+                context=context, harness_source=harness,
+                harness_source_path=harness_path))
+            payload = provider.requests[0].payload
+            self.assertEqual(payload["harness_source"], harness)
+            self.assertEqual(payload["harness_source_file"], str(harness_path.resolve()))
+            self.assertFalse(payload["harness_source_truncated"])
+            self.assertEqual(payload["context"], context)
+
+    def test_no_safe_judgment_skips_assertion_llm(self):
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "unresolved", "input", [], [],
+                                    [], ["caller guard is unknown"])
+        provider = ScriptedProvider([])
+        assertions = asyncio.run(AgentPipeline(provider).generate_assertions(
+            analysis, "w", "d", "int parse(){return 0;}"))
+        self.assertEqual(assertions, [])
+        self.assertEqual(provider.roles, [])
+
+    def test_queue_assumption_uses_source_confirmed_fallback(self):
+        analysis = FunctionAnalysis("fn", "scan", "scanner.c", "summary", "input", [], [],
+                                    ["Queue is nonempty before dequeue"], [])
+        source = "scan(parser_t *parser) {\n  *token = DEQUEUE(parser, parser->tokens);\n}"
+        context = [{"target": "DEQUEUE", "source":
+                    "#define DEQUEUE(context,queue) (*((queue).head++))"}]
+        pipeline = AgentPipeline(ScriptedProvider([{"assertions": []}]))
+        assertions = asyncio.run(pipeline.generate_assertions(analysis, "w", "d", source,
+                                                              source_start_line=10, context=context))
+        self.assertEqual(len(assertions), 1)
+        self.assertEqual(assertions[0].runtime_expression,
+                         "parser->tokens.head != parser->tokens.tail")
+        self.assertEqual(assertions[0].source_location, "scanner.c:11")
+        self.assertEqual(assertions[0].generation_method, "STATIC_RULE")
+
+    def test_invalid_llm_expression_is_recorded_not_silently_replaced(self):
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [],
+                                    ["size remains below capacity"], [])
+        provider = ScriptedProvider([{"assertions": [{"safe_assumption": "size remains below capacity",
+            "runtime_expression": "size++ < capacity", "source_line": 9,
+            "required_context": [], "rationale": "claimed bound"}]}])
+        pipeline = AgentPipeline(provider)
+        result = asyncio.run(pipeline.generate_assertions(analysis, "w", "d",
+            "int parse(int size, int capacity) { return size; }", source_start_line=9))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, "INVALID_ASSERTION")
+        self.assertEqual(result[0].generation_method, "LLM")
+
+    def test_pointer_addition_bounds_assertion_is_not_accepted(self):
+        assumption = "cursor remains within the input allocation"
+        analysis = FunctionAnalysis("fn", "parse", "target.c", "summary", "input", [], [],
+                                    [assumption], [])
+        source = ("int parse(const char *base, size_t n) {\n"
+                  "  const char *cursor = base;\n"
+                  "  return cursor[0];\n}")
+        provider = ScriptedProvider([{"assertions": [{"safe_assumption": assumption,
+            "runtime_expression": "cursor + n <= base + n", "source_line": 22,
+            "required_context": [], "rationale": "claimed allocation bound"}]}])
+        result = asyncio.run(AgentPipeline(provider).generate_assertions(
+            analysis, "w", "d", source, source_start_line=20))
+        self.assertEqual(result[0].status, "INVALID_ASSERTION")
+        self.assertIn("out-of-bounds pointer addition", result[0].execution_result)
+
+    def test_assertion_schema_requires_an_existing_safe_judgment(self):
+        assumption = "Without state mutation, queue head differs from tail before dequeue."
+        analysis = FunctionAnalysis("fn", "scan", "scanner.c", "summary", "input", [], [],
+                                    [assumption], [])
+        provider = ScriptedProvider([{"assertions": [{"safe_assumption": "a different claim",
+            "runtime_expression": "1", "source_line": 10, "required_context": [],
+            "rationale": "unsupported claim"}]}])
+        result = asyncio.run(AgentPipeline(provider).generate_assertions(analysis, "w", "d",
+                    "int scan(void) { return 0; }", source_start_line=10))
+        item = provider.requests[0].output_schema["properties"]["assertions"]["items"]
+        self.assertEqual(item["properties"]["safe_assumption"], {"type": "string"})
+        self.assertEqual(result[0].status, "INVALID_ASSERTION")
+
+    def test_quoted_safe_assumption_does_not_enter_strict_output_schema(self):
+        assumption = 'The key list contains "connection" and "proxy-connection".'
+        analysis = FunctionAnalysis("fn", "scan", "scanner.c", "summary", "input", [], [],
+                                    [assumption], [])
+        provider = ScriptedProvider([{"assertions": []}])
+        asyncio.run(AgentPipeline(provider).generate_assertions(analysis, "w", "d",
+                    "int scan(void) { return 0; }", source_start_line=10))
+        item = provider.requests[0].output_schema["properties"]["assertions"]["items"]
+        self.assertNotIn("enum", item["properties"]["safe_assumption"])
+
+    def test_before_dequeue_assumption_rejects_insertion_after_dequeue(self):
+        assumption = "The token queue is nonempty before dequeue."
+        analysis = FunctionAnalysis("fn", "scan", "scanner.c", "summary", "input", [], [],
+                                    [assumption], [])
+        source = "scan(parser_t *parser) {\n  *token = DEQUEUE(parser, parser->tokens);\n  return 1;\n}"
+        provider = ScriptedProvider([{"assertions": [{"safe_assumption": assumption,
+            "runtime_expression": "parser->tokens.head != parser->tokens.tail",
+            "source_line": 12, "required_context": [], "rationale": "queue invariant"}]}])
+        result = asyncio.run(AgentPipeline(provider).generate_assertions(
+            analysis, "w", "d", source, source_start_line=10))
+        self.assertEqual(result[0].status, "INVALID_ASSERTION")
+        self.assertIn("before dequeue", result[0].execution_result)
+
+    def test_llm_and_static_rule_assertions_have_distinct_provenance_ids(self):
+        assumption = "Queue is nonempty before dequeue"
+        analysis = FunctionAnalysis("fn", "scan", "scanner.c", "summary", "input", [], [],
+                                    [assumption], [])
+        source = "scan(parser_t *parser) {\n  *token = DEQUEUE(parser, parser->tokens);\n}"
+        context = [{"target": "DEQUEUE", "source": "#define DEQUEUE(context,queue) (*((queue).head++))"}]
+        llm = AgentPipeline(ScriptedProvider([{"assertions": [{"safe_assumption": assumption,
+            "runtime_expression": "parser->tokens.head != parser->tokens.tail", "source_line": 11,
+            "required_context": [], "rationale": "check before dequeue"}]}]))
+        fallback = AgentPipeline(ScriptedProvider([{"assertions": []}]))
+        llm_result = asyncio.run(llm.generate_assertions(analysis, "w", "d", source,
+                                                           source_start_line=10, context=context))
+        static_result = asyncio.run(fallback.generate_assertions(analysis, "w", "d", source,
+                                                                 source_start_line=10, context=context))
+        self.assertNotEqual(llm_result[0].assertion_id, static_result[0].assertion_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

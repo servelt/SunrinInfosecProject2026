@@ -1,0 +1,316 @@
+import unittest
+import json
+import tempfile
+import shutil
+import subprocess
+from unittest.mock import patch
+
+from vulnerabilityanalysis.analysis import RetryLedger
+from vulnerabilityanalysis.models import RuntimeResult, PoC, SuspiciousPoint
+from vulnerabilityanalysis.runtime import RuntimeExecutor, _gdb_measurement_condition, classify_runtime, parse_function_trace, parse_sp_trace, triage_crash, trace_sp_location
+from vulnerabilityanalysis.scan import _exact_sp_location, execute_poc, _resolve_verifier_context
+from vulnerabilityanalysis.models import ContextRequest
+from pathlib import Path
+
+
+class EvidenceQualityTest(unittest.TestCase):
+    def test_sp_trace_restored_source_and_all_condition_hits(self):
+        compiler = shutil.which("clang") or shutil.which("cc")
+        if not compiler or not shutil.which("gdb"):
+            self.skipTest("C compiler and GDB required")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            original = checkout / "probe.c"
+            source = ("volatile int seen;\n"
+                      "int target(void) {\n"
+                      "    for (int i = 0; i < 3; ++i) {\n"
+                      "        seen += i;\n"
+                      "    }\n"
+                      "    return seen;\n"
+                      "}\n"
+                      "int main(void) { return target() == 3 ? 0 : 1; }\n")
+            original.write_text(source)
+            restored = root / "restored"
+            restored.symlink_to(checkout, target_is_directory=True)
+            binary = root / "probe"
+            subprocess.run([compiler, "-g", "-O0", str(restored / "probe.c"), "-o", str(binary)],
+                           check=True, capture_output=True)
+            seed = root / "seed"
+            seed.write_bytes(b"input")
+            reached, condition, trace = trace_sp_location(
+                binary, seed, f"{restored / 'probe.c'}:4", "i == 2")
+            self.assertTrue(reached)
+            self.assertTrue(condition)
+            self.assertIn("SP_PROBE_HITS=3 VERIFIED_LINE_HITS=3", trace)
+            reached, condition, trace = trace_sp_location(
+                binary, seed, f"{restored / 'probe.c'}:4", "i == 5")
+            self.assertTrue(reached)
+            self.assertFalse(condition)
+            self.assertIn("CONDITION_EVALUATIONS=3", trace)
+            reached, condition, trace = trace_sp_location(
+                binary, seed, f"{restored / 'probe.c'}:4", "missing_field == 1")
+            self.assertTrue(reached)
+            self.assertIsNone(condition)
+            self.assertIn("_ERROR=", trace)
+            changed = root / "changed" / "probe.c"
+            changed.parent.mkdir()
+            changed.write_text(source + "\n/* changed */\n")
+            reached, condition, trace = trace_sp_location(binary, seed,
+                f"{changed}:4", "i == 2")
+            self.assertIsNone(reached)
+            self.assertIsNone(condition)
+            self.assertIn("SOURCE_MAPPING_UNVERIFIED", trace)
+
+    def test_poc_cannot_reopen_refuted_or_verified_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed = root / "seed.bin"
+            seed.write_bytes(b"normal input")
+            for status in ("REFUTED", "VERIFIED"):
+                with self.subTest(status=status):
+                    point = SuspiciousPoint("s", "w", "d", "target", None, "UNKNOWN",
+                        "operation", "hypothesis", [], "UNKNOWN", [], [], [], [],
+                        status=status, status_history=[status])
+                    poc = PoC("p", "s", "", str(seed), None, "observation")
+                    with self.assertRaisesRegex(ValueError, "requires an active SP"):
+                        execute_poc(poc, point, ["/usr/bin/cat", "{input}"], root / status)
+                    self.assertEqual(point.status, status)
+                    self.assertEqual(point.status_history, [status])
+                    self.assertFalse((root / status).exists())
+
+    def test_c_macro_measurement_preserves_original_in_trace(self):
+        self.assertEqual(_gdb_measurement_condition("token == NULL", c_source=True), "token == 0")
+        self.assertEqual(_gdb_measurement_condition("NULL != parser->token", c_source=True),
+                         "0 != parser->token")
+        self.assertEqual(_gdb_measurement_condition("token == NULL && ready", c_source=True),
+                         "token == 0 && ready")
+        self.assertEqual(_gdb_measurement_condition("major > INT_MAX", c_source=True),
+                         "major > ((int)(((unsigned int)~0)>>1))")
+        self.assertEqual(_gdb_measurement_condition("token == NULL"), "token == NULL")
+
+    def test_libyaml_null_condition_is_measured_on_saved_seed(self):
+        binary = Path('/tmp/va-libyaml-debug-20261008T141232Z-af00a142-fuzzer')
+        source = Path('/tmp/va-ollama-libyaml/src/scanner.c')
+        seed = Path(__file__).resolve().parents[2] / (
+            'result/vulnerabilityanalysis/20261008T172055Z-83a8c4c4/'
+            'poc/poc-8bf5b335a73215b8/input.bin')
+        if not all(path.is_file() for path in (binary, source, seed)):
+            self.skipTest('saved libyaml debug build and seed unavailable')
+        reached, condition, trace = trace_sp_location(binary, seed, f'{source}:756',
+                                                      'token == NULL')
+        self.assertTrue(reached)
+        self.assertFalse(condition)
+        self.assertIn('CONDITION_ORIGINAL=token == NULL', trace)
+        self.assertIn('CONDITION_MEASUREMENT=token == 0', trace)
+
+    def test_runtime_uses_addr2line_without_changing_timeout_or_overriding_explicit_symbolizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = Path(tmp) / "seed"
+            seed.write_bytes(b"A")
+            completed = __import__("subprocess").CompletedProcess(["/bin/cat"], 0, "A", "")
+            with patch("vulnerabilityanalysis.runtime.shutil.which", return_value="/usr/bin/addr2line"), \
+                 patch("vulnerabilityanalysis.runtime._guarded_run", return_value=completed) as run, \
+                 patch.dict("vulnerabilityanalysis.runtime.os.environ", {"ASAN_OPTIONS": "detect_leaks=0"}, clear=True):
+                RuntimeExecutor(timeout_seconds=10).run(["/bin/cat", "{input}"], seed)
+                self.assertEqual(run.call_args.kwargs["timeout"], 10)
+                self.assertIn("external_symbolizer_path=/usr/bin/addr2line",
+                              run.call_args.kwargs["env"]["ASAN_OPTIONS"])
+                self.assertIn("detect_leaks=0", run.call_args.kwargs["env"]["ASAN_OPTIONS"])
+            with patch("vulnerabilityanalysis.runtime._guarded_run", return_value=completed) as run, \
+                 patch.dict("vulnerabilityanalysis.runtime.os.environ",
+                            {"ASAN_OPTIONS": "external_symbolizer_path=/custom/symbolizer"}, clear=True):
+                RuntimeExecutor(timeout_seconds=10).run(["/bin/cat", "{input}"], seed)
+                self.assertEqual(run.call_args.kwargs["env"]["ASAN_OPTIONS"],
+                                 "external_symbolizer_path=/custom/symbolizer")
+
+    def test_verifier_context_records_reuse_and_budget_exhaustion(self):
+        reused = {'target': 'known_guard', 'function_name': 'known_guard',
+                  'source': 'int known_guard(void) { return 1; }',
+                  'relation': 'CALLEE_OF', 'related_function': 'parse'}
+        class Resolver:
+            def resolve(self, request):
+                raise AssertionError('budget exhausted: resolver must not run')
+        requests = [ContextRequest('parse', 'known_guard', 'CALLEE', 'guard', 'body'),
+                    ContextRequest('parse', 'missing_guard', 'CALLEE', 'guard', 'body')]
+        expanded, records = _resolve_verifier_context(requests, [reused], set(), 0, Resolver())
+        self.assertEqual(expanded, [])
+        self.assertEqual([row['status'] for row in records],
+                         ['REUSED_EXISTING_CONTEXT', 'SKIPPED_BUDGET'])
+
+    def test_verifier_context_records_an_actual_fetch(self):
+        class Resolver:
+            def resolve(self, request):
+                return [{'target': request.target, 'function_name': 'guard',
+                         'source': 'int guard(void) { return 1; }',
+                         'source_file': '/target/guard.c', 'source_location': '/target/guard.c:1',
+                         'callsite_location': '/target/parse.c:3',
+                         'relation': 'CALLEE_OF', 'related_function': 'parse'}]
+        request = ContextRequest('parse', 'guard', 'CALLEE', 'inspect guard', 'body')
+        requested = set()
+        expanded, records = _resolve_verifier_context([request], [], requested, 1, Resolver())
+        self.assertEqual(records[0]['status'], 'FETCHED')
+        self.assertEqual(expanded[0]['target'], 'guard')
+        self.assertIn(('guard', 'CALLEE'), requested)
+
+    def test_verifier_does_not_repeat_with_duplicate_context_evidence(self):
+        existing = {'target': 'original_name', 'function_name': 'guard',
+                    'source_file': '/target/guard.c', 'source': 'int guard(void) { return 1; }',
+                    'source_location': '/target/guard.c:1',
+                    'callsite_location': '/target/parse.c:3',
+                    'relation': 'CALLEE_OF', 'related_function': 'parse'}
+        fresh = {'target': 'new_guard', 'source_file': '/target/new.c',
+                 'source': 'int new_guard(void) { return 0; }', 'function_name': 'new_guard',
+                 'source_location': '/target/new.c:1',
+                 'callsite_location': '/target/parse.c:4',
+                 'relation': 'CALLEE_OF', 'related_function': 'parse'}
+
+        class Resolver:
+            def resolve(self, request):
+                return [dict(existing, target=request.target)] if request.target == 'alias' else [fresh]
+
+        requests = [ContextRequest('parse', 'alias', 'CALLEE', 'check guard', 'body'),
+                    ContextRequest('parse', 'new_guard', 'CALLEE', 'check new guard', 'body')]
+        expanded, records = _resolve_verifier_context(requests, [existing], set(), 2, Resolver())
+        self.assertEqual([row['status'] for row in records], ['NO_NEW_EVIDENCE', 'FETCHED'])
+        self.assertEqual(expanded, [fresh])
+
+    def test_verifier_rejects_wrong_function_as_caller_evidence(self):
+        class Resolver:
+            def resolve(self, request):
+                return [{'target': request.target, 'function_name': 'parse',
+                         'source_file': '/target/parse.c', 'source': 'int parse(void) { return 1; }'}]
+        request = ContextRequest('parse', 'callers of parse', 'CALLER', 'check guard', 'body')
+        expanded, records = _resolve_verifier_context([request], [], set(), 1, Resolver())
+        self.assertEqual(expanded, [])
+        self.assertEqual(records[0]['status'], 'INVALID_RELATION')
+
+    def test_debug_copy_source_is_mapped_only_when_hash_matches(self):
+        binary = Path('/tmp/va-libyaml-debug-20261008T141232Z-af00a142-fuzzer')
+        original = Path('/tmp/va-ollama-libyaml/src/scanner.c')
+        seed = Path(__file__).resolve().parents[2] / 'result/vulnerabilityanalysis/20261008T142433Z-622973b7/poc/poc-82deadde04558cb2/input.bin'
+        if not all(path.is_file() for path in (binary, original, seed)):
+            self.skipTest('saved libyaml debug build and seed unavailable')
+        reached, condition, trace = trace_sp_location(binary, seed, f'{original}:773',
+                                                      'parser->tokens.head == parser->tokens.tail')
+        self.assertTrue(reached)
+        self.assertFalse(condition)
+        self.assertIn('SOURCE_MAPPING', trace)
+
+        with tempfile.TemporaryDirectory() as temp:
+            changed = Path(temp) / 'scanner.c'
+            changed.write_text(original.read_text() + '\n/* changed */\n')
+            reached, condition, trace = trace_sp_location(binary, seed, f'{changed}:773')
+            self.assertIsNone(reached)
+            self.assertIsNone(condition)
+            self.assertIn('SOURCE_MAPPING_UNVERIFIED', trace)
+
+    def test_runtime_classification_distinguishes_three_reachability_levels(self):
+        self.assertEqual(classify_runtime(0, "", target_reached=True, sp_reached=None),
+                         "NO_CRASH_BUT_FUNCTION_REACHED")
+        self.assertEqual(classify_runtime(0, "", target_reached=True, sp_reached=True),
+                         "NO_CRASH_BUT_SP_LOCATION_REACHED")
+        self.assertEqual(classify_runtime(0, "", target_reached=True, sp_reached=True,
+                                          sp_condition_reached=True),
+                         "NO_CRASH_BUT_SP_CONDITION_REACHED")
+
+    def test_poc_trace_passes_condition_and_classifies_after_location_measurement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed = root / "seed.bin"
+            seed.write_bytes(b"A")
+            point = SuspiciousPoint("s", "w", "d", "target", "target.c", "target.c:9",
+                "read", "hypothesis", [], "input", [], [], [], [], sp_condition="i >= size")
+            poc = PoC("p", "s", "", str(seed), None, "observation")
+            with patch("vulnerabilityanalysis.scan.trace_function_reached", return_value=(True, "function hit")), \
+                 patch("vulnerabilityanalysis.scan.trace_sp_location", return_value=(True, False, "SP hit")) as sp_trace:
+                evidence = execute_poc(poc, point, ["/usr/bin/cat", "{input}"], root,
+                            trace_reachability=True, sp_location="target.c:9",
+                            sp_condition=point.sp_condition)
+            sp_trace.assert_called_once_with(Path("/usr/bin/cat"), seed, "target.c:9", "i >= size")
+            result = json.loads((root / "runtime/p.json").read_text())
+            self.assertTrue(result["function_reached"])
+            self.assertTrue(result["sp_location_reached"])
+            self.assertFalse(result["sp_condition_reached"])
+            self.assertEqual(result["failure_classification"], "NO_CRASH_BUT_SP_LOCATION_REACHED")
+            condition = next(item for item in evidence if item.type == "SP_CONDITION_REACHED")
+            self.assertFalse(condition.supports)
+            self.assertFalse(condition.contradicts)
+
+    def test_artifact_and_runtime_sanitizer_provenance_stay_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seed = root / "seed.bin"
+            seed.write_bytes(b"A")
+            poc = PoC("p", "s", "", str(seed), None, "observation")
+            sp = SuspiciousPoint("s", "w", "d", "target", "target.c", "target.c:9",
+                "read", "hypothesis", [], "input", [], [], [], [])
+            execute_poc(poc, sp, ["/usr/bin/wc", "-c", "{input}"], root,
+                        source_artifact_sanitizers=["UNKNOWN"], runtime_sanitizers=["ASAN", "UBSAN"])
+            result = json.loads((root / "runtime/p.json").read_text())
+            self.assertEqual(result["source_artifact_sanitizers"], ["UNKNOWN"])
+            self.assertEqual(result["runtime_profile"]["sanitizers"], ["ASAN", "UBSAN"])
+            self.assertIsNone(result["crash_triage"])
+
+    def test_only_exact_existing_source_line_is_used_for_breakpoint(self):
+        root = Path(__file__).resolve().parents[2]
+        known = root / "harnessgenerator/harnesscreator/tests/fixtures/c_project/target.c"
+        self.assertEqual(_exact_sp_location("harnessgenerator/harnesscreator/tests/fixtures/c_project/target.c:9", root), f"{known}:9")
+        self.assertIsNone(_exact_sp_location("target.c: maybe line 9", root))
+        self.assertIsNone(_exact_sp_location("harnessgenerator/harnesscreator/tests/fixtures/c_project/target.c:99999", root))
+
+    def test_sp_trace_does_not_promote_function_hit(self):
+        trace = "Breakpoint 1, yaml_parser_scan () at src/scanner.c:749\n"
+        self.assertEqual(parse_sp_trace(trace, "src/scanner.c:773"), (None, None))
+
+    def test_missing_line_breakpoint_in_optimized_build_is_unknown(self):
+        trace = "Breakpoint 1 at 0x123: file src/scanner.c, line 773.\n[Inferior 1 exited normally]\n"
+        self.assertEqual(parse_sp_trace(trace, "src/scanner.c:773"), (None, None))
+
+    def test_optimized_breakpoint_relocated_to_other_line_is_unknown(self):
+        trace = ("Breakpoint 1 at 0x123: file src/scanner.c, line 766.\n"
+                 "Thread 1 hit Breakpoint 1, yaml_parser_scan () at src/scanner.c:766\n"
+                 "$1 = 0\n")
+        self.assertEqual(parse_sp_trace(trace, "src/scanner.c:761"), (None, None))
+
+    def test_gdb_function_hit_requires_actual_stop_not_breakpoint_setup(self):
+        setup = "Breakpoint 1 at 0x123: file src/scanner.c, line 749.\n"
+        self.assertIsNone(parse_function_trace(setup, "yaml_parser_scan"))
+        self.assertTrue(parse_function_trace(
+            setup + "Breakpoint 1, yaml_parser_scan (parser=0x1) at src/scanner.c:749\n",
+            "yaml_parser_scan"))
+        self.assertFalse(parse_function_trace(setup + "[Inferior 1 exited normally]\n",
+                                              "yaml_parser_scan"))
+
+    def test_sp_trace_records_location_and_false_condition(self):
+        trace = ("Breakpoint 1, yaml_parser_scan () at src/scanner.c:773\n"
+                 "$1 = 0\n")
+        self.assertEqual(parse_sp_trace(trace, "src/scanner.c:773"), (True, False))
+
+    def test_target_crash_requires_hypothesis_link(self):
+        result = RuntimeResult(-6, "", "ERROR: AddressSanitizer: heap-buffer-overflow\n"
+            "#0 0x1 in yaml_parser_scan /tmp/libyaml/src/scanner.c:773\n", 6, False,
+            "AddressSanitizer: heap-buffer-overflow", "#0 /tmp/libyaml/src/scanner.c:773", "SANITIZER_CRASH")
+        self.assertEqual(triage_crash(result, "/tmp/libyaml", "/tmp/harness.c", "src/scanner.c:773")["category"], "TARGET_CRASH")
+        self.assertTrue(triage_crash(result, "/tmp/libyaml", "/tmp/harness.c", "src/scanner.c:773")["verification_eligible"])
+        self.assertFalse(triage_crash(result, "/tmp/libyaml", "/tmp/harness.c", "src/other.c:8")["verification_eligible"])
+        self.assertEqual(triage_crash(result, "", "", "src/scanner.c:773")["category"], "UNKNOWN")
+
+    def test_harness_and_assertion_crashes_never_verify_target(self):
+        harness = RuntimeResult(-6, "", "ERROR: AddressSanitizer: heap-buffer-overflow\n"
+            "#0 0x1 in LLVMFuzzerTestOneInput /tmp/harness.c:11\n", 6, False,
+            "AddressSanitizer: heap-buffer-overflow", "#0 /tmp/harness.c:11", "SANITIZER_CRASH")
+        self.assertEqual(triage_crash(harness, "/tmp/libyaml", "/tmp/harness.c", "src/scanner.c:773")["category"], "HARNESS_CRASH")
+        assertion = RuntimeResult(-6, "", "VA_ASSERTION_VIOLATION:a-1", 6, False, None, None, "UNKNOWN")
+        self.assertEqual(triage_crash(assertion, "/tmp/libyaml", "/tmp/harness.c", "src/scanner.c:773")["category"], "ASSERTION_VIOLATION")
+
+    def test_retry_requires_new_evidence(self):
+        ledger = RetryLedger(3)
+        ledger.record("sp", "python_input", ["context-1"], "NO_CRASH")
+        self.assertFalse(ledger.allow("sp", "python_input", ["context-1"]))
+        self.assertTrue(ledger.allow("sp", "python_input", ["context-1", "gdb-2"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

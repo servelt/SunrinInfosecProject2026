@@ -1,0 +1,70 @@
+{
+  "code_location": "src/reqs.c:806",
+  "contradicting_evidence": [
+    "The map implementation may retain value storage until the original header entry is removed.",
+    "No callee implementation or runtime failure is supplied."
+  ],
+  "direction_id": "direction-faa775e7d29665de",
+  "external_input_relation": "The token bytes are stored header-value bytes and may be derived from harness-controlled request bytes, but the supplied harness does not establish the map population or returned-pointer ownership.",
+  "function_name": "remove_connection_headers",
+  "priority_reasons": [
+    "unverified external input hint +8",
+    "security relevance hint +8",
+    "described trigger hint +6",
+    "static support hints +6",
+    "unverified contradiction hints -2",
+    "required state complexity -3"
+  ],
+  "priority_score": 23.0,
+  "required_state": [
+    "hashofheaders contains a connection or proxy-connection entry.",
+    "The returned value is NUL-terminated and has at least one token.",
+    "Removing the token changes the lifetime or validity of the returned value buffer.",
+    "The missing orderedmap_remove contract determines whether this occurs."
+  ],
+  "runtime_reachable": null,
+  "security_property": "Memory safety and pointer lifetime during header removal.",
+  "source_excerpt": "ptr += strlen (ptr) + 1;",
+  "source_file": "src/reqs.c",
+  "source_line": 806,
+  "sp_condition": null,
+  "sp_id": "sp-a4ff121e327e3408",
+  "status": "OPEN",
+  "status_history": [
+    "OPEN",
+    "VERIFYING",
+    "OPEN",
+    "POC_PENDING",
+    "RUNTIME_PENDING",
+    "OPEN"
+  ],
+  "supporting_evidence": [
+    "The function continues traversing data after orderedmap_remove.",
+    "The context explicitly identifies possible freeing or invalidation by orderedmap_remove as unresolved.",
+    "strlen(ptr) dereferences the returned buffer after the removal operation.",
+    "src/reqs.c:806: the loop advances with `ptr += strlen (ptr) + 1;` after `orderedmap_remove (hashofheaders, ptr)` at the prior statement.",
+    "src/reqs.c:796-806: `ptr` traverses the value returned by `orderedmap_find`, and `strlen(ptr)` is evaluated after each token removal."
+  ],
+  "suspicious_operation": "Calls strlen on the token buffer after removing the current token from hashofheaders.",
+  "trigger_conditions": [
+    "orderedmap_find returns a value pointer used as data.",
+    "The token loop enters at least one iteration.",
+    "orderedmap_remove(hashofheaders, ptr) frees or invalidates the storage containing data or ptr.",
+    "Execution then evaluates strlen(ptr)."
+  ],
+  "unknowns": [
+    "Whether orderedmap_remove frees values, reallocates map storage, or invalidates pointers.",
+    "Whether removing a token key can affect the storage backing the original header value.",
+    "Whether the relevant map values are independently allocated or aliased.",
+    "condition source validation unavailable: baseline translation unit does not compile; model sp_condition='data != NULL && ptr != NULL && ptr < data + len'",
+    "The implementation and ownership/lifetime contract of `orderedmap_remove` are not supplied.",
+    "It is unknown whether `orderedmap_remove` can free, reallocate, or otherwise invalidate the storage returned by `orderedmap_find`.",
+    "The supplied harness is truncated and does not establish that a request reaches `remove_connection_headers` with the required header-map state.",
+    "Verifier still needs context after the available expansions: SKIPPED_BUDGET, SKIPPED_BUDGET"
+  ],
+  "verification_cost": null,
+  "verified_evidence_count": 0,
+  "vulnerability_hypothesis": "orderedmap_remove may free or invalidate the value buffer returned by orderedmap_find, so the subsequent strlen may read freed or otherwise invalid memory.",
+  "wait_age": 0,
+  "worker_id": "worker-773ac126a38e56ff"
+}

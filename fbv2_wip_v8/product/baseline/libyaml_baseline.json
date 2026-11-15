@@ -1,0 +1,96 @@
+{
+  "report_kind": "FBV2_LIBYAML_BASELINE_AND_HP_READINESS",
+  "created_at_utc": "2026-10-10T11:25:00Z",
+  "historical_report": "result/vulnerabilityanalysis/20261010T1115Z-fullscan-final-review/report.json",
+  "historical_runs_unchanged": true,
+  "target": {
+    "commit": "90a56d4500aa1a1798514c5cb55c3ad4cb095f94",
+    "binary_sha256": "340fd1d09c35f8622f7b8447e9e6be41a1aea2c0a7b0254fab8d6169a8dba0f1",
+    "harness_path": "/home/dawne/SunrinInfosecProject2026/reference/QuartetFuzz/QuartetFuzz/subset_25/precomputed/libyaml__libyaml_scanner_fuzzer/libyaml_scanner_fuzzer.c",
+    "harness_sha256": "b370c8209c82c9e94cf95a3ce0cc8eedaaee33df96d1a16e6ba8459ad3a526f4"
+  },
+  "baseline": {
+    "function_pool": 12,
+    "completed_functions": 12,
+    "incomplete_functions": 0,
+    "generated_sp": 34,
+    "distinct_deep_verified_sp": 29,
+    "pending_open_sp": 5,
+    "poc_records": 37,
+    "poc_executed": 35,
+    "poc_input_generation_errors": 2,
+    "function_reached_true": 32,
+    "function_reached_false": 3,
+    "sp_location_true": 27,
+    "sp_location_unknown": 8,
+    "sp_condition_true": 0,
+    "sp_condition_false": 8,
+    "sp_condition_unknown": 27,
+    "sanitizer_crash": 0,
+    "verified": 0,
+    "pending_ids": [
+      "sp-5ebdef5e43d85ca2",
+      "sp-0af274be69a426c7",
+      "sp-8999cc1ceb03cd3b",
+      "sp-996c7d1da40b9117",
+      "sp-51ab90b479696c39"
+    ]
+  },
+  "condition_unknown": {
+    "NO_VALIDATED_MEASURABLE_CONDITION": 19,
+    "EXACT_SP_LOCATION_NOT_CONFIRMED": 8
+  },
+  "invalid_diagnostic": {
+    "run_id": "20261010T105255Z-pending-sp-resume",
+    "seed_count": 65,
+    "first_origin": "GLOBAL_FUZZ",
+    "invalid_run_artifact": "result/vulnerabilityanalysis/20261010T105255Z-pending-sp-resume/experiment_invalid.json",
+    "hash_manifest": "invalid_diagnostic_seed_hashes.json"
+  },
+  "future_matched_off_on": {
+    "status": "SPECIFIED_NOT_RUN",
+    "initial_corpus": "initial_corpus",
+    "seed_count": 1,
+    "seed_sha256": "15af1afdc737fda5a7b8529ba41d1d71a05363c7c9e08ef0eb8cbe16211d6951",
+    "seed_bytes": 144,
+    "source_seed": "result/vulnerabilityanalysis/20261009T115412Z-guided-libyaml/seed.bin",
+    "phase1": "Use identical clean target/harness/Function Pool snapshot with separate fresh OFF and ON campaign IDs; no prior worker corpus import",
+    "max_functions": 12,
+    "max_candidates_per_function": 2,
+    "max_llm_calls_per_function": 8,
+    "initial_function_llm_call_ceiling": 96,
+    "max_sp_verifier_attempts": 2,
+    "max_scan_seconds_per_arm": 2400,
+    "worker_fuzz_engine_seconds_per_arm": 30,
+    "global_fuzz_slice_seconds": 3,
+    "targeted_fuzz_seconds_per_candidate": 2,
+    "assertion_fuzz_seconds_if_eligible_on": 1,
+    "runtime_timeout_seconds": 10,
+    "sanitizers": [
+      "ASAN"
+    ],
+    "provider": "codex",
+    "model_config_source": "vulnerabilityanalysis/config/default.yaml",
+    "historical_fuzzer_config_source": "result/vulnerabilityanalysis/20261010T103028Z-4e197682/evaluation_config.yaml",
+    "same_binary_sha256": "340fd1d09c35f8622f7b8447e9e6be41a1aea2c0a7b0254fab8d6169a8dba0f1",
+    "trace_reachability": true,
+    "ollama_fallback": false,
+    "off_meaning": "HP assertion execution off; shared Function Analyzer still evaluates safety hypotheses",
+    "on_meaning": "HP Assertion/Guided Fuzzing only when eligible assumption exists; share worker fuzz and LLM budget",
+    "uncontrolled": "LLM stochastic outputs and host/runtime scheduling; record exact request logs, prompt/config hashes, build hashes, corpus provenance, and stage timings"
+  },
+  "implementation_vs_validation": {
+    "implemented": "Function Analyzer safe judgment recording, Assertion generation/build/execute, guided fuzzing, violation triage, refinement, SP feedback paths in existing modules",
+    "oss_functional_diagnostic": "Little CMS paper-invariant nonblind witness reached Assertion violation and SP feedback; separate followup SP Verifier/PoV/Runtime reached in prior diagnostic",
+    "blind_oss_end_to_end": "NOT_DEMONSTRATED_NO_INDEPENDENT_ELIGIBLE_INVARIANT",
+    "detection_gain": "NOT_EVALUATED"
+  },
+  "files": [
+    "baseline.json",
+    "poc_condition_audit.json",
+    "invalid_diagnostic_seed_hashes.json",
+    "safe_assumption_inventory.json",
+    "initial_corpus/seed.bin",
+    "validation.json"
+  ]
+}

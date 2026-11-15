@@ -1,0 +1,9 @@
+%YAML 1.2
+---
+root:
+  sequence:
+    - &anchor {key: 'value', folded: >-
+        text line}
+    - *anchor
+  tagged: !!str "scanner exercise"
+...

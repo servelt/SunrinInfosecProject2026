@@ -1,0 +1,92 @@
+{
+  "kind": "MANUAL_POST_HOC_CAUSAL_DIAGNOSTIC_NOT_GATE_EVIDENCE",
+  "source_project": "public md4c",
+  "source_revision": "fb83eb2bedcf730bc721ab91b07c80d011cbe38f",
+  "original_source_sha256": "88cb055c808278098dec86089c566c3e232b5af758e1d7b5273323b167e4ed1f",
+  "diagnostic_source_sha256": "70b844c1de9f08208b696358d74c5ae1a42fe0b3239429f1ec5b2ae5d653eccb",
+  "original_diagnostic_binary_sha256": "7604255e03ae0f5aad23bc0e804ec54fe0cc52c3ee2b045dec10d685b09973c6",
+  "patched_diagnostic_binary_sha256": "d201fad5fefce894eda331ada8ad7fceedaa7d77c728f76b7cc3555f011add1d",
+  "product_original_asan_binary_sha256": "4b75a6c4e8ace630d9db101592a84d68145448090ba824abc9d597fa8a759196",
+  "observed_input_sha256": "e96efb46fd5232d952a4eee62e3d64cc98497a6f4dbbb695080fa248cf3eaf33",
+  "product_gate_status": "TARGET_OOB_OBSERVED_PENDING_CAUSAL_EVIDENCE",
+  "source_locations": {
+    "corrupting_branch": "md4c.c:5868-5878",
+    "observed_invalid_access": "md4c.c:3266"
+  },
+  "counterfactual_changes": [
+    "shift the current MD_BLOCK and its lines one MD_BLOCK to the right before writing MD_BLOCK_HR",
+    "refresh the local MD_LINE pointer after the shift"
+  ],
+  "diagnostic_results": [
+    {
+      "input_variant": "observed",
+      "input_sha256": "e96efb46fd5232d952a4eee62e3d64cc98497a6f4dbbb695080fa248cf3eaf33",
+      "input_bytes": 127,
+      "source_variant": "original",
+      "exit_code": -6,
+      "asan_oob": true,
+      "stderr_sha256": "ece22deede4b62e65738739167985ad0674fe398ffd965389cca140a4888700c"
+    },
+    {
+      "input_variant": "observed",
+      "input_sha256": "e96efb46fd5232d952a4eee62e3d64cc98497a6f4dbbb695080fa248cf3eaf33",
+      "input_bytes": 127,
+      "source_variant": "patched2",
+      "exit_code": 0,
+      "asan_oob": false,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input_variant": "no_thematic_break",
+      "input_sha256": "f83122bb88bcc045e856c551e2c6df45f278b12050e93eea81304c415db799a0",
+      "input_bytes": 127,
+      "source_variant": "original",
+      "exit_code": 0,
+      "asan_oob": false,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input_variant": "no_thematic_break",
+      "input_sha256": "f83122bb88bcc045e856c551e2c6df45f278b12050e93eea81304c415db799a0",
+      "input_bytes": 127,
+      "source_variant": "patched2",
+      "exit_code": 0,
+      "asan_oob": false,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input_variant": "no_link_references",
+      "input_sha256": "b98edeaac89d21ff4127b69647d6619c9e0efae8c7f8bf1e296a5e218accff0e",
+      "input_bytes": 127,
+      "source_variant": "original",
+      "exit_code": 0,
+      "asan_oob": false,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "input_variant": "no_link_references",
+      "input_sha256": "b98edeaac89d21ff4127b69647d6619c9e0efae8c7f8bf1e296a5e218accff0e",
+      "input_bytes": 127,
+      "source_variant": "patched2",
+      "exit_code": 0,
+      "asan_oob": false,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "interpretation": "Two-line diagnostic change and input trigger controls support a source-level causal hypothesis. The target checkout and product Gate were not modified. This manual post-hoc analysis is not automatic VERIFIED evidence.",
+  "limitations": [
+    "diagnostic binaries were separately built with GCC ASan, not the pinned product ASan binary",
+    "this record alone does not satisfy the existing product causal-evidence or Security Gate contract"
+  ],
+  "execution_settings": {
+    "asan_options": "abort_on_error=1:detect_leaks=0",
+    "timeout_seconds_per_case": 10,
+    "compiler_flags": [
+      "-O1",
+      "-g",
+      "-fsanitize=address",
+      "-static-libasan",
+      "-fno-omit-frame-pointer"
+    ]
+  }
+}

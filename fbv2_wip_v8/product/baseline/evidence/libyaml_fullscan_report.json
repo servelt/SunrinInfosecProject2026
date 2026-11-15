@@ -1,0 +1,509 @@
+{
+  "report_kind": "FBV2_LIBYAML_FULLSCAN_FINAL_REVIEW",
+  "target_commit": "90a56d4500aa1a1798514c5cb55c3ad4cb095f94",
+  "source_repository": "/tmp/va-ollama-libyaml",
+  "binary": "/tmp/va-hp-eval-libyaml-buildcheck",
+  "binary_sha256": "340fd1d09c35f8622f7b8447e9e6be41a1aea2c0a7b0254fab8d6169a8dba0f1",
+  "budget": {
+    "function_count_limit_this_run": 6,
+    "max_llm_calls_per_function": 8,
+    "max_scan_seconds": 900,
+    "worker_fuzz_engine_seconds_configured": 30,
+    "new_function_llm_upper_bound": 48,
+    "pending_resume_llm_upper_bound": 48,
+    "pending_resume_scan_seconds_each": 180
+  },
+  "function_pool": {
+    "total": 12,
+    "completed": 12,
+    "remaining": []
+  },
+  "runs": [
+    {
+      "run_id": "20261010T103028Z-4e197682",
+      "kind": "original_six",
+      "function": "yaml_parser_scan",
+      "priority_score": 79.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-ea4b777ccdccf7ab"
+      ],
+      "poc_count": 4,
+      "scan_elapsed_seconds": 160.117,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T103344Z-696bc68b",
+      "kind": "original_six",
+      "function": "yaml_parser_fetch_block_scalar",
+      "priority_score": 61.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-18d6841d9f0f9002"
+      ],
+      "poc_count": 3,
+      "scan_elapsed_seconds": 205.605,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T103830Z-worker-continuation",
+      "kind": "original_six",
+      "function": "yaml_parser_fetch_plain_scalar",
+      "priority_score": 62.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-31ad45f129f27f8e"
+      ],
+      "poc_count": 3,
+      "scan_elapsed_seconds": 189.162,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T104147Z-5a2824e8",
+      "kind": "original_six",
+      "function": "yaml_parser_fetch_flow_scalar",
+      "priority_score": 63.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-470a50a7fabbe576"
+      ],
+      "poc_count": 4,
+      "scan_elapsed_seconds": 169.434,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T104449Z-8bc8717f",
+      "kind": "original_six",
+      "function": "yaml_token_delete",
+      "priority_score": 48.0,
+      "llm_calls": 8,
+      "sp_count": 5,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-a02bc00ed1465f1d",
+        "sp-b79987c2a7eea8bf",
+        "sp-340cfac53330885b"
+      ],
+      "poc_count": 4,
+      "scan_elapsed_seconds": 171.627,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T105025Z-worker-retry-corrected",
+      "kind": "original_six",
+      "function": "yaml_parser_scan_to_next_token",
+      "priority_score": 55.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-2d0d6b858297b6ed"
+      ],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 128.003,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-fullscan-final-continuation",
+      "kind": "new_six",
+      "function": "yaml_parser_fetch_next_token",
+      "priority_score": 51.0,
+      "llm_calls": 7,
+      "sp_count": 2,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 152.421,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T110324Z-9631d638",
+      "kind": "new_six",
+      "function": "yaml_parser_delete",
+      "priority_score": 51.0,
+      "llm_calls": 8,
+      "sp_count": 6,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-5ebdef5e43d85ca2",
+        "sp-0af274be69a426c7",
+        "sp-8999cc1ceb03cd3b",
+        "sp-996c7d1da40b9117"
+      ],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 132.388,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T110547Z-86d3792d",
+      "kind": "new_six",
+      "function": "yaml_free",
+      "priority_score": 44.0,
+      "llm_calls": 8,
+      "sp_count": 2,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 167.195,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T110847Z-87720b6a",
+      "kind": "new_six",
+      "function": "yaml_parser_initialize",
+      "priority_score": 43.0,
+      "llm_calls": 8,
+      "sp_count": 3,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-51ab90b479696c39"
+      ],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 129.304,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T111107Z-d7e3ef07",
+      "kind": "new_six",
+      "function": "yaml_malloc",
+      "priority_score": 36.0,
+      "llm_calls": 6,
+      "sp_count": 1,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 113.836,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T111312Z-b692c528",
+      "kind": "new_six",
+      "function": "yaml_parser_set_input_string",
+      "priority_score": 32.0,
+      "llm_calls": 4,
+      "sp_count": 0,
+      "selected_sp_count": 0,
+      "pending_sp_ids": [],
+      "poc_count": 0,
+      "scan_elapsed_seconds": 51.485,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T105420Z-pending-sp-resume-corrected",
+      "kind": "resumed_sp",
+      "function": "yaml_parser_scan",
+      "priority_score": 79.0,
+      "llm_calls": 3,
+      "sp_count": 3,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 50.464,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-block_scalar-1",
+      "kind": "resumed_sp",
+      "function": "yaml_parser_fetch_block_scalar",
+      "priority_score": 61.0,
+      "llm_calls": 3,
+      "sp_count": 3,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 46.227,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-plain_scalar-1",
+      "kind": "resumed_sp",
+      "function": "yaml_parser_fetch_plain_scalar",
+      "priority_score": 62.0,
+      "llm_calls": 3,
+      "sp_count": 3,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 102.019,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-flow_scalar-1",
+      "kind": "resumed_sp",
+      "function": "yaml_parser_fetch_flow_scalar",
+      "priority_score": 63.0,
+      "llm_calls": 3,
+      "sp_count": 3,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 49.124,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-token_delete-1",
+      "kind": "resumed_sp",
+      "function": "yaml_token_delete",
+      "priority_score": 48.0,
+      "llm_calls": 5,
+      "sp_count": 5,
+      "selected_sp_count": 2,
+      "pending_sp_ids": [
+        "sp-340cfac53330885b"
+      ],
+      "poc_count": 2,
+      "scan_elapsed_seconds": 65.692,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-token_delete-2",
+      "kind": "resumed_sp",
+      "function": "yaml_token_delete",
+      "priority_score": 48.0,
+      "llm_calls": 3,
+      "sp_count": 5,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 52.244,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-scan_next_token-1",
+      "kind": "resumed_sp",
+      "function": "yaml_parser_scan_to_next_token",
+      "priority_score": 55.0,
+      "llm_calls": 3,
+      "sp_count": 3,
+      "selected_sp_count": 1,
+      "pending_sp_ids": [],
+      "poc_count": 1,
+      "scan_elapsed_seconds": 55.86,
+      "crash_count": 0,
+      "verified_count": 0
+    }
+  ],
+  "aggregate": {
+    "original_six": {
+      "llm_calls": 48,
+      "sp_count": 20,
+      "selected_sp_count": 12,
+      "pending": 8,
+      "poc_count": 20,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    "new_six": {
+      "llm_calls": 41,
+      "sp_count": 14,
+      "selected_sp_count": 9,
+      "pending": 5,
+      "poc_count": 9,
+      "crash_count": 0,
+      "verified_count": 0
+    },
+    "resumed_sp": {
+      "llm_calls": 23,
+      "sp_count": 25,
+      "selected_sp_count": 8,
+      "pending": 1,
+      "poc_count": 8,
+      "crash_count": 0,
+      "verified_count": 0,
+      "sp_count_explanation": "snapshot count across resume Runs; not newly generated SPs",
+      "pending_explanation": "one intermediate token_delete resume left a candidate pending; the next resume processed it"
+    }
+  },
+  "llm_requests": {
+    "original_six": {
+      "gpt-5.6-luna": 36,
+      "COMPLETED": 48,
+      "gpt-5.6-sol": 12
+    },
+    "new_six": {
+      "gpt-5.6-luna": 32,
+      "COMPLETED": 41,
+      "gpt-5.6-sol": 9
+    },
+    "resumed_sp": {
+      "gpt-5.6-luna": 15,
+      "COMPLETED": 23,
+      "gpt-5.6-sol": 8
+    }
+  },
+  "verifier_verdicts_across_original_and_resume_artifacts": {
+    "UNKNOWN": 28,
+    "PLAUSIBLE": 1
+  },
+  "poc_statuses_across_original_and_resume_artifacts": {
+    "EXECUTED_UNRESOLVED": 35,
+    "INPUT_GENERATION_ERROR": 2
+  },
+  "old_pending_sp_count": 8,
+  "old_pending_resumed_prior": 1,
+  "old_pending_resumed_this_batch": 7,
+  "new_pending_sp_ids": [
+    "sp-5ebdef5e43d85ca2",
+    "sp-0af274be69a426c7",
+    "sp-8999cc1ceb03cd3b",
+    "sp-996c7d1da40b9117",
+    "sp-51ab90b479696c39"
+  ],
+  "reachability": {
+    "executed_poc_count": 35,
+    "function_reached": {
+      "True": 32,
+      "False": 3
+    },
+    "sp_location_reached": {
+      "True": 27,
+      "None": 8
+    },
+    "sp_condition_reached": {
+      "False": 8,
+      "None": 27
+    },
+    "old_replay_artifact": "result/vulnerabilityanalysis/20261010T1100Z-poc-reachability-replay/reachability.json",
+    "new_replay_artifact": "result/vulnerabilityanalysis/20261010T1114Z-new-poc-reachability-replay/reachability.json"
+  },
+  "corpus": {
+    "folder": "result/vulnerabilityanalysis/worker_corpora/02b643857ae94e4453ec",
+    "last_run_import_count": 2303,
+    "archive_seed_count": 2303,
+    "first_origin_counts": {
+      "SP_FUZZ": 1073,
+      "GLOBAL_FUZZ": 1218,
+      "POV_FAILED": 8,
+      "POV": 3,
+      "INITIAL": 1
+    },
+    "invalid_diagnostic_first_origin_count": 65
+  },
+  "fuzzing": {
+    "valid_initial_six_allocated_engine_seconds": 29,
+    "invalid_prior_diagnostic_allocated_engine_seconds": 3,
+    "new_function_and_pending_runs_allocated_engine_seconds": 0,
+    "valid_initial_six_process_wall_seconds_by_job": {
+      "GLOBAL": 21.502,
+      "SP": 59.142
+    },
+    "invalid_prior_diagnostic_global_process_wall_seconds": 4.127,
+    "new_function_and_pending_process_wall_seconds": 0
+  },
+  "new_function_scan_elapsed_seconds": 756.707,
+  "new_pending_batch_elapsed_seconds_sum": 395.821,
+  "regression_tests": {
+    "total": 197,
+    "passed": 195,
+    "skipped": 2,
+    "failed": 0
+  },
+  "conclusion": {
+    "verified_count_in_this_libyaml_campaign": 0,
+    "new_product_code_changes": 0,
+    "note": "The pending SP resume batch overlapped with new function analysis; elapsed values are not additive wall time. Five newly generated SPs remain pending under the per-function candidate budget."
+  },
+  "totals_without_duplicate_resume_snapshots": {
+    "functions": 12,
+    "sp_generated": 34,
+    "distinct_sp_deep_verified": 29,
+    "new_pending_sp": 5,
+    "poc_records": 37,
+    "poc_inputs_executed": 35,
+    "llm_requests_original_function_runs": 48,
+    "llm_requests_new_function_runs": 41,
+    "llm_requests_all_pending_resumes": 23
+  },
+  "resumed_sp_results": [
+    {
+      "run_id": "20261010T105420Z-pending-sp-resume-corrected",
+      "sp_id": "sp-ea4b777ccdccf7ab",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-block_scalar-1",
+      "sp_id": "sp-18d6841d9f0f9002",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-plain_scalar-1",
+      "sp_id": "sp-31ad45f129f27f8e",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-flow_scalar-1",
+      "sp_id": "sp-470a50a7fabbe576",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-token_delete-1",
+      "sp_id": "sp-b79987c2a7eea8bf",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-token_delete-1",
+      "sp_id": "sp-a02bc00ed1465f1d",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 0
+    },
+    {
+      "run_id": "20261010T1100Z-resume-token_delete-2",
+      "sp_id": "sp-340cfac53330885b",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    },
+    {
+      "run_id": "20261010T1100Z-resume-scan_next_token-1",
+      "sp_id": "sp-2d0d6b858297b6ed",
+      "status": "OPEN",
+      "verdict": "UNKNOWN",
+      "next_action": "REQUEST_CONTEXT",
+      "new_context_fetches": 1
+    }
+  ]
+}
