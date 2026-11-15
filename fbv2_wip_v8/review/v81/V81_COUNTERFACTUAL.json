@@ -1,0 +1,21 @@
+{
+  "evidence_sha256": {
+    "V7_PINNED_FUNCTIONS.json": "ff2e05b1ae92a893ea4cc4c950b3fd7f66d4d1c65b13875d5268644fed209a22",
+    "V7_SP_FUNCTION_SELECTION_RECEIPT.json": "15600e57b2506de696366ed8ae76ea30b60894715280c8c8b80dd60aa2887b79"
+  },
+  "kind": "V81_V7_SELECTION_COUNTERFACTUAL_V1",
+  "limitation": "This sorts V7's pinned selected rows; it is not a V8.1 Live result.",
+  "results": {
+    "generic": {
+      "selected_count": 155,
+      "target_counterfactual_order_zero_based": 15,
+      "target_score": 75
+    },
+    "lifetime_family": {
+      "selected_count": 155,
+      "target_counterfactual_order_zero_based": 51,
+      "target_score": 20
+    }
+  },
+  "v7_target_original_order_zero_based": 72
+}

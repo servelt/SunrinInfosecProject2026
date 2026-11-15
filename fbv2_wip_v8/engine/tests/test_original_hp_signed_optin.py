@@ -291,6 +291,89 @@ def test_parallel_hp_pipeline_shares_sp_host_tool_boundary(tmp_path, monkeypatch
             bound, hp, "function_analysis", spec_path, _sha(spec_path))
 
 
+def test_parallel_hp_reservation_waits_for_sp_boundary_and_cancels_cleanly(
+        tmp_path, monkeypatch):
+    from devtools.campaign_model_gate import CampaignModelGate
+    from vulnerabilityanalysis.llm import LLMRequest
+
+    run_dir = tmp_path / "run"
+    event_dir = run_dir / "model_events"
+    event_dir.mkdir(parents=True, mode=0o700)
+    hp = {"enabled": True, "max_items": 1, "max_model_calls": 4,
+          "assets": {}}
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text("{}")
+    gate = CampaignModelGate(tmp_path / "campaign.json", "v81-offline", None,
+                             60, create=True)
+    lock = asyncio.Lock()
+    calls = []
+
+    def sp_factory(_role, _owner):
+        raise AssertionError("SP factory must not be called by HP")
+
+    sp_factory._fbv2_campaign_gate = gate
+    sp_factory._fbv2_campaign_boundary_lock = lock
+
+    class Transport:
+        event_log_path = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def generate(self, _request):
+            calls.append("sent")
+            return {"ok": True}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(hp_live, "_hp_client_type", lambda _check: Transport)
+    monkeypatch.setattr(hp_live, "_check_signed_hp_spec",
+                        lambda *_args: None)
+    monkeypatch.setattr(hp_live, "validate_hp_spec",
+                        lambda *_args, **_kwargs: None)
+    bound = SimpleNamespace(
+        identity=SimpleNamespace(
+            run_dir=run_dir, task_path=tmp_path, codex_role_models=None,
+            codex_model="fixture", codex_effort="low",
+            product_src=tmp_path / "product-src",
+            codex_executable=tmp_path / "codex",
+            codex_executable_sha256="a" * 64),
+        caps=SimpleNamespace(model_turn_seconds=30,
+                             bounded_nohint_dev=False),
+        model_gate=gate, recheck=lambda: None,
+        strategy=SimpleNamespace(llm_client_factory=sp_factory),
+        executor=SimpleNamespace(parallel_hp_async_factory=object()))
+    pipeline = hp_live._pipeline_factory(
+        bound, hp, "function_analysis", spec_path,
+        _sha(spec_path))(SimpleNamespace(function_id="f", direction_id="d"))
+    request = LLMRequest(role="function_analysis", instructions="fixture",
+                         payload={}, output_schema={})
+
+    async def exercise():
+        async with lock:
+            waiting = asyncio.create_task(pipeline.provider.generate(request))
+            await asyncio.sleep(0.02)
+            assert not waiting.done()
+            assert gate.snapshot()["physical"] == 0
+            assert calls == []
+        assert await asyncio.wait_for(waiting, timeout=2) == {"ok": True}
+        assert gate.snapshot()["physical"] == 1
+        assert gate.snapshot()["records"][0]["status"] == "COMPLETED"
+        assert calls == ["sent"]
+
+        async with lock:
+            cancelled = asyncio.create_task(pipeline.provider.generate(request))
+            await asyncio.sleep(0.02)
+            cancelled.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancelled
+            assert gate.snapshot()["physical"] == 1
+            assert calls == ["sent"]
+
+    asyncio.run(exercise())
+
+
 def test_signed_hp_run_claim_is_one_shot_and_result_is_separate(
         tmp_path, monkeypatch):
     source, hp = _assets(tmp_path)

@@ -1,0 +1,175 @@
+--- V8/engine/tests/test_fullscan_client_factory.py
++++ V81/engine/tests/test_fullscan_client_factory.py
+@@ -706,6 +706,45 @@
+     assert [(func.function_id, direction_id) for func, direction_id in
+             strategy._phase_work_for_directions(pools, "small/new")] == [
+                 ("high", "D2"), ("low", "D1")]
++
++
++def test_concurrent_family_profile_prioritizes_across_directions_only_when_enabled(
++        tmp_path):
++    strategy, _ = make_strategy(RecordingFactory())
++    strategy._full_nohint_sp = False
++    strategy._development_security_invariant_focus = "LIFETIME_OWNERSHIP"
++    strategy.results_path = tmp_path
++    strategy._development_direction_plan = (
++        tmp_path / "DIRECTION_PLAN.json", "a" * 64)
++    low = SimpleNamespace(function_id="low", name="low",
++                          content="int low(void) { return 0; }")
++    high = SimpleNamespace(function_id="high", name="high",
++                           content="void high(char *p) { free(p); }")
++    pools = [
++        (SimpleNamespace(direction_id="D1"), {"small/new": [low]}),
++        (SimpleNamespace(direction_id="D2"), {"small/new": [high]}),
++    ]
++
++    strategy._development_sp_concurrent_queue = True
++    assert [(func.function_id, direction_id) for func, direction_id in
++            strategy._phase_work_for_directions(pools, "small/new")] == [
++                ("high", "D2"), ("low", "D1")]
++    phases = ["small/new"]
++    plan = strategy._unique_phase_work_plan(pools, phases)
++    strategy._write_sp_function_selection_receipt(pools, phases, plan)
++    receipt = json.loads((tmp_path / "SP_FUNCTION_SELECTION_RECEIPT.json").read_text())
++    assert [row["canonical_identity"]["value"] for row in
++            receipt["selected_functions"]] == ["high", "low"]
++    assert [row["selected_order"] for row in receipt["occurrences"]] == [1, 0]
++    assert receipt["occurrence_order_semantics"] == (
++        "PRE_PRIORITY_INTERLEAVED_CANDIDATE_ORDER_V1")
++    assert receipt["selected_order_semantics"] == (
++        "ACTUAL_PHASE_EXECUTION_ORDER_V1")
++
++    strategy._development_sp_concurrent_queue = False
++    assert [(func.function_id, direction_id) for func, direction_id in
++            strategy._phase_work_for_directions(pools, "small/new")] == [
++                ("low", "D1"), ("high", "D2")]
+ 
+ 
+ def test_full_nohint_deduplicates_same_function_across_phases():
+--- V8/engine/tests/test_original_hp_signed_optin.py
++++ V81/engine/tests/test_original_hp_signed_optin.py
+@@ -291,6 +291,89 @@
+             bound, hp, "function_analysis", spec_path, _sha(spec_path))
+ 
+ 
++def test_parallel_hp_reservation_waits_for_sp_boundary_and_cancels_cleanly(
++        tmp_path, monkeypatch):
++    from devtools.campaign_model_gate import CampaignModelGate
++    from vulnerabilityanalysis.llm import LLMRequest
++
++    run_dir = tmp_path / "run"
++    event_dir = run_dir / "model_events"
++    event_dir.mkdir(parents=True, mode=0o700)
++    hp = {"enabled": True, "max_items": 1, "max_model_calls": 4,
++          "assets": {}}
++    spec_path = tmp_path / "spec.json"
++    spec_path.write_text("{}")
++    gate = CampaignModelGate(tmp_path / "campaign.json", "v81-offline", None,
++                             60, create=True)
++    lock = asyncio.Lock()
++    calls = []
++
++    def sp_factory(_role, _owner):
++        raise AssertionError("SP factory must not be called by HP")
++
++    sp_factory._fbv2_campaign_gate = gate
++    sp_factory._fbv2_campaign_boundary_lock = lock
++
++    class Transport:
++        event_log_path = None
++
++        def __init__(self, **_kwargs):
++            pass
++
++        async def generate(self, _request):
++            calls.append("sent")
++            return {"ok": True}
++
++        async def close(self):
++            pass
++
++    monkeypatch.setattr(hp_live, "_hp_client_type", lambda _check: Transport)
++    monkeypatch.setattr(hp_live, "_check_signed_hp_spec",
++                        lambda *_args: None)
++    monkeypatch.setattr(hp_live, "validate_hp_spec",
++                        lambda *_args, **_kwargs: None)
++    bound = SimpleNamespace(
++        identity=SimpleNamespace(
++            run_dir=run_dir, task_path=tmp_path, codex_role_models=None,
++            codex_model="fixture", codex_effort="low",
++            product_src=tmp_path / "product-src",
++            codex_executable=tmp_path / "codex",
++            codex_executable_sha256="a" * 64),
++        caps=SimpleNamespace(model_turn_seconds=30,
++                             bounded_nohint_dev=False),
++        model_gate=gate, recheck=lambda: None,
++        strategy=SimpleNamespace(llm_client_factory=sp_factory),
++        executor=SimpleNamespace(parallel_hp_async_factory=object()))
++    pipeline = hp_live._pipeline_factory(
++        bound, hp, "function_analysis", spec_path,
++        _sha(spec_path))(SimpleNamespace(function_id="f", direction_id="d"))
++    request = LLMRequest(role="function_analysis", instructions="fixture",
++                         payload={}, output_schema={})
++
++    async def exercise():
++        async with lock:
++            waiting = asyncio.create_task(pipeline.provider.generate(request))
++            await asyncio.sleep(0.02)
++            assert not waiting.done()
++            assert gate.snapshot()["physical"] == 0
++            assert calls == []
++        assert await asyncio.wait_for(waiting, timeout=2) == {"ok": True}
++        assert gate.snapshot()["physical"] == 1
++        assert gate.snapshot()["records"][0]["status"] == "COMPLETED"
++        assert calls == ["sent"]
++
++        async with lock:
++            cancelled = asyncio.create_task(pipeline.provider.generate(request))
++            await asyncio.sleep(0.02)
++            cancelled.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await cancelled
++            assert gate.snapshot()["physical"] == 1
++            assert calls == ["sent"]
++
++    asyncio.run(exercise())
++
++
+ def test_signed_hp_run_claim_is_one_shot_and_result_is_separate(
+         tmp_path, monkeypatch):
+     source, hp = _assets(tmp_path)
+--- V8/engine/fuzzingbrain/worker/strategies/pov_fullscan.py
++++ V81/engine/fuzzingbrain/worker/strategies/pov_fullscan.py
+@@ -1374,9 +1374,11 @@
+             for index in range(max((len(group) for group in groups), default=0))
+             for group in groups if index < len(group)
+         ]
+-        if self._full_nohint_sp:
+-            # Prefer sanitizer-relevant source surfaces across the entire
+-            # phase.  The interleaved position remains the stable tie breaker,
++        if (self._full_nohint_sp or
++                (self._development_sp_concurrent_queue and
++                 self._development_security_invariant_focus is not None)):
++            # Prefer the active signed source-risk score across the entire
++            # phase. The interleaved position remains the stable tie breaker,
+             # so equal scores retain Direction breadth and model order.
+             interleaved.sort(
+                 key=lambda item: -self._function_campaign_priority(item[0]))
+@@ -1471,6 +1473,8 @@
+                 for index in range(max((len(group) for group in groups), default=0))
+                 for group in groups if index < len(group)
+             ]
++            # This is the pre-priority candidate inventory. selected_order
++            # below, not occurrence_order, is the planned execution order.
+             for func, direction_id in rows:
+                 key, identity = self._function_receipt_identity(func)
+                 chosen = key in selected and key not in first_seen
+@@ -1499,6 +1503,8 @@
+             "run_id": getattr(self.executor, "development_run_id", None),
+             "direction_plan_sha256": plan[1],
+             "policy": "FIRST_CANONICAL_OCCURRENCE_ACROSS_PHASES_V1",
++            "occurrence_order_semantics": "PRE_PRIORITY_INTERLEAVED_CANDIDATE_ORDER_V1",
++            "selected_order_semantics": "ACTUAL_PHASE_EXECUTION_ORDER_V1",
+             "phase_order": phase_keys,
+             "candidate_occurrence_count": len(occurrences),
+             "selected_function_count": len(selected),

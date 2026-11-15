@@ -1,0 +1,15 @@
+{
+  "checked_project_module_origins": 4,
+  "checked_project_modules_from_extracted_tree": 4,
+  "external_project_imports_observed": null,
+  "focused_tests_failed": 0,
+  "focused_tests_passed": 159,
+  "focused_tests_skipped": 0,
+  "kind": "FBV2_V81_FRESH_EXTRACTION_CHECK_V1",
+  "manifest_files": 955,
+  "manifest_status": "PASS",
+  "scope": "review packet only; no model/Target/Fuzzer/Mongo/Live execution",
+  "source_pins_status": "PASS",
+  "v8_to_v81_patch_status": "PASS",
+  "zip_crc": "PASS"
+}

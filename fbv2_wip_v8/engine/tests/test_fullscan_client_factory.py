@@ -708,6 +708,45 @@ def test_full_nohint_prioritizes_function_risk_across_directions():
                 ("high", "D2"), ("low", "D1")]
 
 
+def test_concurrent_family_profile_prioritizes_across_directions_only_when_enabled(
+        tmp_path):
+    strategy, _ = make_strategy(RecordingFactory())
+    strategy._full_nohint_sp = False
+    strategy._development_security_invariant_focus = "LIFETIME_OWNERSHIP"
+    strategy.results_path = tmp_path
+    strategy._development_direction_plan = (
+        tmp_path / "DIRECTION_PLAN.json", "a" * 64)
+    low = SimpleNamespace(function_id="low", name="low",
+                          content="int low(void) { return 0; }")
+    high = SimpleNamespace(function_id="high", name="high",
+                           content="void high(char *p) { free(p); }")
+    pools = [
+        (SimpleNamespace(direction_id="D1"), {"small/new": [low]}),
+        (SimpleNamespace(direction_id="D2"), {"small/new": [high]}),
+    ]
+
+    strategy._development_sp_concurrent_queue = True
+    assert [(func.function_id, direction_id) for func, direction_id in
+            strategy._phase_work_for_directions(pools, "small/new")] == [
+                ("high", "D2"), ("low", "D1")]
+    phases = ["small/new"]
+    plan = strategy._unique_phase_work_plan(pools, phases)
+    strategy._write_sp_function_selection_receipt(pools, phases, plan)
+    receipt = json.loads((tmp_path / "SP_FUNCTION_SELECTION_RECEIPT.json").read_text())
+    assert [row["canonical_identity"]["value"] for row in
+            receipt["selected_functions"]] == ["high", "low"]
+    assert [row["selected_order"] for row in receipt["occurrences"]] == [1, 0]
+    assert receipt["occurrence_order_semantics"] == (
+        "PRE_PRIORITY_INTERLEAVED_CANDIDATE_ORDER_V1")
+    assert receipt["selected_order_semantics"] == (
+        "ACTUAL_PHASE_EXECUTION_ORDER_V1")
+
+    strategy._development_sp_concurrent_queue = False
+    assert [(func.function_id, direction_id) for func, direction_id in
+            strategy._phase_work_for_directions(pools, "small/new")] == [
+                ("low", "D1"), ("high", "D2")]
+
+
 def test_full_nohint_deduplicates_same_function_across_phases():
     strategy, _ = make_strategy(RecordingFactory())
     strategy._full_nohint_sp = True

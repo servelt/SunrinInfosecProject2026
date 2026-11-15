@@ -1374,9 +1374,11 @@ class POVFullscanStrategy(POVBaseStrategy):
             for index in range(max((len(group) for group in groups), default=0))
             for group in groups if index < len(group)
         ]
-        if self._full_nohint_sp:
-            # Prefer sanitizer-relevant source surfaces across the entire
-            # phase.  The interleaved position remains the stable tie breaker,
+        if (self._full_nohint_sp or
+                (self._development_sp_concurrent_queue and
+                 self._development_security_invariant_focus is not None)):
+            # Prefer the active signed source-risk score across the entire
+            # phase. The interleaved position remains the stable tie breaker,
             # so equal scores retain Direction breadth and model order.
             interleaved.sort(
                 key=lambda item: -self._function_campaign_priority(item[0]))
@@ -1471,6 +1473,8 @@ class POVFullscanStrategy(POVBaseStrategy):
                 for index in range(max((len(group) for group in groups), default=0))
                 for group in groups if index < len(group)
             ]
+            # This is the pre-priority candidate inventory. selected_order
+            # below, not occurrence_order, is the planned execution order.
             for func, direction_id in rows:
                 key, identity = self._function_receipt_identity(func)
                 chosen = key in selected and key not in first_seen
@@ -1499,6 +1503,8 @@ class POVFullscanStrategy(POVBaseStrategy):
             "run_id": getattr(self.executor, "development_run_id", None),
             "direction_plan_sha256": plan[1],
             "policy": "FIRST_CANONICAL_OCCURRENCE_ACROSS_PHASES_V1",
+            "occurrence_order_semantics": "PRE_PRIORITY_INTERLEAVED_CANDIDATE_ORDER_V1",
+            "selected_order_semantics": "ACTUAL_PHASE_EXECUTION_ORDER_V1",
             "phase_order": phase_keys,
             "candidate_occurrence_count": len(occurrences),
             "selected_function_count": len(selected),
