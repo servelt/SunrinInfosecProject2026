@@ -1,0 +1,20 @@
+; LightFTP 설정 템플릿. build.sh 가 @HERE@ 를 이 디렉터리의 절대 경로로 바꿔
+; run/fftp.conf 를 만든다. logfilepath 는 비워 둘 수 없다 -- main() 이 이 값을
+; 읽지 못하면 데몬이 아무 메시지 없이 그냥 종료한다.
+[ftpconfig]
+port=2121
+maxusers=4
+interface=127.0.0.1
+external_ip=127.0.0.1
+local_mask=255.255.255.0
+minport=42000
+maxport=42100
+logfilepath=@HERE@/run/fftp.log
+
+; pswd=* 는 아무 비밀번호나 통과시킨다. CVE-2017-1000218 자체는 인증이
+; 필요 없지만(ftp_client_thread 가 명령줄을 받는 즉시 로그로 넘긴다),
+; 시드 생성기가 로그인 뒤의 명령까지 시도할 수 있어야 문맥이 넓어진다.
+[anonymous]
+pswd=*
+accs=admin
+root=@HERE@/run/share

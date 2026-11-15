@@ -1,0 +1,15 @@
+# 실행 산출물
+runs/
+*.log
+
+# target-lightftp/build.sh 가 만드는 것들. 커밋하지 않는다 -- 플랫폼·컴파일러에
+# 따라 달라지고, build.sh 가 언제든 똑같이 다시 만든다.
+target-lightftp/cov/
+target-lightftp/trace/
+target-lightftp/analysis/
+target-lightftp/run/
+target-lightftp/source/*.o
+
+__pycache__/
+*.pyc
+.pytest_cache/
