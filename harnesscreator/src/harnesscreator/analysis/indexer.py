@@ -77,6 +77,8 @@ class StaticAnalyzer:
                 directory = Path(str(record.get("directory") or self.compile_database.parent))
                 source = Path(str(record["file"]))
                 source = (source if source.is_absolute() else directory / source).resolve()
+                from .fuzz_introspector import rebase_to_source
+                source = rebase_to_source(source, self.source_root) or source
                 if (source.is_file() and self.source_root in source.parents
                     and source.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".c++"}):
                     self.compile_database_files.add(

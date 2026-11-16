@@ -146,6 +146,14 @@ def prep_progress(lines: list[str], session: dict[str, Any]) -> tuple[float, str
     for marker, fraction, text in PREP_MARKS:
         if any(marker in l for l in lines):
             value, label = max(value, fraction), text
+    # Long silent steps (Fuzz Introspector on a large tree took 11+ minutes on redis) say what runs.
+    started = next((l for l in lines if "Fuzz Introspector automatic analysis started" in l), "")
+    if started and not any("Fuzz Introspector automatic analysis completed" in l or "Fuzz Introspector cache hit" in l
+                           or "automatic Fuzz Introspector analysis failed" in l for l in lines):
+        files = re.search(r"files=(\d+)", started)
+        waited = next((m for m in (re.search(r"no output for (\d+)s", l) for l in reversed(lines[-5:])) if m), None)
+        label = "정적 분석: Fuzz Introspector" + (f" · 파일 {files.group(1)}개" if files else "") + \
+                (f" · {int(waited.group(1)) // 60}분 경과" if waited else "")
     return value, label, False
 
 

@@ -182,6 +182,16 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
         entries = json.loads(Path(opt["--analysis-compile-database"]).read_text(encoding="utf-8"))
         if not entries:
             problems.append("compile_commands.json is empty")
+        else:
+            source = (work / "source").resolve()
+            def under_source(entry: dict) -> bool:
+                path = Path(str(entry.get("file", "")))
+                path = path if path.is_absolute() else Path(str(entry.get("directory", ""))) / path
+                return path.resolve() == source or source in path.resolve().parents or \
+                    any((source / Path(*path.parts[i:])).is_file() for i in range(1, len(path.parts)))
+            if not any(under_source(e) for e in entries[:400] if isinstance(e, dict)):
+                problems.append(f"compile_commands.json names no file of {source}: build it in {source} itself "
+                                "(or in a copy whose relative paths match), the analysis reads that tree")
     except (OSError, ValueError) as exc:
         problems.append(f"compile database unreadable: {exc}")
     channel = opt["--channel"]

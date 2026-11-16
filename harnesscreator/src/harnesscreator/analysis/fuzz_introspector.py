@@ -66,7 +66,10 @@ class FuzzIntrospectorRunner:
         # next to them) are analysed.  Without it every C/C++ file under the root was taken:
         # measured on redis 7.x, 504 files including deps/ (Lua, jemalloc, hiredis), tests and
         # modules, and FI ran past 11 minutes; the program itself is 139 files under src/.
-        self.compiled: set[Path] | None = _compiled_files(compile_database) if compile_database else None
+        self.compiled: set[Path] | None = None
+        if compile_database:
+            self.compiled = {p for p in (rebase_to_source(f, self.source_root)
+                                         for f in _compiled_files(compile_database)) if p is not None}
 
     def run(self) -> FuzzIntrospectorResult:
         version = self._installed_version()
@@ -303,3 +306,31 @@ def _compiled_files(compile_database: Path) -> set[Path]:
         except OSError:
             continue
     return files
+
+
+def rebase_to_source(path: Path, source_root: Path) -> Path | None:
+    """`path` itself when it lies under source_root; otherwise the file under source_root with the
+    longest matching tail of path components and identical content.
+
+    A build is often run in a copy of the tree (the redis profile builds its compile database in
+    WORK/analysis/src while the analysed source is WORK/source); its entries name the same files.
+    """
+    root = Path(source_root).resolve()
+    path = Path(path)
+    if root == path or root in path.parents:
+        return path
+    # Only a copy counts: the same tail of the path AND the same bytes.  A compile database of some
+    # other program that merely has a file of the same name must still be rejected.
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return None
+    parts = path.parts
+    for start in range(1, len(parts)):
+        candidate = root.joinpath(*parts[start:])
+        try:
+            if candidate.is_file() and candidate.read_bytes() == content:
+                return candidate.resolve()
+        except OSError:
+            continue
+    return None
