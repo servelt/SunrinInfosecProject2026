@@ -318,7 +318,7 @@ def ollama_env(cfg: Any, model: str) -> dict[str, str]:
     Besides the main model, Claude Code calls its own helper models (the haiku/sonnet/opus aliases,
     the small fast model); they are mapped to the same Ollama model so nothing reaches Anthropic."""
     return dict(os.environ, ANTHROPIC_BASE_URL=cfg.ollama_url.rstrip("/"), ANTHROPIC_AUTH_TOKEN="ollama",
-                ANTHROPIC_API_KEY="", ANTHROPIC_MODEL=model, ANTHROPIC_SMALL_FAST_MODEL=model,
+                ANTHROPIC_API_KEY="ollama", ANTHROPIC_MODEL=model, ANTHROPIC_SMALL_FAST_MODEL=model,
                 ANTHROPIC_DEFAULT_HAIKU_MODEL=model, ANTHROPIC_DEFAULT_SONNET_MODEL=model,
                 ANTHROPIC_DEFAULT_OPUS_MODEL=model, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
                 DISABLE_TELEMETRY="1", DISABLE_ERROR_REPORTING="1")
