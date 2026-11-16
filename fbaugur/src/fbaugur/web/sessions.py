@@ -233,10 +233,11 @@ class Sessions:
         return [dict(zip(("hash", "date", "msg"), line.split("\x1f"))) for line in out.stdout.splitlines() if line]
 
     # ------------------------------------------------------------------ start / stop
-    def start(self, repo: str, branch: str, mode: str, commit: str, hours: int) -> dict[str, Any]:
+    def start(self, repo: str, branch: str, mode: str, commit: str, hours: int, *, provider: str = "claude",
+              models: dict[str, str] | None = None) -> dict[str, Any]:
         repo_n = normalise_repo(repo)
         sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
-        session = {"id": sid, "repo": repo_n, "url": clone_url(repo), "branch": branch.strip(), "mode": "Delta" if mode == "delta" else "Full",
+        session = {"id": sid, "repo": repo_n, "url": clone_url(repo), "provider": provider, "models": dict(models or {}), "branch": branch.strip(), "mode": "Delta" if mode == "delta" else "Full",
                    "commit": commit, "hours": hours, "name": repo_n.split("/")[-1],
                    "rev": (commit if mode == "delta" else branch.strip() or "기본 브랜치"), "when": time.strftime("%m/%d %H:%M"),
                    "created": time.time(), "state": "preparing", "prep_progress": 0.02, "prep_label": "저장소 받기",
@@ -317,6 +318,10 @@ class Sessions:
             args += [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
             if session["mode"] == "Delta":
                 args += ["--diff", str(work / "delta.diff")]
+            args += ["--provider", session.get("provider") or "claude"]
+            for tier, model in sorted((session.get("models") or {}).items()):
+                if tier in ("1", "2", "3"):
+                    args += [f"--model-t{tier}", model]
             self.update(sid, prep_progress=0.52, prep_label="정적 분석 준비", state="starting")
             log = open(root / "pipeline.log", "a", encoding="utf-8")
             pipeline = subprocess.Popen(args, cwd=str(self.package_root.parent), stdout=log, stderr=subprocess.STDOUT,

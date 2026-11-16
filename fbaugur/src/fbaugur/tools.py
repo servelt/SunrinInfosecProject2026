@@ -181,13 +181,25 @@ def sp_duplicate_of(new_description: str, existing: list[dict[str, Any]], cfg: R
     """On any failure the SP is kept (FBv2: "assume not a duplicate")."""
     compare = existing[:SP_DEDUP_MAX_COMPARE]
     model, _ = cfg.model_for("sp_dedup")
+    prompt = _sp_dedup_prompt(new_description, compare)
     try:
-        proc = subprocess.run([cfg.claude_executable, "-p", "--model", model, "--output-format", "json",
-                               "--tools", "", "--disable-slash-commands", "--max-turns", "1",
-                               "--system-prompt", SP_DEDUP_SYSTEM],
-                              input=_sp_dedup_prompt(new_description, compare), capture_output=True,
-                              text=True, timeout=180)
-        text = json.loads(proc.stdout).get("result", "")
+        if cfg.provider == "codex":
+            with tempfile.TemporaryDirectory(prefix="fba-dedup-") as tmp:
+                out = Path(tmp) / "answer.txt"
+                subprocess.run([cfg.codex_executable, "exec", "--skip-git-repo-check", "-m", model, "-s", "read-only",
+                                "-C", tmp, "-o", str(out), "-"], input=SP_DEDUP_SYSTEM + "\n\n" + prompt,
+                               capture_output=True, text=True, timeout=300)
+                text = out.read_text(encoding="utf-8") if out.is_file() else ""
+        else:
+            env = None
+            if cfg.provider == "ollama":
+                env = dict(os.environ, ANTHROPIC_BASE_URL=cfg.ollama_url.rstrip("/"), ANTHROPIC_AUTH_TOKEN="ollama",
+                           ANTHROPIC_API_KEY="")
+            proc = subprocess.run([cfg.claude_executable, "-p", "--model", model, "--output-format", "json",
+                                   "--tools", "", "--disable-slash-commands", "--max-turns", "1",
+                                   "--system-prompt", SP_DEDUP_SYSTEM],
+                                  input=prompt, capture_output=True, text=True, timeout=180, env=env)
+            text = json.loads(proc.stdout).get("result", "")
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return parse_sp_dedup(text or "", compare)

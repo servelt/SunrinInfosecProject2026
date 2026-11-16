@@ -156,6 +156,14 @@ class AgentRunner:
 
     async def _spawn(self, run_id: str, role: str, model: str, effort: str, max_turns: int, system: str,
                      message: str, binding: dict[str, Any], tool_log: Path, log_dir: Path) -> AgentResult:
+        if self.cfg.provider == "codex":
+            return await self._spawn_codex(run_id, role, model, effort, system, message, binding, tool_log, log_dir)
+        # Ollama serves the Anthropic Messages API, so the same Claude Code agent loop (and the same
+        # MCP tools) runs on an Ollama model when Claude Code is pointed at it.
+        env = None
+        if self.cfg.provider == "ollama":
+            env = dict(os.environ, ANTHROPIC_BASE_URL=self.cfg.ollama_url.rstrip("/"),
+                       ANTHROPIC_AUTH_TOKEN="ollama", ANTHROPIC_API_KEY="")
         with tempfile.TemporaryDirectory(prefix="fbaugur-agent-") as tmp:
             workdir = Path(tmp)
             config = self._mcp_config(workdir, binding, run_id, tool_log)
@@ -168,7 +176,7 @@ class AgentRunner:
             try:
                 process = await asyncio.create_subprocess_exec(
                     *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, cwd=str(workdir), limit=64 * 1024 * 1024)
+                    stderr=asyncio.subprocess.PIPE, cwd=str(workdir), limit=64 * 1024 * 1024, env=env)
             except FileNotFoundError as exc:
                 raise TerminalLLMError(f"Claude Code executable not found: {self.cfg.claude_executable}") from exc
             transcript = log_dir / f"{run_id}.jsonl"
@@ -182,6 +190,46 @@ class AgentRunner:
                                    f"no answer within {self.cfg.agent_timeout_seconds:.0f}s")
             transcript.write_bytes(stdout)
             return self._parse(run_id, role, stdout.decode("utf-8", errors="replace"),
+                               stderr.decode("utf-8", errors="replace"), tool_log)
+
+    async def _spawn_codex(self, run_id: str, role: str, model: str, effort: str, system: str, message: str,
+                           binding: dict[str, Any], tool_log: Path, log_dir: Path) -> AgentResult:
+        """One agent run on Codex (`codex exec --json`), with the same MCP tool server.
+
+        codex exec has no system-prompt option and no turn limit: the role instructions go first
+        in the prompt and the run is bounded by the agent timeout.  Tool calls to our own server are
+        approved in advance (default_tools_approval_mode); the sandbox stays read-only.
+        """
+        with tempfile.TemporaryDirectory(prefix="fbaugur-agent-") as tmp:
+            workdir = Path(tmp)
+            server = json.loads(self._mcp_config(workdir, binding, run_id, tool_log).read_text())["mcpServers"]["fba"]
+            env_table = "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in server["env"].items()) + "}"
+            argv = [self.cfg.codex_executable, "exec", "--json", "--skip-git-repo-check", "-m", model,
+                    "-s", "read-only", "-C", str(workdir),
+                    "-c", f"model_reasoning_effort={json.dumps(effort)}",
+                    "-c", f"mcp_servers.fba.command={json.dumps(server['command'])}",
+                    "-c", f"mcp_servers.fba.args={json.dumps(server['args'])}",
+                    "-c", f"mcp_servers.fba.env={env_table}",
+                    "-c", 'mcp_servers.fba.default_tools_approval_mode="approve"',
+                    "-c", "mcp_servers.fba.tool_timeout_sec=900", "-"]
+            prompt = (f"<role_instructions>\n{system}{_SYSTEM_SUFFIX}\n</role_instructions>\n\n"
+                      "Work only through the fba tools.\n\n" + message)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, cwd=str(workdir), limit=64 * 1024 * 1024)
+            except FileNotFoundError as exc:
+                raise TerminalLLMError(f"Codex executable not found: {self.cfg.codex_executable}") from exc
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(prompt.encode("utf-8")), timeout=self.cfg.agent_timeout_seconds)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                return AgentResult(run_id, role, "timeout", "", 0, 0,
+                                   f"no answer within {self.cfg.agent_timeout_seconds:.0f}s")
+            (log_dir / f"{run_id}.jsonl").write_bytes(stdout)
+            return parse_codex(run_id, role, stdout.decode("utf-8", errors="replace"),
                                stderr.decode("utf-8", errors="replace"), tool_log)
 
     def _parse(self, run_id: str, role: str, stdout: str, stderr: str, tool_log: Path) -> AgentResult:
@@ -230,3 +278,35 @@ class AgentRunner:
         if tool_log.is_file():
             tool_calls = max(tool_calls, sum(1 for _ in tool_log.open(encoding="utf-8")))
         return AgentResult(run_id, role, status, text.strip(), turns, tool_calls, error, usage)
+
+
+def parse_codex(run_id: str, role: str, stdout: str, stderr: str, tool_log: Path) -> AgentResult:
+    """`codex exec --json` events: item.completed (agent_message, mcp_tool_call), turn.completed, errors."""
+    text, tool_calls, turns, usage, errors, finished = "", 0, 0, {}, [], False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        kind = event.get("type")
+        item = event.get("item") or {}
+        if kind == "item.completed" and item.get("type") == "agent_message":
+            text = item.get("text") or text
+        elif kind == "item.completed" and item.get("type") == "mcp_tool_call":
+            tool_calls += 1
+        elif kind == "turn.completed":
+            finished, turns = True, turns + 1
+            for key, value in (event.get("usage") or {}).items():
+                if isinstance(value, int):
+                    usage[key] = usage.get(key, 0) + value
+        elif kind in ("turn.failed", "error"):
+            errors.append(str(event.get("message") or (event.get("error") or {}).get("message") or event)[:500])
+    usage["calls"] = 1
+    if re.search(r"not logged in|401 Unauthorized|please log ?in|usage limit", stderr + " ".join(errors), re.I):
+        raise TerminalLLMError("Codex is not usable: " + (errors[-1] if errors else stderr.strip()[-300:]))
+    if tool_log.is_file():
+        tool_calls = max(tool_calls, sum(1 for _ in tool_log.open(encoding="utf-8")))
+    if finished:
+        return AgentResult(run_id, role, "completed", text.strip(), turns, tool_calls, "", usage)
+    return AgentResult(run_id, role, "error", text.strip(), turns, tool_calls,
+                       (errors[-1] if errors else stderr.strip()[-1500:] or "no turn.completed event"), usage)

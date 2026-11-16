@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from .config import DEFAULT_MAX_TURNS, RunConfig
+from .config import PROVIDER_MODELS, DEFAULT_MAX_TURNS, RunConfig
 from .store import Store
 
 def _harnesscreator_default() -> Path:
@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--no-msan", action="store_true",
                             help="do not add a MemorySanitizer fuzzing worker (default: add one per harness "
                                  "when a clang >= 18 is installed and the build starts)")
+        parser.add_argument("--provider", choices=["claude", "codex", "ollama"], default="claude",
+                            help="LLM back end for both stages (codex: codex exec; ollama: Claude Code on Ollama's "
+                                 "Anthropic-compatible API)")
+        parser.add_argument("--codex", default="codex", help="Codex CLI executable")
+        parser.add_argument("--ollama-url", default="http://localhost:11434")
         parser.add_argument("--model-t1", help="reasoning tier (threat model, directions, verification, triage)")
         parser.add_argument("--model-t2", help="main tier (seeds, PoV, invariants, reports)")
         parser.add_argument("--model-t3", help="fast tier (candidate generation)")
@@ -160,6 +165,8 @@ async def _scan(args: argparse.Namespace) -> int:
                         daemon_plain_command=args.daemon_plain_command or "",
                         daemon_cwd=args.daemon_cwd, daemon_port=args.daemon_port,
                         product_version=args.product_version)
+        cfg.provider, cfg.codex_executable, cfg.ollama_url = args.provider, args.codex, args.ollama_url
+        cfg.models = dict(PROVIDER_MODELS[args.provider])
         for tier, value in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)):
             if value:
                 cfg.models[tier] = value

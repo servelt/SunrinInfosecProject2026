@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import PROVIDER_MODELS
+
 _ARTIFACTS = re.compile(r"artifacts=(\S+)")
 
 
@@ -65,7 +67,7 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
     argv = [args.python, "-m", "harnesscreator.cli", "run", str(args.source.resolve()),
             "--name", args.name or args.source.resolve().name,
             "--output", str(run_root),
-            "--provider", "claude", "--workers", str(max(1, args.concurrency)),
+            "--provider", args.provider, "--workers", str(max(1, args.concurrency)),
             "--coverage-root", str(args.coverage_root.resolve()),
             "--coverage-command", args.coverage_command,
             "--port", str(args.port), "--host", args.host]
@@ -81,8 +83,17 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
         argv += ["--include-unresolved-entries"]
     argv += [] if args.require_fuzz_introspector else ["--allow-source-analysis"]
     argv += ["--svf"] if args.svf else ["--no-svf"]
-    if args.model_t3:                      # the Entry stage is the cheapest place to save
-        argv += ["--model", args.model_t3]
+    if args.provider == "claude":
+        if args.model_t3:                  # the Entry stage is the cheapest place to save
+            argv += ["--model", args.model_t3]
+    else:
+        # Tier mapping of HarnessCreator's roles: candidates = fast, verifiers = reasoning,
+        # harness generation = main coding model.
+        tiers = dict(PROVIDER_MODELS[args.provider])
+        tiers.update({k: v for k, v in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)) if v})
+        argv += ["--strong-model", tiers["1"], "--coding-model", tiers["2"], "--candidate-model", tiers["3"],
+                 "--model", tiers["3"]]
+        argv += ["--ollama-url", args.ollama_url] if args.provider == "ollama" else ["--codex", args.codex]
     return argv
 
 
@@ -206,7 +217,7 @@ def report_stage1(run_dir: Path, emit) -> list[tuple[str, str]]:
 
 
 async def run(args, emit) -> int:
-    from .config import RunConfig
+    from .config import PROVIDER_MODELS, RunConfig
     from .orchestrator import Run
 
     total = args.max_hours * 3600
@@ -276,6 +287,8 @@ async def run(args, emit) -> int:
             daemon_plain_command=args.daemon_plain_command or "",
             daemon_cwd=args.daemon_cwd, daemon_port=args.daemon_port, product_version=args.product_version,
             prior_scans=list(analysed))
+        cfg.provider, cfg.codex_executable, cfg.ollama_url = args.provider, args.codex, args.ollama_url
+        cfg.models = dict(PROVIDER_MODELS[args.provider])
         for tier, value in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)):
             if value:
                 cfg.models[tier] = value

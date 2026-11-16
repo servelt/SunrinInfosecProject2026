@@ -137,8 +137,12 @@ def _handler(sessions: Sessions):
                         return self._error(400, "저장소를 입력해")
                     if body.get("mode") == "delta" and not body.get("commit"):
                         return self._error(400, "Delta Scan 은 커밋을 골라야 해")
+                    provider = str(body.get("provider") or "claude")
+                    if provider not in ("claude", "codex", "ollama"):
+                        return self._error(400, "provider 는 claude, codex, ollama 중 하나")
+                    models = {str(k): str(v).strip() for k, v in (body.get("models") or {}).items() if str(v).strip()}
                     s = sessions.start(body["repo"], str(body.get("branch") or ""), body.get("mode", "full"),
-                                       body.get("commit", ""), int(hours))
+                                       body.get("commit", ""), int(hours), provider=provider, models=models)
                     return self._json({"id": s["id"]})
                 if url.path == "/api/update":
                     out = subprocess.run([str(APP_ROOT / "bin" / "occulta-update")], capture_output=True, text=True,

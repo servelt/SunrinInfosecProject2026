@@ -30,6 +30,8 @@ background-size:293px 293px,293px 293px,293px 293px,293px 293px,523px 523px,523p
 aside{width:236px;flex:none;min-height:100vh;padding:14px 10px;border-right:1px solid var(--line);background:rgba(10,10,12,.72);display:flex;flex-direction:column;gap:14px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow-y:auto}
 .brand{font-family:Sora,sans-serif;font-weight:600;font-size:12.5px;letter-spacing:.34em;text-shadow:0 0 16px rgba(255,255,255,.6)}
 .newscan{display:flex;align-items:center;gap:10px;min-height:34px;padding:0 10px;border:0;border-radius:8px;background:transparent;font-size:13px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid3 input{font-size:13px}
+.seg-s button{font-size:12.5px;padding:6px 14px}
 .ver{margin-top:auto;padding:10px 12px 4px;font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:6px}
 .ver button{align-self:flex-start;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:transparent;color:#fff;font-size:11.5px;padding:4px 12px;cursor:pointer;box-shadow:0 0 12px rgba(255,255,255,.18)}
 .srow{position:relative}.srow .del{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:28px;height:28px;border:0;border-radius:7px;background:transparent;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s,background .15s;cursor:pointer}
@@ -148,7 +150,7 @@ const VR = ['tm','dr','spg','spv','pov','inv','fz','ct','val','adv'];
 const COL = {done:'#6EF0A8',run:'#FFD66B',wait:'#6B6B72',fail:'#FF7A7A',prep:'#FFD66B',stop:'#9A9AA0',stopped:'#9A9AA0',failed:'#FF7A7A'};
 const PHASE = {prep:'준비 중',run:'진행 중',done:'완료',stopped:'중단',failed:'실패'};
 const S = {sidebar:false, view:'home', sid:null, sel:null, sessions:[], status:null, flowFor:null, doc:null,
-  form:{mode:'full', repo:'', branch:'', hours:'3', commit:'', commits:[], cmsg:''}};
+  form:{mode:'full', provider:'claude', models:null, repo:'', branch:'', hours:'3', commit:'', commits:[], cmsg:''}};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path, body) {
@@ -213,6 +215,12 @@ function renderHome() {
         <label class="f"><span>TIME LIMIT · HOURS</span><input id="hours" type="number" step="1" value="${esc(f.hours)}"><em id="hhint" class="hint" style="font-style:normal"></em></label>
       </div>
     </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">MODEL</span>
+      <div class="seg seg-s">${PROVIDERS.map(p => `<button data-p="${p.id}" class="${f.provider===p.id?'on':''}">${p.label}</button>`).join('')}</div>
+      <div class="grid3">${TIERS.map((t, i) => `<label class="f"><span>${t}</span><input data-t="${i+1}" value="${esc(tierModels()[i+1])}" autocomplete="off" spellcheck="false"></label>`).join('')}</div>
+      <em class="hint" style="font-style:normal">${esc((PROVIDERS.find(p => p.id === f.provider) || {}).note || '')}</em>
+    </div>
     ${delta ? `<div style="display:flex;flex-direction:column;gap:10px"><span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">COMMIT</span><div class="commits" id="commits"></div><span class="hint" id="cmsg"></span></div>` : ''}
     <span class="hint bad" id="serr" style="text-align:center"></span>
     <button class="start" id="start">스캔 시작</button>
@@ -223,8 +231,18 @@ function renderHome() {
   $('branch').oninput = (e) => { f.branch = e.target.value; clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
   $('hours').oninput = (e) => { f.hours = e.target.value; updateHomeBits(); };
   $('start').onclick = startScan;
+  for (const b of document.querySelectorAll('.seg-s button')) b.onclick = () => { f.provider = b.dataset.p; f.models = null; renderHome(); };
+  for (const inp of document.querySelectorAll('input[data-t]')) inp.oninput = (e) => { f.models = {...tierModels(), [e.target.dataset.t]: e.target.value}; };
   updateHomeBits(); if (delta) renderCommits();
 }
+// Defaults per back end (fbaugur/config.py PROVIDER_MODELS): reasoning / main / fast tiers.
+const PROVIDERS = [
+  {id:'claude', label:'Claude', models:{1:'claude-opus-5-5', 2:'claude-sonnet-5-5', 3:'claude-haiku-5-5'}, note:'Claude Code 로그인 계정으로 실행'},
+  {id:'codex', label:'Codex', models:{1:'gpt-6-sol', 2:'gpt-6-sol', 3:'gpt-6-luna'}, note:'codex exec (Codex CLI 로그인 필요)'},
+  {id:'ollama', label:'Ollama', models:{1:'glm-5.3:cloud', 2:'kimi-k2.7-code:cloud', 3:'glm-5.3-flash:cloud'}, note:'Ollama(localhost:11434)의 Anthropic 호환 API 로 Claude Code 실행'},
+];
+const TIERS = ['REASONING', 'MAIN', 'FAST'];
+function tierModels() { const f = S.form; return f.models || (PROVIDERS.find(p => p.id === f.provider) || PROVIDERS[0]).models; }
 function updateHomeBits() {
   const h = hoursState(), f = S.form;
   $('hhint').textContent = h.text; $('hhint').className = 'hint' + (h.ok ? '' : ' bad');
@@ -249,7 +267,7 @@ async function loadCommits() {
 }
 async function startScan() {
   const f = S.form; $('start').disabled = true; $('serr').textContent = '';
-  try { const d = await api('/api/scan', {repo:f.repo, branch:f.branch, mode:f.mode, commit:f.commit, hours:f.hours}); await loadSessions(); openSession(d.id); }
+  try { const d = await api('/api/scan', {repo:f.repo, branch:f.branch, mode:f.mode, commit:f.commit, hours:f.hours, provider:f.provider, models:tierModels()}); await loadSessions(); openSession(d.id); }
   catch (e) { $('serr').textContent = e.message; updateHomeBits(); }
 }
 

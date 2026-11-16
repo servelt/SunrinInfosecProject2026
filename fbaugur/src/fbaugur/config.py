@@ -36,6 +36,18 @@ DEFAULT_MAX_TURNS = {
 }
 
 
+# Models per tier for each LLM back end.  Claude: Opus / Sonnet / Haiku.  The others are the
+# closest counterparts available to this installation: a strong reasoning model, a main coding
+# model and a fast model (Codex: models_cache of codex-cli 0.167; Ollama: the cloud models
+# HarnessCreator already routes its roles to).
+PROVIDERS = ("claude", "codex", "ollama")
+PROVIDER_MODELS = {
+    "claude": {"1": "claude-opus-5-5", "2": "claude-sonnet-5-5", "3": "claude-haiku-5-5"},
+    "codex": {"1": "gpt-6-sol", "2": "gpt-6-sol", "3": "gpt-6-luna"},
+    "ollama": {"1": "glm-5.3:cloud", "2": "kimi-k2.7-code:cloud", "3": "glm-5.3-flash:cloud"},
+}
+
+
 @dataclasses.dataclass
 class RunConfig:
     run_dir: str
@@ -48,6 +60,9 @@ class RunConfig:
     efforts: dict[str, str] = dataclasses.field(default_factory=lambda: {
         "1": "high", "2": "medium", "3": "medium"})
     claude_executable: str = "claude"
+    provider: str = "claude"            # claude | codex | ollama
+    codex_executable: str = "codex"
+    ollama_url: str = "http://localhost:11434"
     python: str = ""
     max_hours: float = 4.0
     fuzz_after_drain_minutes: float = 0.0   # 0 = fuzz until max_hours runs out
