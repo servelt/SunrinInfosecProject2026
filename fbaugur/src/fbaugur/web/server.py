@@ -39,7 +39,7 @@ _version_cache: dict = {}
 
 
 def version_info() -> dict:
-    """Installed release and the newest release tag on GitHub (checked at most once an hour)."""
+    """Installed release and the newest release tag on GitHub (checked at most once a minute)."""
     def git(*args: str, timeout: int = 20) -> str:
         out = subprocess.run(["git", "-C", str(APP_ROOT), *args], capture_output=True, text=True, timeout=timeout)
         return out.stdout.strip() if out.returncode == 0 else ""
@@ -48,7 +48,9 @@ def version_info() -> dict:
     except OSError:
         version = "dev"
     current = git("describe", "--tags", "--always") or version
-    if time.time() - _version_cache.get("at", 0) > 3600:
+    # Checked again at most once a minute: every page load asks, and the page asks again every
+    # few minutes, so a new release shows up without restarting the server.
+    if time.time() - _version_cache.get("at", 0) > 60:
         latest = ""
         try:
             branch = git("config", "occulta.branch") or "main"

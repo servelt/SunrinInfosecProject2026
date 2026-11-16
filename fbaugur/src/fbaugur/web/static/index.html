@@ -194,6 +194,7 @@ async function loadVersion() {
   } catch (e) {}
 }
 loadVersion();
+setInterval(loadVersion, 5 * 60 * 1000);
 async function deleteSession(id) {
   const s = S.sessions.find(x => x.id === id) || {};
   const live = s.phase === 'run' || s.phase === 'prep';
