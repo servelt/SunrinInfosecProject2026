@@ -258,10 +258,11 @@ class AutoPrep:
                                    stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
         process.stdin.write(prompt)
         process.stdin.close()
-        final, started = "", time.time()
+        final, started, self.agent_error, tail = "", time.time(), "", []
         with self.log.open("a", encoding="utf-8") as log:
             for line in process.stdout:
                 log.write(line)
+                tail = (tail + [line.strip()])[-20:]
                 if time.time() - started > self.agent_timeout:
                     os.killpg(process.pid, signal.SIGKILL)
                     break
@@ -271,7 +272,16 @@ class AutoPrep:
                     continue
                 self.session_id = (event.get("session_id") or event.get("thread_id") or self.session_id)
                 final = self._watch(event) or final
-        process.wait()
+                if event.get("type") == "result" and event.get("is_error"):
+                    self.agent_error = str(event.get("result") or event.get("subtype") or "agent error")
+                if event.get("type") in ("error", "turn.failed"):
+                    self.agent_error = str(event.get("message") or (event.get("error") or {}).get("message") or event)
+        code = process.wait()
+        if not final and not self.agent_error:
+            # No answer at all: the agent did not run (not logged in, model unknown, CLI missing ...).
+            plain = [t for t in tail if t and not t.startswith("{")]
+            self.agent_error = (" | ".join(plain[-3:]) or (tail[-1] if tail else "")
+                                or f"the agent exited with status {code} and wrote nothing")
         return final
 
     def _watch(self, event: dict[str, Any]) -> str:
@@ -295,8 +305,14 @@ class AutoPrep:
         prompt, summary, problems = self.task(), "", ["not started"]
         for number in range(1, self.rounds + 1):
             self.emit(f"[autoprep] agent round {number}: {self.provider}/{self.model}")
-            summary = self._agent(prompt)
+            try:
+                summary = self._agent(prompt)
+            except FileNotFoundError as exc:
+                return False, [f"준비 에이전트를 실행할 수 없음 ({exc.filename} 없음)"], ""
             self.emit("[autoprep] agent: " + summary.strip().replace("\n", " ")[:600])
+            if self.agent_error and not (self.work / "profile" / "profile.json").is_file():
+                # Retrying cannot help an agent that does not start; say why instead.
+                return False, [f"준비 에이전트 실행 실패 ({self.provider}): {self.agent_error[:400]}"], summary
             self.progress("결과 확인 (prepare.sh 다시 실행)")
             problems = check_profile(self.work, self.env, emit=self.progress)
             if not problems:
