@@ -3,13 +3,14 @@
 #
 #   gh auth login                       # once: the repository is private
 #   curl -fsSL -H "Authorization: token $(gh auth token)" \
-#     https://raw.githubusercontent.com/${OCCULTA_REPO:-servelt/occulta}/main/install.sh | bash
+#     https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/occulta/install.sh | bash
 #
 # Installs into ~/.occulta (app/ = git checkout, venv/ = Python packages) and puts the
 # `occulta` command in ~/.local/bin.  Run it again to repair an installation.
 set -euo pipefail
 
-REPO="${OCCULTA_REPO:-servelt/occulta}"
+REPO="${OCCULTA_REPO:-servelt/SunrinInfosecProject2026}"
+BRANCH="${OCCULTA_BRANCH:-occulta}"          # the repository holds other work; Occulta lives on this branch
 ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
 APP="$ROOT/app"
 VENV="$ROOT/venv"
@@ -57,8 +58,10 @@ if [ -d "$APP/.git" ]; then
   say "기존 설치 발견: $APP (업데이트는 'occulta update')"
 else
   say "소스 받기: $REPO"
-  git clone --quiet "https://github.com/$REPO.git" "$APP"
-  latest=$(git -C "$APP" tag --list 'v*' --sort=-v:refname | head -1)
+  git clone --quiet --branch "$BRANCH" --single-branch "https://github.com/$REPO.git" "$APP"
+  git -C "$APP" config occulta.branch "$BRANCH"
+  git -C "$APP" fetch --quiet --tags origin
+  latest=$(git -C "$APP" tag --list 'v*' --merged "origin/$BRANCH" --sort=-v:refname | head -1)
   [ -n "$latest" ] && git -C "$APP" checkout --quiet "$latest"
 fi
 

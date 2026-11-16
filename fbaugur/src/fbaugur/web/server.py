@@ -51,7 +51,9 @@ def version_info() -> dict:
     if time.time() - _version_cache.get("at", 0) > 3600:
         latest = ""
         try:
-            tags = [line.rsplit("/", 1)[-1] for line in git("ls-remote", "--tags", "--refs", "origin", "v*").splitlines()]
+            branch = git("config", "occulta.branch") or "occulta"
+            git("fetch", "--quiet", "--tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=60)
+            tags = git("tag", "--list", "v*", "--merged", f"origin/{branch}").split()
             def key(tag: str):
                 return tuple(int(p) if p.isdigit() else 0 for p in tag.lstrip("v").split("."))
             latest = max(tags, key=key) if tags else ""

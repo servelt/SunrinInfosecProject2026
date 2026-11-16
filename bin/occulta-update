@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Move the installation to the newest release tag (v*), or to the newest main commit with --main.
+# Move the installation to the newest release tag (v*) on Occulta's branch, or to its newest commit with --main.
 set -euo pipefail
 APP="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
@@ -15,9 +15,11 @@ for s in "$ROOT"/sessions/*/session.json; do
   fi
 done
 
-git -C "$APP" fetch --quiet --tags origin
-if [ "${1:-}" = "--main" ]; then target="origin/main"
-else target=$(git -C "$APP" tag --list 'v*' --sort=-v:refname | head -1); [ -n "$target" ] || target="origin/main"; fi
+BRANCH=$(git -C "$APP" config occulta.branch || echo occulta)
+git -C "$APP" fetch --quiet --tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+# Only release tags on Occulta's branch count: the repository also holds unrelated work.
+if [ "${1:-}" = "--main" ]; then target="origin/$BRANCH"
+else target=$(git -C "$APP" tag --list 'v*' --merged "origin/$BRANCH" --sort=-v:refname | head -1); [ -n "$target" ] || target="origin/$BRANCH"; fi
 old=$(git -C "$APP" rev-parse HEAD); new=$(git -C "$APP" rev-parse "$target^{commit}")
 if [ "$old" = "$new" ]; then echo "[occulta] 이미 최신이야 ($target)"; exit 0; fi
 deps_changed=$(git -C "$APP" diff --name-only "$old" "$new" -- harnesscreator/pyproject.toml fbaugur/pyproject.toml)
