@@ -735,6 +735,7 @@ def _analyze(args: argparse.Namespace) -> int:
         progress=lambda message: print(
             f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True
         ),
+        compile_database=compile_database,
     )
     bundle = StaticAnalyzer(
         source,
@@ -1076,6 +1077,7 @@ async def _run(args: argparse.Namespace) -> int:
         progress=lambda message: print(
             f"[{time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True
         ),
+        compile_database=project.analysis_compile_database,
     )
     project = dataclasses.replace(project, fuzz_introspector=report)
     # Do this before starting app-server processes. A strict run with no FI
@@ -1647,6 +1649,7 @@ def _prepare_fuzz_introspector(
     require: bool,
     excluded_paths: tuple[Path, ...] | list[Path],
     progress,
+    compile_database: Path | None = None,
 ) -> Path | None:
     if explicit_report is not None:
         report = explicit_report.expanduser().resolve()
@@ -1658,6 +1661,7 @@ def _prepare_fuzz_introspector(
             cache_root,
             excluded_paths=excluded_paths,
             progress=progress,
+            compile_database=compile_database,
         ).run()
         return result.report
     except FuzzIntrospectorError as exc:
