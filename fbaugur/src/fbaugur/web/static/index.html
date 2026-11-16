@@ -57,6 +57,7 @@ label.f span{font-size:11px;letter-spacing:.18em;color:var(--dim)}
 label.f input{background:transparent;border:0;border-bottom:1px solid rgba(255,255,255,.22);padding:6px 0 9px;color:#fff;font-size:16px;font-weight:300;font-family:Sora,sans-serif;border-radius:0}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(200px,100%),1fr));gap:18px 24px}
 .hint{font-size:12.5px;color:var(--dim)}.hint.bad{color:var(--pink)}
+.cq{width:100%;box-sizing:border-box;background:transparent;border:1px solid rgba(255,255,255,.15);border-radius:8px;color:inherit;padding:8px 10px;font:inherit;font-size:13px}
 .commits{max-height:260px;overflow-y:auto;border-top:1px solid rgba(255,255,255,.1)}
 .commit{display:flex;align-items:center;gap:12px;width:100%;min-height:30px;padding:0 6px;border:0;border-bottom:1px solid rgba(255,255,255,.07);background:transparent;font-size:12.5px;color:var(--dim);text-align:left}
 .commit.on{color:#fff}.commit .h{font-family:'JetBrains Mono',monospace;font-size:12px;width:58px;flex:none}
@@ -155,7 +156,7 @@ const VR = ['tm','dr','spg','spv','pov','inv','fz','ct','val','adv'];
 const COL = {done:'#6EF0A8',run:'#FFD66B',wait:'#6B6B72',fail:'#FF7A7A',prep:'#FFD66B',stop:'#9A9AA0',stopped:'#9A9AA0',failed:'#FF7A7A'};
 const PHASE = {prep:'준비 중',run:'진행 중',done:'완료',stopped:'중단',failed:'실패'};
 const S = {sidebar:false, view:'home', sid:null, sel:null, sessions:[], status:null, flowFor:null, doc:null,
-  form:{mode:'full', provider:'claude', models:null, repo:'', branch:'', hours:'3', commit:'', commits:[], cmsg:''}};
+  form:{mode:'full', provider:'claude', models:null, repo:'', branch:'', hours:'3', commit:'', commits:[], cmsg:'', cq:''}};
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path, body) {
@@ -229,7 +230,7 @@ function renderHome() {
       <span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">LLM</span>
       <div class="seg seg-s">${PROVIDERS.map(p => `<button data-p="${p.id}" class="${f.provider===p.id?'on':''}">${p.label}</button>`).join('')}</div>
     </div>
-    ${delta ? `<div style="display:flex;flex-direction:column;gap:10px"><span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">COMMIT</span><div class="commits" id="commits"></div><span class="hint" id="cmsg"></span></div>` : ''}
+    ${delta ? `<div style="display:flex;flex-direction:column;gap:10px"><span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">COMMIT</span><input id="cq" class="cq" placeholder="예전 커밋 검색: 해시 또는 메시지" value="${esc(f.cq)}"><div class="commits" id="commits"></div><span class="hint" id="cmsg"></span></div>` : ''}
     <span class="hint bad" id="serr" style="text-align:center"></span>
     <button class="start" id="start">스캔 시작</button>
   </div>`;
@@ -237,6 +238,7 @@ function renderHome() {
   $('mdelta').onclick = () => { f.mode = 'delta'; renderHome(); loadCommits(); };
   $('repo').oninput = (e) => { f.repo = e.target.value; f.commits = []; updateHomeBits(); clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
   $('branch').oninput = (e) => { f.branch = e.target.value; clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
+  if ($('cq')) $('cq').oninput = (e) => { f.cq = e.target.value; clearTimeout(S.ct); S.ct = setTimeout(loadCommits, 400); };
   $('hours').oninput = (e) => { f.hours = e.target.value; updateHomeBits(); };
   $('start').onclick = startScan;
   for (const b of document.querySelectorAll('.seg-s button')) b.onclick = () => { f.provider = b.dataset.p; f.models = null; renderHome(); };
@@ -266,9 +268,13 @@ function renderCommits() {
 async function loadCommits() {
   const f = S.form; if (f.mode !== 'delta') return;
   if (!f.repo.trim()) { f.commits = []; f.cmsg = '저장소 링크를 넣으면 커밋 목록이 나와'; renderCommits(); return; }
-  f.cmsg = '커밋 목록 불러오는 중…'; renderCommits();
-  try { const d = await api(`/api/commits?repo=${encodeURIComponent(f.repo)}&branch=${encodeURIComponent(f.branch)}`); f.commits = d.commits; f.cmsg = d.commits.length ? '' : '커밋 없음';
-    if (!d.commits.some(c => c.hash === f.commit)) f.commit = ''; }
+  const q = f.cq.trim();
+  f.cmsg = q ? '검색 중…' : '커밋 목록 불러오는 중…'; renderCommits();
+  try { const d = await api(`/api/commits?repo=${encodeURIComponent(f.repo)}&branch=${encodeURIComponent(f.branch)}&q=${encodeURIComponent(q)}`);
+    if (q !== f.cq.trim()) return;      // a newer search is on its way
+    const kept = f.commits.find(c => c.hash === f.commit);
+    f.commits = d.commits; f.cmsg = d.commits.length ? (q ? `검색 결과 ${d.commits.length}개` : '최근 커밋 · 예전 건 위에서 검색') : (q ? '검색 결과 없음' : '커밋 없음');
+    if (kept && !f.commits.some(c => c.hash === kept.hash)) f.commits.unshift(kept); }
   catch (e) { f.commits = []; f.cmsg = '불러오지 못함: ' + e.message; }
   renderCommits();
 }

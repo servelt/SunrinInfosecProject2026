@@ -7,7 +7,7 @@ Serves one page (static/index.html) and a small JSON API:
     GET  /api/sessions/<id>             one session's phase, prep bar, agent statuses and details
     POST /api/scan                      {repo, branch, mode, commit, hours} -> a new session
     POST /api/sessions/<id>/stop
-    GET  /api/commits?repo=&branch=     commits for the Delta picker
+    GET  /api/commits?repo=&branch=&q=  commits for the Delta picker (q: hash or message search)
     GET  /api/file?session=<id>&path=   an advisory or report inside that session's pipeline directory
 Standard library only.  Binds to 127.0.0.1.
 """
@@ -115,7 +115,7 @@ def _handler(sessions: Sessions):
                         return self._error(404, "no such session")
                     return self._json(session_status(session))
                 if url.path == "/api/commits":
-                    return self._json({"commits": sessions.commits(q.get("repo", ""), q.get("branch", ""))})
+                    return self._json({"commits": sessions.commits(q.get("repo", ""), q.get("branch", ""), query=q.get("q", ""))})
                 if url.path == "/api/file":
                     session = sessions.load(q.get("session", "")) or {}
                     root = Path(session.get("pipeline_dir") or "/nonexistent").resolve()

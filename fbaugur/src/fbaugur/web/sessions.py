@@ -220,8 +220,12 @@ class Sessions:
         return [json.loads(p.read_text())["repos"][0] for p in sorted(self.targets.glob("*/profile.json"))]
 
     # ------------------------------------------------------------------ git
-    def commits(self, repo: str, branch: str, limit: int = 40) -> list[dict[str, str]]:
-        """Commits of a branch, newest first, from a blob-less mirror kept under OCCULTA_HOME."""
+    def commits(self, repo: str, branch: str, limit: int = 40, query: str = "") -> list[dict[str, str]]:
+        """Commits of a branch, newest first, from a blob-less mirror kept under OCCULTA_HOME.
+
+        Without `query` the newest `limit`.  With one, older history is searched instead: a hash
+        (prefix) of any commit, or words in the message (case-insensitive), newest first.
+        """
         key = re.sub(r"[^A-Za-z0-9._-]", "_", normalise_repo(repo))
         mirror = self.home / "mirrors" / key
         url = clone_url(repo)
@@ -229,15 +233,34 @@ class Sessions:
             mirror.parent.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "clone", "--bare", "--filter=blob:none", url, str(mirror)], check=True,
                            capture_output=True, timeout=300)
-        else:
+        elif not query:      # a search reuses the mirror the list just fetched, so typing stays fast
             subprocess.run(["git", "-C", str(mirror), "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*",
                             "+refs/tags/*:refs/tags/*"], capture_output=True, timeout=300)
         ref = branch or "HEAD"
-        out = subprocess.run(["git", "-C", str(mirror), "log", f"--max-count={limit}", "--format=%h%x1f%ad%x1f%s",
-                              "--date=short", ref], capture_output=True, text=True, timeout=60)
+        fmt = ["--format=%h%x1f%ad%x1f%s", "--date=short"]
+        rows: list[str] = []
+        query = query.strip()
+        if query and re.fullmatch(r"[0-9a-fA-F]{4,40}", query):
+            found = subprocess.run(["git", "-C", str(mirror), "log", "-1", *fmt, query, "--"],
+                                   capture_output=True, text=True, timeout=60)
+            if found.returncode == 0:
+                rows += found.stdout.splitlines()
+        if query:
+            out = subprocess.run(["git", "-C", str(mirror), "log", f"--max-count={limit}", *fmt, "-i",
+                                  "--fixed-strings", f"--grep={query}", ref],
+                                 capture_output=True, text=True, timeout=120)
+        else:
+            out = subprocess.run(["git", "-C", str(mirror), "log", f"--max-count={limit}", *fmt, ref],
+                                 capture_output=True, text=True, timeout=60)
         if out.returncode != 0:
             raise ValueError(out.stderr.strip()[-300:] or f"no such branch or tag: {ref}")
-        return [dict(zip(("hash", "date", "msg"), line.split("\x1f"))) for line in out.stdout.splitlines() if line]
+        rows += out.stdout.splitlines()
+        seen, result = set(), []
+        for line in rows:
+            if line and line.split("\x1f")[0] not in seen:
+                seen.add(line.split("\x1f")[0])
+                result.append(dict(zip(("hash", "date", "msg"), line.split("\x1f"))))
+        return result
 
     # ------------------------------------------------------------------ start / stop
     def start(self, repo: str, branch: str, mode: str, commit: str, hours: int, *, provider: str = "claude",
