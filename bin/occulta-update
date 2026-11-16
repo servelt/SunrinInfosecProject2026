@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Move the installation to the newest release tag (v*), or to the newest main commit with --main.
+set -euo pipefail
+APP="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
+VENV="$ROOT/venv"
+[ -d "$APP/.git" ] || { echo "[occulta] $APP 는 git 설치가 아니라 업데이트할 수 없어"; exit 1; }
+
+# A scan in progress keeps running the code it started with; changing the files under it is refused.
+for s in "$ROOT"/sessions/*/session.json; do
+  [ -f "$s" ] || continue
+  pid=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('pid') or '') if d.get('state') in ('running','starting','preparing') else print('')" "$s")
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "[occulta] 진행 중인 스캔이 있어 ($(basename "$(dirname "$s")")). 끝나거나 멈춘 뒤에 업데이트해."; exit 2
+  fi
+done
+
+git -C "$APP" fetch --quiet --tags origin
+if [ "${1:-}" = "--main" ]; then target="origin/main"
+else target=$(git -C "$APP" tag --list 'v*' --sort=-v:refname | head -1); [ -n "$target" ] || target="origin/main"; fi
+old=$(git -C "$APP" rev-parse HEAD); new=$(git -C "$APP" rev-parse "$target^{commit}")
+if [ "$old" = "$new" ]; then echo "[occulta] 이미 최신이야 ($target)"; exit 0; fi
+deps_changed=$(git -C "$APP" diff --name-only "$old" "$new" -- harnesscreator/pyproject.toml fbaugur/pyproject.toml)
+git -C "$APP" checkout --quiet "$new"
+if [ -n "$deps_changed" ] && [ -x "$VENV/bin/pip" ]; then
+  echo "[occulta] 의존성이 바뀌어서 다시 설치"
+  "$VENV/bin/pip" install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"
+fi
+echo "[occulta] $(git -C "$APP" describe --tags --always "$old") -> $(git -C "$APP" describe --tags --always "$new")"
+git -C "$APP" log --oneline "$old..$new" | head -20

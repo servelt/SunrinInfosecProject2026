@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Checks what a scan needs, by running it where possible.
+APP="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
+PY="${OCCULTA_PYTHON:-$ROOT/venv/bin/python}"; [ -x "$PY" ] || PY="$(command -v python3)"
+export PYTHONPATH="$APP/fbaugur/src:$APP/harnesscreator/src${PYTHONPATH:+:$PYTHONPATH}"
+bad=0
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+no()   { printf '  \033[31m✗\033[0m %s\n' "$*"; bad=$((bad+1)); }
+check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else no "$1 -- $3"; fi; }
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+printf 'int main(int c,char**v){int x[4];return c>1?x[c]:0;}\n' > "$tmp/t.c"
+printf '#include <stdint.h>\n#include <stddef.h>\nint LLVMFuzzerTestOneInput(const uint8_t*d,size_t n){return 0;}\n' > "$tmp/f.c"
+MSAN_CC=$(for v in 30 29 28 27 26 25 24 23 22 21 20 19 18; do command -v clang-$v && break; done)
+
+echo "occulta doctor"
+check "WSL"                         "grep -qi microsoft /proc/version"          "WSL 에서만 지원"
+check "python 패키지 (venv)"        "$PY -c 'import harnesscreator, fbaugur'"  "install.sh 를 다시 실행"
+check "clang + libFuzzer"           "clang -fsanitize=fuzzer $tmp/f.c -o $tmp/f" "clang 설치 확인"
+check "clang AddressSanitizer"      "clang -fsanitize=address -no-pie $tmp/t.c -o $tmp/a && $tmp/a" "clang 설치 확인"
+check "MemorySanitizer (clang>=18)" "[ -n '$MSAN_CC' ] && $MSAN_CC -fsanitize=memory $tmp/t.c -o $tmp/m && $tmp/m" "LLVM 20 설치: OCCULTA_LLVM=20 install.sh"
+check "gcc --coverage"              "gcc --coverage $tmp/t.c -o $tmp/g"        "build-essential 설치"
+check "bear (compile DB)"           "command -v bear"                           "apt install bear"
+check "네트워크 격리 (unshare)"     "unshare \$( [ \$(id -u) -eq 0 ] && echo -n || echo -rn ) true" "WSL 커널의 user namespace 설정 확인"
+check "glibc malloc debug 라이브러리" "ls /usr/lib/*/libc_malloc_debug.so.0"   "glibc 2.34 이상 필요 (일반 빌드 측정에만 씀)"
+check "GitHub 로그인 (gh)"          "gh auth status"                            "gh auth login"
+check "Claude Code"                 "command -v claude"                         "npm install -g @anthropic-ai/claude-code 후 claude 로그인"
+echo
+[ $bad -eq 0 ] && echo "모두 정상" || echo "$bad 개 항목을 고쳐야 해"
+exit $bad

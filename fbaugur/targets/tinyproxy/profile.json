@@ -1,0 +1,19 @@
+{
+  "name": "tinyproxy",
+  "repos": ["github.com/tinyproxy/tinyproxy"],
+  "prepare": "prepare.sh",
+  "pipeline_args": [
+    "--coverage-root", "{WORK}/cov",
+    "--coverage-command", "{WORK}/cov/tinyproxy -d -c {WORK}/run/tinyproxy.conf",
+    "--coverage-cwd", "{WORK}/cov",
+    "--thread-trace-command", "{WORK}/trace/tinyproxy -d -c {WORK}/run/tinyproxy.conf",
+    "--analysis-compile-database", "{WORK}/analysis/compile_commands.json",
+    "--port", "8888", "--channel", "tcp",
+    "--daemon-command", "{WORK}/daemon-asan/tinyproxy -d -c {WORK}/run/tinyproxy.conf",
+    "--daemon-msan-command", "{WORK}/daemon-msan/tinyproxy -d -c {WORK}/run/tinyproxy.conf",
+    "--daemon-plain-command", "{WORK}/daemon-plain/tinyproxy -d -c {WORK}/run/tinyproxy.conf",
+    "--daemon-cwd", "{WORK}",
+    "--harness-max-minutes", "55"
+  ],
+  "port": 8888
+}

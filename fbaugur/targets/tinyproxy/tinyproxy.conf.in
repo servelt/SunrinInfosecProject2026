@@ -1,0 +1,13 @@
+# tinyproxy 1.11.1 설정 — 배포판 기본값(etc/tinyproxy.conf.in)에서 User/Group 만 뺐다.
+# root 로 실행하면 User/Group 이 있을 때 nobody 로 내려가는데, 분석 환경에서는 로그 경로 권한 문제만 만든다.
+Port 8888
+Listen 127.0.0.1
+Timeout 600
+DefaultErrorFile "@HERE@/source/data/templates/default.html"
+StatFile "@HERE@/source/data/templates/stats.html"
+LogFile "@HERE@/run/tinyproxy.log"
+LogLevel Info
+MaxClients 100
+Allow 127.0.0.1
+Allow ::1
+ViaProxyName "tinyproxy"

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# occulta            open the web console (http://localhost:7860)
+# occulta update     move to the newest release from GitHub
+# occulta doctor     check every tool the scans need
+# occulta version
+set -euo pipefail
+APP="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
+PY="${OCCULTA_PYTHON:-$ROOT/venv/bin/python}"
+[ -x "$PY" ] || PY="$(command -v python3)"
+
+case "${1:-}" in
+  update)  shift; exec "$APP/bin/occulta-update" "$@" ;;
+  doctor)  shift; exec "$APP/bin/occulta-doctor" "$@" ;;
+  version|--version)
+    echo "occulta $(cat "$APP/VERSION") ($(git -C "$APP" describe --tags --always --dirty 2>/dev/null || echo 'no git'))"
+    exit 0 ;;
+  -h|--help|help)
+    sed -n '2,5p' "$0" | sed 's/^# //'; exit 0 ;;
+esac
+export PYTHONPATH="$APP/fbaugur/src:$APP/harnesscreator/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m fbaugur.web --python "$PY" "$@"
