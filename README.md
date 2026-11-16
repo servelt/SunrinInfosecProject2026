@@ -44,9 +44,9 @@ occulta version
 ## 배포 (관리자)
 
 ```bash
-echo 0.2.0 > VERSION && git commit -am "release 0.2.0"
-git tag v0.2.0 && git push origin main v0.2.0
+bash release.sh          # 다음 패치 버전 (0.1.5 -> 0.1.6), 또는 bash release.sh 0.2.0
 ```
+VERSION 커밋, 태그, main 과 태그를 함께 push(--atomic), GitHub 에 태그가 실제로 있는지 확인까지 한다.
 
 설치된 쪽은 `main` 브랜치에 있는 `v*` 태그만 따라간다. 태그를 찍기 전의 커밋은 배포되지 않는다.
 
