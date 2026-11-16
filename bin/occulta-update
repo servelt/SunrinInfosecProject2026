@@ -23,6 +23,13 @@ else target=$(git -C "$APP" tag --list 'v*' --merged "origin/$BRANCH" --sort=-v:
 old=$(git -C "$APP" rev-parse HEAD); new=$(git -C "$APP" rev-parse "$target^{commit}")
 if [ "$old" = "$new" ]; then echo "[occulta] 이미 최신이야 ($target)"; exit 0; fi
 deps_changed=$(git -C "$APP" diff --name-only "$old" "$new" -- harnesscreator/pyproject.toml fbaugur/pyproject.toml)
+# The install directory is managed by this script; anything changed in it (an edit, or only a
+# file-mode / line-ending difference) is kept aside in a stash instead of blocking the update.
+git -C "$APP" config core.fileMode false
+if [ -n "$(git -C "$APP" status --porcelain)" ]; then
+  git -C "$APP" stash push --include-untracked --quiet -m "occulta-update $(date +%F-%H%M%S)"
+  echo "[occulta] 설치 폴더의 로컬 변경을 보관함: git -C $APP stash list"
+fi
 git -C "$APP" checkout --quiet "$new"
 if [ -n "$deps_changed" ] && [ -x "$VENV/bin/python" ]; then
   echo "[occulta] 의존성이 바뀌어서 다시 설치"

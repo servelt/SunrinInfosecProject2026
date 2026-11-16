@@ -62,6 +62,7 @@ else
   say "소스 받기: $REPO"
   git clone --quiet --branch "$BRANCH" --single-branch "https://github.com/$REPO.git" "$APP"
   git -C "$APP" config occulta.branch "$BRANCH"
+  git -C "$APP" config core.fileMode false
   git -C "$APP" fetch --quiet --tags origin
   latest=$(git -C "$APP" tag --list 'v*' --merged "origin/$BRANCH" --sort=-v:refname | head -1)
   [ -n "$latest" ] && git -C "$APP" checkout --quiet "$latest"
