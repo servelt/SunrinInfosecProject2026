@@ -55,11 +55,19 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 
 
 _names_lock = threading.Lock()
-_names_cache: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
+_names_cache: dict[str, tuple[tuple[int, int], dict[str, tuple[str, str]]]] = {}
 
 
 def _function_names(path: Path) -> dict[str, str]:
-    """function_id -> name, read once per file version.
+    return {k: v[0] for k, v in _function_index(path).items()}
+
+
+def _function_files(path: Path) -> dict[str, str]:
+    return {k: v[1] for k, v in _function_index(path).items()}
+
+
+def _function_index(path: Path) -> dict[str, tuple[str, str]]:
+    """function_id -> (name, file), read once per file version.
 
     functions.jsonl holds every function's full source (183 MB for a large program).  Parsing it on
     every status poll, from several pollers at once, kept the server busy until it stopped answering.
@@ -74,10 +82,10 @@ def _function_names(path: Path) -> dict[str, str]:
         cached = _names_cache.get(str(path))
         if cached and cached[0] == key:
             return cached[1]
-        names: dict[str, str] = {}
+        names: dict[str, tuple[str, str]] = {}
         for row in _rows(path):
             if "function_id" in row:
-                names[row["function_id"]] = row.get("name", row["function_id"])
+                names[row["function_id"]] = (row.get("name", row["function_id"]), row.get("file", ""))
         _names_cache[str(path)] = (key, names)
         return names
 
@@ -237,9 +245,7 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
         return {"status": st, "details": details}
     # Entries and contexts are shown as code + a short Korean label (labels.py), not file:line.
     from . import labels
-    fn_files: dict[str, str] = {}
-    for r in _rows(hc / "analysis" / "functions.jsonl"):
-        fn_files[r["function_id"]] = r.get("file", "")
+    fn_files = _function_files(hc / "analysis" / "functions.jsonl")
     try:
         source_root = Path(json.loads((hc / "project.json").read_text(encoding="utf-8"))["source_root"])
     except (OSError, ValueError, KeyError):
