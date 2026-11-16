@@ -15,13 +15,17 @@
 저장소가 비공개라 GitHub 로그인이 먼저 필요하다.
 
 ```bash
-sudo apt-get install -y gh || true   # 없으면 install.sh 가 설치하지만 로그인은 먼저 해야 한다
+# gh 는 공식 저장소판이 필요하다 (우분투 apt 의 2.4.0 에는 'gh auth token' 이 없다)
+sudo mkdir -p -m 755 /etc/apt/keyrings
+wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+sudo apt-get update && sudo apt-get install -y gh
 gh auth login
 curl -fsSL -H "Authorization: token $(gh auth token)" \
   https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/main/install.sh | bash
 ```
 
-- 설치 위치: `~/.occulta/app` (소스), `~/.occulta/venv` (Python), 명령은 `~/.local/bin/occulta`
+- 설치 위치: `~/.occulta/app` (소스), `~/.occulta/venv` (Python 3.10, 시스템 Python 이 다르면 uv 로 받는다), 명령은 `~/.local/bin/occulta`
 - 시스템 패키지(clang, LLVM 20, gcc, bear, autotools, gh)는 `apt` 로 설치한다. sudo 비밀번호를 물을 수 있다.
 - LLM 은 Claude Code 를 쓴다: `npm install -g @anthropic-ai/claude-code` 후 `claude` 로 로그인.
 - 코드는 `servelt/SunrinInfosecProject2026` 저장소의 `main` 브랜치에 있다. 다른 곳이면 `OCCULTA_REPO=owner/name`, `OCCULTA_BRANCH=이름` 을 붙인다.

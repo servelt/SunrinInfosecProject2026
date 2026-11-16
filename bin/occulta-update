@@ -24,9 +24,9 @@ old=$(git -C "$APP" rev-parse HEAD); new=$(git -C "$APP" rev-parse "$target^{com
 if [ "$old" = "$new" ]; then echo "[occulta] 이미 최신이야 ($target)"; exit 0; fi
 deps_changed=$(git -C "$APP" diff --name-only "$old" "$new" -- harnesscreator/pyproject.toml fbaugur/pyproject.toml)
 git -C "$APP" checkout --quiet "$new"
-if [ -n "$deps_changed" ] && [ -x "$VENV/bin/pip" ]; then
+if [ -n "$deps_changed" ] && [ -x "$VENV/bin/python" ]; then
   echo "[occulta] 의존성이 바뀌어서 다시 설치"
-  "$VENV/bin/pip" install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"
+  "$VENV/bin/python" -m pip install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"
 fi
 echo "[occulta] $(git -C "$APP" describe --tags --always "$old") -> $(git -C "$APP" describe --tags --always "$new")"
 git -C "$APP" log --oneline "$old..$new" | head -20

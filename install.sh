@@ -38,8 +38,10 @@ if ! command -v "clang-$LLVM_VERSION" >/dev/null; then
 fi
 $SUDO apt-get install -y -qq "libclang-rt-$LLVM_VERSION-dev" >/dev/null 2>&1 || true
 
-if ! command -v gh >/dev/null; then
-  say "GitHub CLI 설치"
+# Ubuntu's own gh (2.4.0 on 22.04) has no 'gh auth token', which the install command uses.
+gh_ok() { command -v gh >/dev/null && gh auth token --help >/dev/null 2>&1; }
+if ! gh_ok; then
+  say "GitHub CLI 설치 (cli.github.com 공식 저장소)"
   $SUDO mkdir -p -m 755 /etc/apt/keyrings
   wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | $SUDO tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
   $SUDO chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
@@ -67,9 +69,25 @@ fi
 
 # ---------------------------------------------------------------- Python
 say "Python 환경 ($VENV)"
-[ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
-"$VENV/bin/pip" install -q --upgrade pip
-"$VENV/bin/pip" install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"
+# Python 3.10 is what Occulta is tested on, and Fuzz Introspector's pinned dependency
+# (tree-sitter-languages 1.10.2) has no build for Python 3.12+ (Ubuntu 24.04's python3).
+# uv fetches that interpreter without touching the system Python.
+PY_VERSION="${OCCULTA_PYTHON_VERSION:-3.10}"
+if [ -x "$VENV/bin/python" ] && ! "$VENV/bin/python" -c "import sys; sys.exit(sys.version_info[:2] != tuple(map(int, '$PY_VERSION'.split('.'))))"; then
+  say "기존 가상환경이 Python $PY_VERSION 이 아니라서 다시 만듦"; rm -rf "$VENV"
+fi
+if [ ! -x "$VENV/bin/python" ]; then
+  if command -v "python$PY_VERSION" >/dev/null && "python$PY_VERSION" -m venv --help >/dev/null 2>&1; then
+    "python$PY_VERSION" -m venv "$VENV"
+  else
+    command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+    UV=$(command -v uv || echo "$HOME/.local/bin/uv")
+    "$UV" venv --quiet --seed --python "$PY_VERSION" "$VENV"
+  fi
+fi
+"$VENV/bin/python" -m pip --version >/dev/null 2>&1 || "$VENV/bin/python" -m ensurepip --upgrade >/dev/null
+"$VENV/bin/python" -m pip install -q --upgrade pip
+"$VENV/bin/python" -m pip install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"
 
 # ---------------------------------------------------------------- command
 mkdir -p "$HOME/.local/bin"
