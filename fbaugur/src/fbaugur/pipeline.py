@@ -81,6 +81,8 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
         argv += ["--analysis-compile-database", str(args.analysis_compile_database.resolve())]
     if not args.only_verified_entries:
         argv += ["--include-unresolved-entries"]
+    if args.diff:                          # delta: Entries only where data reaches the change
+        argv += ["--diff", str(args.diff.expanduser().resolve())]
     argv += [] if args.require_fuzz_introspector else ["--allow-source-analysis"]
     argv += ["--svf"] if args.svf else ["--no-svf"]
     if args.provider == "claude":

@@ -202,8 +202,11 @@ class EntryGeneratorAgent:
         preferred_source_files: set[str] | None = None,
         configured_target_files: set[str] | None = None,
         trace: TraceCallback | None = None,
+        scope_function_ids: set[str] | None = None,
     ):
         self.llm = llm
+        # Delta scans: only these functions are inspected (None = every product function).
+        self.scope_function_ids = scope_function_ids
         self.chunk_size = chunk_size
         self.max_batch_chars = max_batch_chars
         self.target_names = unique_strings(
@@ -299,6 +302,8 @@ class EntryGeneratorAgent:
         )
         for function in functions:
             if function.function_id not in product_ids:
+                continue
+            if self.scope_function_ids is not None and function.function_id not in self.scope_function_ids:
                 continue
             payload = function_payload(
                 function, source_limit=max(1, len(function.source) + 1),

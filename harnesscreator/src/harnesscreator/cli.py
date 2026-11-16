@@ -256,6 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
               "run after checking the indexed product source; start at Action grouping"),
     )
     run.add_argument("--name")
+    run.add_argument("--diff", type=Path, help="delta scan: search Entries only among changed functions and their callers")
+    run.add_argument("--diff-depth", type=int, default=6, help="with --diff: how many calls above the change to search (0 = no limit)")
     run.add_argument(
         "--analysis-binary", type=Path,
         help=("optional ELF: prioritize byte-identical DWARF sources or "
@@ -998,6 +1000,8 @@ async def _run(args: argparse.Namespace) -> int:
         context_depth=args.context_depth,
         max_context_functions=args.context_functions,
         entry_batch_size=args.entry_batch_size,
+        entry_diff=getattr(args, 'diff', None),
+        entry_diff_depth=getattr(args, 'diff_depth', 6),
         fuzzgen_evidence=args.fuzzgen_evidence,
         hopper_constraints=args.hopper_constraints,
         winnie_evidence=args.winnie_evidence,

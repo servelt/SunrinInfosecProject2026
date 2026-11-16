@@ -800,6 +800,22 @@ class HarnessCreator:
             trace=trace,
         )
         product_function_ids = entry_generator.product_function_ids(analysis)
+        if self.project.entry_diff:
+            from .analysis.diff_scope import diff_scope
+            delta = diff_scope(analysis.functions, analysis.edges,
+                               Path(self.project.entry_diff).read_text(encoding="utf-8", errors="replace"),
+                               max_depth=self.project.entry_diff_depth)
+            store.write_json("analysis/diff-scope.json", {
+                **{k: v for k, v in delta.items() if k != "scope"},
+                "scope": sorted(delta["scope"]) if delta["scope"] is not None else None})
+            if delta["scope"] is None:
+                self._emit(f"delta: no indexed function matches the diff ({len(delta['changed_files'])} file(s)); "
+                           "searching every function")
+            else:
+                entry_generator.scope_function_ids = delta["scope"]
+                self._emit(f"delta: {len(delta['changed_functions'])} changed function(s) "
+                           f"({', '.join(delta['changed_function_names'][:8])}); Entry search limited to "
+                           f"{delta['scope_size']} function(s) within {delta['max_depth']} calls above them")
         product_analysis = AnalysisBundle(
             functions={
                 function_id: analysis.functions[function_id]
