@@ -118,7 +118,8 @@ def run_loop(*, url: str, model: str, system: str, message: str, mcp: McpClient 
              local_tools: dict[str, tuple[dict[str, Any], Callable[..., str]]] | None = None,
              max_turns: int = 40, deadline_seconds: float = 1800.0,
              on_event: Callable[[str, Any], None] = lambda kind, data: None,
-             history: list[dict[str, Any]] | None = None) -> tuple[LoopResult, list[dict[str, Any]]]:
+             history: list[dict[str, Any]] | None = None,
+             should_stop: Callable[[], bool] = lambda: False) -> tuple[LoopResult, list[dict[str, Any]]]:
     """Run until the model stops calling tools.  Returns the result and the conversation (to continue it)."""
     local_tools = local_tools or {}
     remote = mcp.tools() if mcp else []
@@ -128,6 +129,9 @@ def run_loop(*, url: str, model: str, system: str, message: str, mcp: McpClient 
     messages.append({"role": "user", "content": message})
     result, started = LoopResult(), time.time()
     while True:
+        if should_stop():
+            result.status, result.error = "error", "stopped by the user"
+            break
         if result.turns >= max_turns:
             result.status = "turn_limit"
             break
@@ -174,7 +178,7 @@ def run_loop(*, url: str, model: str, system: str, message: str, mcp: McpClient 
 
 
 # ------------------------------------------------------------------------------------------ local tools
-def workspace_tools(root: Path, on_command: Callable[[str], None] = lambda c: None
+def workspace_tools(root: Path, on_command: Callable[[str], None] = lambda c: None, key: str | None = None
                     ) -> dict[str, tuple[dict[str, Any], Callable[..., str]]]:
     """Shell and file tools for the preparation agent, working in `root`."""
     root = Path(root)
@@ -182,8 +186,9 @@ def workspace_tools(root: Path, on_command: Callable[[str], None] = lambda c: No
     def bash(command: str, timeout: int = 1200) -> str:
         on_command(command)
         try:
-            done = subprocess.run(["bash", "-lc", command], cwd=str(root), capture_output=True, text=True,
-                                  timeout=min(int(timeout), 3600))
+            from . import proctrack
+            done = proctrack.run(key, ["bash", "-lc", command], cwd=str(root), text=True,
+                                 timeout=min(int(timeout), 3600))
         except subprocess.TimeoutExpired:
             return f"timed out after {timeout}s"
         out = (done.stdout + done.stderr)

@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import proctrack
 from .status import pid_alive, pipeline_dir_of, read_log
 
 UNLIMITED_HOURS = 720.0       # "-1": run until stopped
@@ -156,6 +157,7 @@ class Sessions:
             raise ValueError("bad session id")
         own = self.home / "sessions" / sid
         if (own / "session.json").is_file():
+            proctrack.cancel(sid)
             session = self.load(sid) or {}
             pid = session.get("pid")
             if pid and pid_alive(pid):
@@ -252,6 +254,7 @@ class Sessions:
         return session
 
     def stop(self, sid: str) -> None:
+        proctrack.cancel(sid)              # clone / prepare.sh / preparation agent, before any pipeline
         session = self.load(sid) or {}
         pid = session.get("pid")
         if pid and pid_alive(pid):
@@ -277,7 +280,7 @@ class Sessions:
             steps["n"] += 1
             self.update(sid, prep_progress=min(0.48, 0.15 + 0.004 * steps["n"]), prep_label="자동 준비: " + label)
 
-        prep = AutoPrep(work, repo=session["repo"], name=name, provider=provider,
+        prep = AutoPrep(work, repo=session["repo"], name=name, provider=provider, key=sid,
                         model=default_model(provider, session.get("models")), python=self.python, hc=hc_root,
                         emit=lambda m: self._log(sid, m), progress=progress)
         ok, problems, summary = prep.run()
@@ -301,22 +304,24 @@ class Sessions:
             self._log(sid, f"occulta: {session['repo']} @ {session['rev']} ({session['mode']})")
             url = session.get("url") or clone_url(session["repo"])
             self._log(sid, f"clone {url}")
-            subprocess.run(["git", "clone", "--filter=blob:none", "--no-checkout", url, str(work / "source")],
-                           check=True, capture_output=True, text=True, timeout=600)
+            cloned = proctrack.run(sid, ["git", "clone", "--filter=blob:none", "--no-checkout", url, str(work / "source")],
+                                   text=True, timeout=600)
+            if cloned.returncode != 0:
+                raise RuntimeError(f"clone 실패: {cloned.stderr.strip()[-300:]}")
             branch = session.get("branch") or ""
             if not branch:            # no branch typed: the repository's default branch (main, master, ...)
-                head = subprocess.run(["git", "-C", str(work / "source"), "symbolic-ref", "--short", "HEAD"],
-                                      capture_output=True, text=True, timeout=30)
+                head = proctrack.run(sid, ["git", "-C", str(work / "source"), "symbolic-ref", "--short", "HEAD"],
+                                     text=True, timeout=30)
                 branch = head.stdout.strip() or "HEAD"
                 self.update(sid, branch=branch, **({} if session["mode"] == "Delta" else {"rev": branch}))
             target = session["commit"] if session["mode"] == "Delta" else branch
-            checkout = subprocess.run(["git", "-C", str(work / "source"), "checkout", "--quiet", target],
-                                      capture_output=True, text=True, timeout=300)
+            checkout = proctrack.run(sid, ["git", "-C", str(work / "source"), "checkout", "--quiet", target],
+                                     text=True, timeout=300)
             if checkout.returncode != 0:
                 raise RuntimeError(f"'{target}' 를 체크아웃하지 못함: {checkout.stderr.strip()[-200:]}")
             if session["mode"] == "Delta":
-                diff = subprocess.run(["git", "-C", str(work / "source"), "diff", f"{target}^", target],
-                                      capture_output=True, text=True, timeout=120)
+                diff = proctrack.run(sid, ["git", "-C", str(work / "source"), "diff", f"{target}^", target],
+                                     text=True, timeout=120)
                 (work / "delta.diff").write_text(diff.stdout, encoding="utf-8")
             self.update(sid, prep_progress=0.12, prep_label="대상 준비")
             hc_root = self.package_root.parent.parent / "harnesscreator"
@@ -329,8 +334,8 @@ class Sessions:
             profile_dir, profile = found
             env = dict(os.environ, WORK=str(work), PROFILE=str(profile_dir), PY=self.python, HC=str(hc_root))
             if not prepared:
-                proc = subprocess.Popen(["bash", str(profile_dir / profile["prepare"])], cwd=str(work), env=env,
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                proc = proctrack.spawn(sid, ["bash", str(profile_dir / profile["prepare"])], cwd=str(work), env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 steps = 0
                 for line in proc.stdout:
                     line = line.rstrip()
@@ -339,6 +344,9 @@ class Sessions:
                     if m:
                         steps += 1
                         self.update(sid, prep_progress=min(0.5, 0.12 + 0.1 * steps), prep_label=m.group(1))
+                proctrack.forget(sid, proc)
+                if proctrack.cancelled(sid):
+                    raise proctrack.Cancelled("사용자가 멈춤")
                 if proc.wait() != 0:
                     raise RuntimeError(f"대상 준비가 실패함 (exit {proc.returncode}); {work}/*.log 확인")
             hours = UNLIMITED_HOURS if int(session["hours"]) == -1 else float(session["hours"])
@@ -352,11 +360,19 @@ class Sessions:
             for tier, model in sorted((session.get("models") or {}).items()):
                 if tier in ("1", "2", "3"):
                     args += [f"--model-t{tier}", model]
+            if proctrack.cancelled(sid):
+                raise proctrack.Cancelled("사용자가 멈춤")
             self.update(sid, prep_progress=0.52, prep_label="정적 분석 준비", state="starting")
             log = open(root / "pipeline.log", "a", encoding="utf-8")
             pipeline = subprocess.Popen(args, cwd=str(self.package_root.parent), stdout=log, stderr=subprocess.STDOUT,
                                         env=dict(os.environ, PYTHONPATH=str(self.package_root)), start_new_session=True)
             self.update(sid, pid=pipeline.pid, state="running")
+        except proctrack.Cancelled:
+            if (self.home / "sessions" / sid).is_dir():
+                self._log(sid, "stopped by the user during preparation")
+                self.update(sid, state="failed", error="사용자가 멈춤")
         except Exception as exc:          # every failure ends up on the page, with its reason
+            if proctrack.cancelled(sid):
+                return
             self._log(sid, f"failed: {exc}")
             self.update(sid, state="failed", error=str(exc))

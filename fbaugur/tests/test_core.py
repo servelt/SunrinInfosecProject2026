@@ -1210,3 +1210,48 @@ class SpDedupTests(unittest.TestCase):
             with mock.patch("fbaugur.tools.subprocess.run", side_effect=OSError("no claude")):
                 out = json.loads(box.create_suspicious_point("sblist_new", "Division by zero", "a"))
             self.assertTrue(out["created"])
+
+
+class StopAndFailureTests(unittest.TestCase):
+    """Review 2026-11-17: deleting a preparing session left its processes running; a Codex run that
+    completed a turn and then exited 7 counted as completed; a silent preparation agent outlived its limit."""
+
+    def test_deleting_a_preparing_session_ends_its_processes(self):
+        from fbaugur import proctrack
+        from fbaugur.web.sessions import Sessions
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            sessions = Sessions(home, None, Path(tmp), Path(tmp) / "targets", sys.executable)
+            sid = "20990101-000000-test"
+            sessions.save({"id": sid, "state": "preparing", "pid": None, "created": time.time()})
+            child = proctrack.spawn(sid, ["sleep", "60"])
+            self.assertEqual(sessions.delete(sid), "deleted")
+            child.wait(timeout=10)
+            self.assertIsNotNone(child.returncode)
+            with self.assertRaises(proctrack.Cancelled):
+                proctrack.spawn(sid, ["sleep", "1"])
+
+    def test_codex_failure_after_a_completed_turn_is_an_error(self):
+        from fbaugur.agent import parse_codex
+        out = '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "tools.jsonl"
+            self.assertEqual(parse_codex("r", "role", out, "", log, returncode=0).status, "completed")
+            failed = parse_codex("r", "role", out, "boom", log, returncode=7)
+            self.assertEqual(failed.status, "error")
+            self.assertIn("status 7", failed.error)
+
+    def test_silent_preparation_agent_is_stopped_at_its_limit(self):
+        from fbaugur.autoprep import AutoPrep
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "agent"
+            fake.write_text("#!/bin/sh\nsleep 30\n")
+            fake.chmod(0o755)
+            prep = AutoPrep(Path(tmp) / "work", repo="x/y", name="y", provider="claude", model="m",
+                            python=sys.executable, hc=Path(tmp), claude=str(fake), agent_timeout=0.5, emit=lambda m: None)
+            (Path(tmp) / "work").mkdir()
+            started = time.time()
+            ok, problems, _ = prep.run()
+            self.assertLess(time.time() - started, 10)
+            self.assertFalse(ok)
+            self.assertIn("did not finish", problems[0])

@@ -24,10 +24,12 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from . import proctrack
 from .config import CODEX_DAYBREAK, PROVIDER_MODELS
 
 REFERENCE = Path(__file__).resolve().parents[2] / "targets" / "tinyproxy"
@@ -119,12 +121,13 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
         return False
 
 
-def _start_and_stop(command: str, cwd: str, port: int | None, *, wait: float = 25.0) -> dict[str, Any]:
+def _start_and_stop(command: str, cwd: str, port: int | None, *, wait: float = 25.0,
+                    key: str | None = None) -> dict[str, Any]:
     """Start a command, wait for its port, stop it with SIGTERM. What happened, for the report."""
     out = tempfile.NamedTemporaryFile(prefix="autoprep-", suffix=".log", delete=False)
     try:
-        process = subprocess.Popen(shlex.split(command), cwd=cwd or None, stdout=out, stderr=subprocess.STDOUT,
-                                   stdin=subprocess.DEVNULL, start_new_session=True)
+        process = proctrack.spawn(key, shlex.split(command), cwd=cwd or None, stdout=out, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL)
     except OSError as exc:
         return {"started": False, "listening": False, "exit": None, "output": str(exc)}
     listening = False
@@ -145,6 +148,7 @@ def _start_and_stop(command: str, cwd: str, port: int | None, *, wait: float = 2
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+    proctrack.forget(key, process)
     out.close()
     text = Path(out.name).read_text(encoding="utf-8", errors="replace")[-1500:]
     os.unlink(out.name)
@@ -153,7 +157,7 @@ def _start_and_stop(command: str, cwd: str, port: int | None, *, wait: float = 2
 
 
 def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
-                  emit: Callable[[str], None] = lambda m: None) -> list[str]:
+                  emit: Callable[[str], None] = lambda m: None, key: str | None = None) -> list[str]:
     """Problems with WORK/profile, measured; an empty list means the profile is usable."""
     problems: list[str] = []
     profile_path = work / "profile" / "profile.json"
@@ -165,8 +169,8 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
         return ["profile/prepare.sh is missing"]
     if rebuild:
         emit("prepare.sh 다시 실행해서 확인")
-        run = subprocess.run(["bash", str(work / "profile" / profile.get("prepare", "prepare.sh"))], cwd=str(work),
-                             env=env, capture_output=True, text=True, timeout=7200)
+        run = proctrack.run(key, ["bash", str(work / "profile" / profile.get("prepare", "prepare.sh"))], cwd=str(work),
+                            env=env, text=True, timeout=7200)
         if run.returncode != 0:
             return [f"prepare.sh failed (exit {run.returncode}): {(run.stdout + run.stderr).strip()[-1500:]}"]
         if not re.search(r"^\[prep\] ", run.stdout, re.M):
@@ -206,17 +210,18 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
         problems.append(f"coverage binary is not an executable file: {binary}")
         return problems
     if channel == "tcp":
-        result = _start_and_stop(opt["--coverage-command"], opt.get("--coverage-cwd", str(cov_root)), port)
+        result = _start_and_stop(opt["--coverage-command"], opt.get("--coverage-cwd", str(cov_root)), port, key=key)
         if not result["listening"]:
             problems.append(f"the coverage build did not accept a TCP connection on 127.0.0.1:{port} within 25 s "
                             f"(exited early: {result['early_exit']}); its output: {result['output'][-800:]}")
         elif not any(cov_root.rglob("*.gcda")):
             problems.append("the coverage build left no .gcda file after SIGTERM: it must exit normally on SIGTERM "
                             f"and its sources must be under {cov_root}; exit status {result['exit']}")
+        session_key = key
         for key in ("--daemon-command", "--daemon-plain-command", "--daemon-msan-command",
                     "--thread-trace-command"):
             if key in opt:
-                r = _start_and_stop(opt[key], opt.get("--daemon-cwd", str(work)), port)
+                r = _start_and_stop(opt[key], opt.get("--daemon-cwd", str(work)), port, key=session_key)
                 if not r["listening"]:
                     problems.append(f"{key} did not accept a connection on port {port}: {r['output'][-600:]}")
     return problems
@@ -227,7 +232,8 @@ class AutoPrep:
     def __init__(self, work: Path, *, repo: str, name: str, provider: str, model: str, python: str, hc: Path,
                  claude: str = "claude", codex: str = "codex", ollama_url: str = "http://localhost:11434",
                  rounds: int = 3, agent_timeout: float = 3600.0, emit: Callable[[str], None] = print,
-                 progress: Callable[[str], None] = lambda label: None):
+                 progress: Callable[[str], None] = lambda label: None, key: str | None = None):
+        self.key = key
         self.work, self.repo, self.name = Path(work), repo, name
         self.provider, self.model, self.python, self.hc = provider, model, python, Path(hc)
         self.claude, self.codex, self.ollama_url = claude, codex, ollama_url
@@ -249,12 +255,15 @@ class AutoPrep:
     def _agent_ollama(self, prompt: str) -> str:
         """Ollama only: our own loop on /api/chat with shell and file tools in WORK."""
         from .ollama_agent import run_loop, workspace_tools
-        tools = workspace_tools(self.work, on_command=lambda c: self.progress(str(c).splitlines()[0][:60]))
+        tools = workspace_tools(self.work, on_command=lambda c: self.progress(str(c).splitlines()[0][:60]), key=self.key)
         result, self._history = run_loop(
             url=self.ollama_url, model=self.model,
             system="You are a build engineer with a shell. Use the bash, read_file and write_file tools.",
             message=prompt, local_tools=tools, max_turns=200, deadline_seconds=self.agent_timeout,
-            history=getattr(self, "_history", None))
+            history=getattr(self, "_history", None),
+            should_stop=lambda: proctrack.cancelled(self.key or ""))
+        if proctrack.cancelled(self.key or ""):
+            raise proctrack.Cancelled("stopped by the user")
         with self.log.open("a", encoding="utf-8") as log:
             log.write(json.dumps({"turns": result.turns, "tool_calls": result.tool_calls, "status": result.status,
                                   "error": result.error, "text": result.text[-2000:]}, ensure_ascii=False) + "\n")
@@ -283,18 +292,25 @@ class AutoPrep:
                 from types import SimpleNamespace
                 from .agent import ollama_env
                 env = ollama_env(SimpleNamespace(ollama_url=self.ollama_url), self.model)
-        process = subprocess.Popen(argv, cwd=str(self.work), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
+        process = proctrack.spawn(self.key, argv, cwd=str(self.work), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, env=env)
         process.stdin.write(prompt)
         process.stdin.close()
+        # The limit holds even when the agent prints nothing: a timer ends the whole process group.
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            proctrack.kill_group(process.pid, grace=2.0)
+
+        watchdog = threading.Timer(self.agent_timeout, expire)
+        watchdog.daemon = True
+        watchdog.start()
         final, started, self.agent_error, tail = "", time.time(), "", []
         with self.log.open("a", encoding="utf-8") as log:
             for line in process.stdout:
                 log.write(line)
                 tail = (tail + [line.strip()])[-20:]
-                if time.time() - started > self.agent_timeout:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    break
                 try:
                     event = json.loads(line)
                 except ValueError:
@@ -306,6 +322,12 @@ class AutoPrep:
                 if event.get("type") in ("error", "turn.failed"):
                     self.agent_error = str(event.get("message") or (event.get("error") or {}).get("message") or event)
         code = process.wait()
+        watchdog.cancel()
+        proctrack.forget(self.key, process)
+        if proctrack.cancelled(self.key or ""):
+            raise proctrack.Cancelled("stopped by the user")
+        if timed_out.is_set():
+            self.agent_error = self.agent_error or f"the agent did not finish within {self.agent_timeout:.0f}s"
         if not final and not self.agent_error:
             # No answer at all: the agent did not run (not logged in, model unknown, CLI missing ...).
             plain = [t for t in tail if t and not t.startswith("{")]
@@ -353,7 +375,7 @@ class AutoPrep:
                 # Retrying cannot help an agent that does not start; say why instead.
                 return False, [f"준비 에이전트 실행 실패 ({self.provider}): {self.agent_error[:400]}"], summary
             self.progress("결과 확인 (prepare.sh 다시 실행)")
-            problems = check_profile(self.work, self.env, emit=self.progress)
+            problems = check_profile(self.work, self.env, emit=self.progress, key=self.key)
             if not problems:
                 return True, [], summary
             self.emit("[autoprep] check failed: " + " | ".join(p[:300] for p in problems))

@@ -261,7 +261,7 @@ class AgentRunner:
                                    f"no answer within {self.cfg.agent_timeout_seconds:.0f}s")
             (log_dir / f"{run_id}.jsonl").write_bytes(stdout)
             return parse_codex(run_id, role, stdout.decode("utf-8", errors="replace"),
-                               stderr.decode("utf-8", errors="replace"), tool_log)
+                               stderr.decode("utf-8", errors="replace"), tool_log, returncode=process.returncode)
 
     def _parse(self, run_id: str, role: str, stdout: str, stderr: str, tool_log: Path) -> AgentResult:
         tool_calls, turns, usage, text, status, error = 0, 0, {}, "", "error", ""
@@ -311,7 +311,8 @@ class AgentRunner:
         return AgentResult(run_id, role, status, text.strip(), turns, tool_calls, error, usage)
 
 
-def parse_codex(run_id: str, role: str, stdout: str, stderr: str, tool_log: Path) -> AgentResult:
+def parse_codex(run_id: str, role: str, stdout: str, stderr: str, tool_log: Path,
+                returncode: int | None = 0) -> AgentResult:
     """`codex exec --json` events: item.completed (agent_message, mcp_tool_call), turn.completed, errors."""
     text, tool_calls, turns, usage, errors, finished = "", 0, 0, {}, [], False
     for line in stdout.splitlines():
@@ -337,8 +338,10 @@ def parse_codex(run_id: str, role: str, stdout: str, stderr: str, tool_log: Path
         raise TerminalLLMError("Codex is not usable: " + (errors[-1] if errors else stderr.strip()[-300:]))
     if tool_log.is_file():
         tool_calls = max(tool_calls, sum(1 for _ in tool_log.open(encoding="utf-8")))
-    if finished:
+    if finished and not returncode:
         return AgentResult(run_id, role, "completed", text.strip(), turns, tool_calls, "", usage)
+    if finished:                      # a turn completed but the process failed afterwards
+        errors.append(f"codex exited with status {returncode}: {stderr.strip()[-300:]}")
     return AgentResult(run_id, role, "error", text.strip(), turns, tool_calls,
                        (errors[-1] if errors else stderr.strip()[-1500:] or "no turn.completed event"), usage)
 
