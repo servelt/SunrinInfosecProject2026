@@ -192,17 +192,19 @@ def sp_duplicate_of(new_description: str, existing: list[dict[str, Any]], cfg: R
                                 "-C", tmp, "-o", str(out), "-"], input=SP_DEDUP_SYSTEM + "\n\n" + prompt,
                                capture_output=True, text=True, timeout=300)
                 text = out.read_text(encoding="utf-8") if out.is_file() else ""
+        elif cfg.provider == "ollama":
+            from .ollama_agent import chat
+            text = (chat(cfg.ollama_url, model, [{"role": "system", "content": SP_DEDUP_SYSTEM},
+                                                 {"role": "user", "content": prompt}], timeout=300)
+                    .get("message") or {}).get("content", "")
         else:
             env = None
-            if cfg.provider == "ollama":
-                from .agent import ollama_env
-                env = ollama_env(cfg, model)
             proc = subprocess.run([cfg.claude_executable, "-p", "--model", model, "--output-format", "json",
                                    "--tools", "", "--disable-slash-commands", "--max-turns", "1",
                                    "--system-prompt", SP_DEDUP_SYSTEM],
                                   input=prompt, capture_output=True, text=True, timeout=180, env=env)
             text = json.loads(proc.stdout).get("result", "")
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return None
     return parse_sp_dedup(text or "", compare)
 

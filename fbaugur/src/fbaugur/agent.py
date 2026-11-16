@@ -158,6 +158,9 @@ class AgentRunner:
                      message: str, binding: dict[str, Any], tool_log: Path, log_dir: Path) -> AgentResult:
         if self.cfg.provider == "codex":
             return await self._spawn_codex(run_id, role, model, effort, system, message, binding, tool_log, log_dir)
+        if self.cfg.provider == "ollama":
+            return await asyncio.to_thread(self._run_ollama, run_id, role, model, max_turns, system, message,
+                                           binding, tool_log, log_dir)
         # Ollama serves the Anthropic Messages API, so the same Claude Code agent loop (and the same
         # MCP tools) runs on an Ollama model when Claude Code is pointed at it.
         env = None
@@ -190,6 +193,34 @@ class AgentRunner:
             transcript.write_bytes(stdout)
             return self._parse(run_id, role, stdout.decode("utf-8", errors="replace"),
                                stderr.decode("utf-8", errors="replace"), tool_log)
+
+    def _run_ollama(self, run_id: str, role: str, model: str, max_turns: int, system: str, message: str,
+                    binding: dict[str, Any], tool_log: Path, log_dir: Path) -> AgentResult:
+        """Ollama only: our own agent loop on /api/chat with the same MCP tool server."""
+        from .ollama_agent import McpClient, run_loop
+        with tempfile.TemporaryDirectory(prefix="fbaugur-agent-") as tmp:
+            server = json.loads(self._mcp_config(Path(tmp), binding, run_id, tool_log).read_text())["mcpServers"]["fba"]
+            try:
+                mcp = McpClient(server["command"], server["args"], env=server.get("env"), cwd=tmp)
+            except Exception as exc:
+                return AgentResult(run_id, role, "error", "", 0, 0, f"tool server did not start: {exc}")
+            events: list[dict[str, Any]] = []
+            try:
+                result, conversation = run_loop(
+                    url=self.cfg.ollama_url, model=model, system=system + _SYSTEM_SUFFIX, message=message, mcp=mcp,
+                    max_turns=max_turns, deadline_seconds=self.cfg.agent_timeout_seconds,
+                    on_event=lambda kind, data: events.append({"kind": kind, **data}))
+            finally:
+                mcp.close()
+            (log_dir / f"{run_id}.jsonl").write_text(
+                "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in conversation), encoding="utf-8")
+        if result.status == "error" and "not answering" in result.error:
+            raise TerminalLLMError(result.error)
+        tool_calls = result.tool_calls
+        if tool_log.is_file():
+            tool_calls = max(tool_calls, sum(1 for _ in tool_log.open(encoding="utf-8")))
+        return AgentResult(run_id, role, result.status, result.text.strip(), result.turns, tool_calls,
+                           result.error, result.usage)
 
     async def _spawn_codex(self, run_id: str, role: str, model: str, effort: str, system: str, message: str,
                            binding: dict[str, Any], tool_log: Path, log_dir: Path) -> AgentResult:
@@ -330,13 +361,19 @@ def check_backend(cfg: Any) -> str:
     import urllib.request
     if cfg.provider == "codex":
         return "" if shutil.which(cfg.codex_executable) else f"Codex CLI not found: {cfg.codex_executable}"
-    if not shutil.which(cfg.claude_executable):
-        return (f"Claude Code not found: {cfg.claude_executable}" if cfg.provider == "claude" else
-                f"Claude Code (used only as the agent runner; every request goes to Ollama) not found: "
-                f"{cfg.claude_executable}")
     if cfg.provider == "ollama":
         try:
-            urllib.request.urlopen(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=5).read()
-        except OSError as exc:
+            tags = json.loads(urllib.request.urlopen(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=5).read())
+        except (OSError, ValueError) as exc:
             return f"Ollama is not answering at {cfg.ollama_url}: {exc}"
-    return ""
+        return missing_ollama_models(tags, set(cfg.models.values()))
+    return "" if shutil.which(cfg.claude_executable) else f"Claude Code not found: {cfg.claude_executable}"
+
+
+def missing_ollama_models(tags: dict, wanted: set[str]) -> str:
+    """Cloud models too must be pulled once per machine before Ollama serves them."""
+    have = {m.get("name") for m in tags.get("models", [])} | {m.get("model") for m in tags.get("models", [])}
+    missing = sorted(m for m in wanted if m and m not in have and f"{m}:latest" not in have)
+    return ("Ollama 에 없는 모델: " + ", ".join(missing) + " -- " +
+            " && ".join(f"ollama pull {m}" for m in missing)) if missing else ""
+

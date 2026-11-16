@@ -246,9 +246,26 @@ class AutoPrep:
                            ref_profile=_read(REFERENCE / "profile.json"),
                            ref_prepare=_read(REFERENCE / "prepare.sh"), ref_build=_read(REFERENCE / "build.sh"))
 
+    def _agent_ollama(self, prompt: str) -> str:
+        """Ollama only: our own loop on /api/chat with shell and file tools in WORK."""
+        from .ollama_agent import run_loop, workspace_tools
+        tools = workspace_tools(self.work, on_command=lambda c: self.progress(str(c).splitlines()[0][:60]))
+        result, self._history = run_loop(
+            url=self.ollama_url, model=self.model,
+            system="You are a build engineer with a shell. Use the bash, read_file and write_file tools.",
+            message=prompt, local_tools=tools, max_turns=200, deadline_seconds=self.agent_timeout,
+            history=getattr(self, "_history", None))
+        with self.log.open("a", encoding="utf-8") as log:
+            log.write(json.dumps({"turns": result.turns, "tool_calls": result.tool_calls, "status": result.status,
+                                  "error": result.error, "text": result.text[-2000:]}, ensure_ascii=False) + "\n")
+        self.agent_error = result.error if result.status == "error" else ""
+        return result.text
+
     def _agent(self, prompt: str) -> str:
         """One agent session (continued when one exists); returns its final text."""
         (self.work / "profile").mkdir(parents=True, exist_ok=True)
+        if self.provider == "ollama":
+            return self._agent_ollama(prompt)
         if self.provider == "codex":
             argv = [self.codex, "exec", "--json", "--ignore-user-config", *CODEX_DAYBREAK, "--skip-git-repo-check",
                     "-m", self.model,
@@ -315,6 +332,16 @@ class AutoPrep:
     def run(self) -> tuple[bool, list[str], str]:
         """(usable, problems left, the agent's last summary)."""
         prompt, summary, problems = self.task(), "", ["not started"]
+        if self.provider == "ollama":
+            import urllib.request
+            from .agent import missing_ollama_models
+            try:
+                tags = json.loads(urllib.request.urlopen(self.ollama_url.rstrip("/") + "/api/tags", timeout=5).read())
+            except (OSError, ValueError) as exc:
+                return False, [f"Ollama 가 응답하지 않음 ({self.ollama_url}): {exc}"], ""
+            missing = missing_ollama_models(tags, {self.model})
+            if missing:
+                return False, [missing], ""
         for number in range(1, self.rounds + 1):
             self.emit(f"[autoprep] agent round {number}: {self.provider}/{self.model}")
             try:
