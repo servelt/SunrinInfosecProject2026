@@ -97,7 +97,7 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
     return argv
 
 
-async def generate_harness(args, run_root: Path, budget: float, emit) -> Path | None:
+async def generate_harness(args, run_root: Path, budget: float, emit, deadline_file: Path | None = None) -> Path | None:
     """Run stage 1, streaming its log; returns the HarnessCreator run directory."""
     argv = harnesscreator_argv(args, run_root)
     log_path = run_root / "harnesscreator.log"
@@ -132,9 +132,15 @@ async def generate_harness(args, run_root: Path, budget: float, emit) -> Path | 
                     emit("  " + text[:220])
 
         async def heartbeat() -> None:
-            """Say what is still running when HarnessCreator goes quiet for a while."""
+            """Say what is still running when HarnessCreator goes quiet for a while; and stop stage 1
+            when the whole pipeline's end time, changed by the user, has come."""
+            from . import deadline as live
             while True:
                 await asyncio.sleep(30)
+                if deadline_file is not None and time.time() >= live.read(deadline_file, float("inf")):
+                    emit("[stage 1] the time limit was changed and has passed; stopping harness generation")
+                    process.kill()
+                    return
                 quiet = time.time() - last_line
                 if quiet >= 30:
                     emit(f"  ... still running, no output for {quiet:.0f}s "
@@ -225,6 +231,9 @@ async def run(args, emit) -> int:
     run_root = args.output.expanduser().resolve() / f"{time.strftime('%Y%m%d-%H%M%S')}-pipeline"
     run_root.mkdir(parents=True, exist_ok=True)
     emit(f"pipeline directory: {run_root} | whole budget: {args.max_hours} h")
+    from . import deadline as live
+    deadline_file = run_root / "deadline"
+    live.write(deadline_file, deadline)
 
     if args.skip_harness:
         hc_run = args.skip_harness.expanduser().resolve()
@@ -232,7 +241,7 @@ async def run(args, emit) -> int:
     else:
         share = args.harness_max_minutes * 60 if args.harness_max_minutes else total / 2
         hc_run = await generate_harness(args, run_root / "harness", min(share, max(60.0, deadline - time.time())),
-                                        emit)
+                                        emit, deadline_file=deadline_file)
         if hc_run is None:
             return 3
     harnesses = report_stage1(hc_run, emit)
@@ -267,6 +276,7 @@ async def run(args, emit) -> int:
     exit_code = 1
     analysed: list[str] = []         # scan dirs already done: findings there are not new
     for index, (context, deliveries) in enumerate(grouped):
+        deadline = live.read(deadline_file, deadline)
         remaining = deadline - time.time()
         if remaining < 120:
             emit(f"the whole budget is spent; {len(grouped) - index} context(s) not analysed. "
@@ -291,6 +301,7 @@ async def run(args, emit) -> int:
             daemon_plain_command=args.daemon_plain_command or "",
             daemon_cwd=args.daemon_cwd, daemon_port=args.daemon_port, product_version=args.product_version,
             prior_scans=list(analysed))
+        cfg.deadline_file, cfg.contexts_after = str(deadline_file), len(grouped) - index - 1
         cfg.provider, cfg.codex_executable, cfg.ollama_url = args.provider, args.codex, args.ollama_url
         cfg.models = dict(PROVIDER_MODELS[args.provider])
         for tier, value in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)):

@@ -267,6 +267,20 @@ class Sessions:
         else:
             self.update(sid, state="stopped")
 
+    def set_hours(self, sid: str, hours: int) -> dict[str, Any]:
+        """Change the time limit of a session, also while it runs (the pipeline re-reads its deadline file)."""
+        from .. import deadline as live
+        session = self.load(sid) or {}
+        if not session:
+            raise ValueError("no such session")
+        start = float(session.get("created") or time.time())
+        end = start + (UNLIMITED_HOURS if hours == -1 else float(hours)) * 3600
+        session = self.update(sid, hours=hours)
+        target = Path(session["pipeline_dir"]) / "deadline" if session.get("pipeline_dir") else None
+        if target is not None and target.parent.is_dir():
+            live.write(target, end)
+        return {"hours": hours, "ends_at": None if hours == -1 else end}
+
     def _auto_prepare(self, sid: str, session: dict[str, Any], work: Path, hc_root: Path) -> tuple[Path, dict[str, Any]]:
         """No profile for this repository: an agent writes one in WORK/profile, Occulta checks it."""
         from ..autoprep import AutoPrep, default_model, save_profile
@@ -349,7 +363,12 @@ class Sessions:
                     raise proctrack.Cancelled("사용자가 멈춤")
                 if proc.wait() != 0:
                     raise RuntimeError(f"대상 준비가 실패함 (exit {proc.returncode}); {work}/*.log 확인")
-            hours = UNLIMITED_HOURS if int(session["hours"]) == -1 else float(session["hours"])
+            session = self.load(sid) or session          # the limit may have been changed during preparation
+            if int(session["hours"]) == -1:
+                hours = UNLIMITED_HOURS
+            else:   # counted from when the scan was started, like a limit changed later (set_hours)
+                hours = max(0.1, (float(session.get("created") or time.time()) + float(session["hours"]) * 3600
+                                  - time.time()) / 3600)
             args = [self.python, "-m", "fbaugur.cli", "pipeline", str(work / "source"), "--name", profile["name"],
                     "--output", str(root / "runs"), "--python", self.python, "--max-hours", str(hours),
                     "--product-version", session["rev"]]

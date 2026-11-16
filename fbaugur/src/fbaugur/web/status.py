@@ -632,4 +632,16 @@ def session_status(session: dict[str, Any]) -> dict[str, Any]:
             "when": session.get("when", ""), "phase": phase, "error": session.get("error", ""),
             "prep": {"progress": progress, "label": label}, "context": s2.get("context", ""),
             "status": {**s1["status"], **s2["status"]}, "details": {**s1["details"], **s2["details"]},
-            "outputs": outputs(scans), "pipeline_dir": str(pipeline_dir or "")}
+            "outputs": outputs(scans), "pipeline_dir": str(pipeline_dir or ""),
+            "hours": session.get("hours"), "ends_at": _ends_at(session, pipeline_dir)}
+
+
+def _ends_at(session: dict[str, Any], pipeline_dir: Path | None) -> float | None:
+    """When the scan stops: the pipeline's live deadline file, else start + the requested hours."""
+    from .. import deadline as live
+    if pipeline_dir and (Path(pipeline_dir) / "deadline").is_file():
+        return live.read(Path(pipeline_dir) / "deadline", 0.0) or None
+    hours = session.get("hours")
+    if hours in (None, -1, "-1") or not session.get("created"):
+        return None
+    return float(session["created"]) + float(hours) * 3600

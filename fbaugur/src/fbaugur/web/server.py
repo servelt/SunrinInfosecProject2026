@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -161,6 +162,11 @@ def _handler(sessions: Sessions):
                     return None
                 if url.path.startswith("/api/sessions/") and url.path.endswith("/delete"):
                     return self._json({"result": sessions.delete(url.path.split("/")[3])})
+                if url.path.startswith("/api/sessions/") and url.path.endswith("/hours"):
+                    raw = str(body.get("hours", "")).strip()
+                    if not re.fullmatch(r"-?\d+", raw) or (int(raw) != -1 and int(raw) <= 0):
+                        return self._error(400, "시간은 양의 정수, 제한 없음은 -1")
+                    return self._json(sessions.set_hours(url.path.split("/")[3], int(raw)))
                 if url.path.startswith("/api/sessions/") and url.path.endswith("/stop"):
                     sessions.stop(url.path.split("/")[3])
                     return self._json({"ok": True})

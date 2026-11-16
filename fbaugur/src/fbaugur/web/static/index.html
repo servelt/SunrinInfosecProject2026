@@ -34,6 +34,7 @@ aside{width:236px;flex:none;min-height:100vh;padding:14px 10px;border-right:1px 
 .seg-s button{font-size:12.5px;padding:6px 14px}
 .updnote{position:fixed;top:14px;right:18px;z-index:5;border:1px solid rgba(255,255,255,.3);border-radius:999px;background:rgba(0,0,0,.6);color:#fff;font-size:12px;padding:6px 14px;cursor:pointer;box-shadow:0 0 16px rgba(255,255,255,.25)}
 .updnote.bad{color:var(--pink);border-color:rgba(255,179,179,.35);box-shadow:none;cursor:default}
+.tchip{border:0;background:transparent;color:var(--dim);font-size:11.5px;cursor:pointer;padding:2px 8px;border-radius:999px}.tchip:hover{color:#fff;background:rgba(255,255,255,.06)}
 .pstop{margin-top:6px;border:1px solid rgba(255,255,255,.2);border-radius:999px;background:transparent;color:var(--dim);font-size:12px;padding:5px 16px;cursor:pointer}.pstop:hover{color:#fff;border-color:rgba(255,255,255,.5)}
 .ver{margin-top:auto;padding:10px 12px 4px;font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:6px}
 .ver button{align-self:flex-start;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:transparent;color:#fff;font-size:11.5px;padding:4px 12px;cursor:pointer;box-shadow:0 0 12px rgba(255,255,255,.18)}
@@ -286,12 +287,24 @@ function renderView() {
   if (S.flowFor !== st.id) buildFlow(st);
   updateFlow(st);
 }
+function timeText(st) {
+  if (st.hours === -1 || st.hours === '-1') return '시간 제한 없음 · 바꾸기';
+  if (!st.ends_at) return st.hours ? `${st.hours}시간 · 바꾸기` : '';
+  const left = Math.max(0, st.ends_at - Date.now() / 1000), h = Math.floor(left / 3600), m = Math.floor(left % 3600 / 60);
+  return `남은 시간 ${h}시간 ${m}분 · 바꾸기`;
+}
+async function changeHours(st) {
+  const v = prompt('전체 시간 제한 (시간, 스캔 시작부터). -1 이면 제한 없음', String(st.hours ?? 3));
+  if (v === null) return;
+  try { await api(`/api/sessions/${encodeURIComponent(st.id)}/hours`, {hours: v.trim()}); poll(); }
+  catch (e) { alert('못 바꿈: ' + e.message); }
+}
 function renderPrep(st) {
   S.flowFor = null;
   if (!$('prepbar')) $('view').innerHTML = `<div class="prep fade"><span id="pname" style="font-size:12px;letter-spacing:.32em;color:var(--dim)"></span>
     <div class="bar"><i id="prepbar" style="width:0%"></i></div>
     <div style="display:flex;justify-content:space-between;width:min(400px,80vw);font-size:12px;color:var(--dim)"><span id="plabel"></span><span id="ppct" style="color:var(--ink)"></span></div>
-    <p class="err" id="perr"></p><button class="pstop" id="pstop" hidden>중지</button></div>`;
+    <p class="err" id="perr"></p><button class="tchip" id="ptime"></button><button class="pstop" id="pstop" hidden>중지</button></div>`;
   $('pname').textContent = `${st.name} ${st.rev}`.toUpperCase();
   const shown = Math.max(S.prepShown?.[st.id] || 0, st.prep.progress);
   S.prepShown = {...(S.prepShown||{}), [st.id]: shown};
@@ -299,6 +312,7 @@ function renderPrep(st) {
   $('plabel').textContent = st.phase === 'failed' ? '준비 실패' : st.prep.label;
   $('ppct').textContent = Math.floor(shown * 100) + '%';
   $('perr').textContent = st.error || '';
+  const pt = $('ptime'); pt.textContent = st.phase === 'prep' ? timeText(st) : ''; pt.onclick = () => changeHours(st);
   const stop = $('pstop');
   stop.hidden = st.phase !== 'prep';
   stop.onclick = async () => { if (confirm('준비를 멈출까?')) { stop.disabled = true; await api(`/api/sessions/${encodeURIComponent(st.id)}/stop`, {}); poll(); } };
@@ -321,7 +335,7 @@ function buildFlow(st) {
   S.flowFor = st.id; let i = 0;
   const seq = (ids, side) => ids.map(id => nodeHtml(id, side, i++)).join('');
   $('view').innerHTML = `<div class="flow">
-    <div class="title"><span id="ftitle"></span><button id="fstop" hidden>중지</button></div>
+    <div class="title"><span id="ftitle"></span><button id="ftime" class="tchip" title="시간 제한 바꾸기"></button><button id="fstop" hidden>중지</button></div>
     <section class="panel" id="panel" aria-hidden="true"></section>
     <div class="col" id="col">
       <div class="box" id="b-hc"><div class="hd"><span class="bt">Harness Create</span><span class="bs" id="bs-hc"></span></div><div style="display:flex;flex-direction:column">${seq(HC)}</div></div>
@@ -343,6 +357,7 @@ function updateFlow(st) {
   if (!st || S.flowFor !== st.id) return;
   const s = st.status, done = (id) => s[id] === 'done';
   $('ftitle').textContent = `${st.name} ${st.rev} · ${st.mode} · ${PHASE[st.phase] || st.phase}`;
+  { const ft = $('ftime'); ft.textContent = st.phase === 'run' ? timeText(st) : ''; ft.onclick = () => changeHours(st); }
   $('fstop').hidden = !(st.phase === 'run' && S.sessions.find(x => x.id === st.id && !/pipeline$/.test(x.id)));
   for (const id of [...HC, ...VR]) {
     const n = $('n-' + id); n.className = `node rise ${n.classList.contains("left")?"left":""} ${s[id]} ${S.sel===id?"on":""}`;

@@ -110,7 +110,8 @@ class Run:
         self.fuzzers: dict[str, GlobalFuzzer] = {}
         self.builders: dict[str, Any] = {}
         self.builds: dict[str, int] = {}
-        self.deadline = time.time() + cfg.max_hours * 3600
+        self.started_at = time.time()
+        self._fixed_deadline = self.started_at + cfg.max_hours * 3600
         self.stop = asyncio.Event()
         self.terminal: str = ""
         self.sp_done = asyncio.Event()
@@ -132,6 +133,15 @@ class Run:
             (self.run_dir / directory).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ helpers
+    @property
+    def deadline(self) -> float:
+        """This scan's end: its equal share of the time the (possibly changed) pipeline limit leaves."""
+        if not self.cfg.deadline_file:
+            return self._fixed_deadline
+        from . import deadline as live
+        end = live.read(self.cfg.deadline_file, self._fixed_deadline)
+        return self.started_at + (end - self.started_at) / (self.cfg.contexts_after + 1)
+
     def out_of_time(self) -> bool:
         return self.stop.is_set() or time.time() >= self.deadline
 
@@ -1351,7 +1361,9 @@ class Run:
         spawn("confirm", self.confirmation_lane())
         analysis = [t for t in tasks if not t.get_name().startswith(("fuzz:", "confirm"))]
         try:
-            await asyncio.wait(analysis, timeout=max(1.0, self.deadline - time.time()))
+            # Waited in short steps so that a changed time limit is seen.
+            while not self.out_of_time() and any(not t.done() for t in analysis):
+                await asyncio.wait(analysis, timeout=min(30.0, max(1.0, self.deadline - time.time())))
         except asyncio.CancelledError:
             raise
         # Code Augur keeps falsifying after the agents are done, so the remaining budget is
@@ -1366,7 +1378,11 @@ class Run:
         self.emit(f"analysis lanes drained; fuzzing on for {extra / 60:.0f} min "
                   f"({remaining / 60:.0f} min of budget left)")
         if extra > 0 and not self.stop.is_set():
-            await asyncio.sleep(extra)
+            if self.cfg.fuzz_after_drain_minutes > 0:
+                await asyncio.sleep(extra)
+            else:
+                while not self.out_of_time():
+                    await asyncio.sleep(min(30.0, max(1.0, self.deadline - time.time())))
         self.stop.set()
         for task in tasks:
             task.cancel()

@@ -106,6 +106,10 @@ class RunConfig:
     # After the deadline: time allowed to confirm and validate crashes the fuzzers recorded while
     # they were being stopped, or that a cancelled lane left half-done.
     final_drain_minutes: float = 10.0
+    # The pipeline's live end time (deadline.py) and how many contexts are still to come after this
+    # scan: this scan's end is its equal share of what is left, recomputed when the file changes.
+    deadline_file: str = ""
+    contexts_after: int = 0
 
     def model_for(self, role: str) -> tuple[str, str]:
         tier = str(ROLE_TIER[role])
