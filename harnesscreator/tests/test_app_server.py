@@ -24,11 +24,11 @@ class AppServerParsingTest(unittest.TestCase):
     def test_cli_daybreak_feature_is_enabled_for_app_server(self) -> None:
         self.assertEqual(
             CodexAppServer(cwd=Path("."), daybreak=True)._command("/bin/codex"),
-            ["/bin/codex", "--enable", "cli_daybreak", "app-server"],
+            ["/bin/codex", "--enable", "cli_daybreak", "app-server", "-c", "mcp_servers={}"],
         )
         self.assertEqual(
             CodexAppServer(cwd=Path("."))._command("/bin/codex"),
-            ["/bin/codex", "app-server"],
+            ["/bin/codex", "app-server", "-c", "mcp_servers={}"],
         )
 
     def test_explicit_daybreak_model_compatibility(self) -> None:
