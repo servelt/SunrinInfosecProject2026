@@ -3829,6 +3829,7 @@ class HarnessCreator:
                     default_fi_cache_root(self.project.source_root),
                     excluded_paths=excluded_paths,
                     progress=self._emit,
+                    compile_database=self.project.analysis_compile_database,
                 ).run().report
             except FuzzIntrospectorError as exc:
                 if self.project.require_fuzz_introspector:

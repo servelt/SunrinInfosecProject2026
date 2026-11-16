@@ -55,12 +55,18 @@ class FuzzIntrospectorRunner:
         excluded_paths: Iterable[Path] = (),
         progress: Callable[[str], None] | None = None,
         timeout_seconds: int = 1800,
+        compile_database: Path | None = None,
     ):
         self.source_root = source_root.resolve()
         self.cache_root = cache_root.resolve()
         self.excluded_paths = tuple(path.resolve() for path in excluded_paths)
         self.progress = progress or (lambda _message: None)
         self.timeout_seconds = timeout_seconds
+        # With a compile database only the translation units the build compiles (and the headers
+        # next to them) are analysed.  Without it every C/C++ file under the root was taken:
+        # measured on redis 7.x, 504 files including deps/ (Lua, jemalloc, hiredis), tests and
+        # modules, and FI ran past 11 minutes; the program itself is 139 files under src/.
+        self.compiled: set[Path] | None = _compiled_files(compile_database) if compile_database else None
 
     def run(self) -> FuzzIntrospectorResult:
         version = self._installed_version()
@@ -204,6 +210,12 @@ class FuzzIntrospectorRunner:
                 if any(_is_relative_to(resolved, excluded) for excluded in self.excluded_paths):
                     continue
                 files.append(resolved)
+        if self.compiled:
+            folders = {path.parent for path in self.compiled}
+            kept = [path for path in files if path in self.compiled
+                    or (path.suffix.lower() in _HEADER_SUFFIXES and path.parent in folders)]
+            if any(path in self.compiled for path in kept):
+                return sorted(set(kept))
         return sorted(set(files))
 
     def _source_digest(self, source_files: list[Path], version: str) -> str:
@@ -267,3 +279,27 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 def _last_nonempty_line(value: str) -> str:
     return next((line.strip() for line in reversed(value.splitlines()) if line.strip()), "")
+
+
+_HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".inc"}
+
+
+def _compiled_files(compile_database: Path) -> set[Path]:
+    """Source files named by a compile_commands.json, resolved; empty when it cannot be read."""
+    try:
+        records = json.loads(Path(compile_database).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    files: set[Path] = set()
+    for record in records if isinstance(records, list) else []:
+        name = record.get("file") if isinstance(record, dict) else None
+        if not name:
+            continue
+        path = Path(name)
+        if not path.is_absolute():
+            path = Path(str(record.get("directory") or Path(compile_database).parent)) / path
+        try:
+            files.add(path.resolve())
+        except OSError:
+            continue
+    return files
