@@ -3,14 +3,14 @@
 #
 #   gh auth login                       # once: the repository is private
 #   curl -fsSL -H "Authorization: token $(gh auth token)" \
-#     https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/occulta/install.sh | bash
+#     https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/main/install.sh | bash
 #
 # Installs into ~/.occulta (app/ = git checkout, venv/ = Python packages) and puts the
 # `occulta` command in ~/.local/bin.  Run it again to repair an installation.
 set -euo pipefail
 
 REPO="${OCCULTA_REPO:-servelt/SunrinInfosecProject2026}"
-BRANCH="${OCCULTA_BRANCH:-occulta}"          # the repository holds other work; Occulta lives on this branch
+BRANCH="${OCCULTA_BRANCH:-main}"
 ROOT="${OCCULTA_HOME:-$HOME/.occulta}"
 APP="$ROOT/app"
 VENV="$ROOT/venv"

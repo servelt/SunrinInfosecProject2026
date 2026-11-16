@@ -15,7 +15,7 @@ for s in "$ROOT"/sessions/*/session.json; do
   fi
 done
 
-BRANCH=$(git -C "$APP" config occulta.branch || echo occulta)
+BRANCH=$(git -C "$APP" config occulta.branch || echo main)
 git -C "$APP" fetch --quiet --tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
 # Only release tags on Occulta's branch count: the repository also holds unrelated work.
 if [ "${1:-}" = "--main" ]; then target="origin/$BRANCH"

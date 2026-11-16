@@ -18,20 +18,20 @@
 sudo apt-get install -y gh || true   # 없으면 install.sh 가 설치하지만 로그인은 먼저 해야 한다
 gh auth login
 curl -fsSL -H "Authorization: token $(gh auth token)" \
-  https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/occulta/install.sh | bash
+  https://raw.githubusercontent.com/servelt/SunrinInfosecProject2026/main/install.sh | bash
 ```
 
 - 설치 위치: `~/.occulta/app` (소스), `~/.occulta/venv` (Python), 명령은 `~/.local/bin/occulta`
 - 시스템 패키지(clang, LLVM 20, gcc, bear, autotools, gh)는 `apt` 로 설치한다. sudo 비밀번호를 물을 수 있다.
 - LLM 은 Claude Code 를 쓴다: `npm install -g @anthropic-ai/claude-code` 후 `claude` 로 로그인.
-- 코드는 `servelt/SunrinInfosecProject2026` 저장소의 `occulta` 브랜치에 있다. 다른 곳이면 `OCCULTA_REPO=owner/name`, `OCCULTA_BRANCH=이름` 을 붙인다.
+- 코드는 `servelt/SunrinInfosecProject2026` 저장소의 `main` 브랜치에 있다. 다른 곳이면 `OCCULTA_REPO=owner/name`, `OCCULTA_BRANCH=이름` 을 붙인다.
 
 ## 사용
 
 ```bash
 occulta            # 웹 콘솔 열기
 occulta doctor     # 필요한 도구가 실제로 동작하는지 점검
-occulta update     # 최신 릴리스(v* 태그)로 업데이트 (--main 이면 occulta 브랜치 최신 커밋)
+occulta update     # 최신 릴리스(v* 태그)로 업데이트 (--main 이면 main 브랜치 최신 커밋)
 occulta version
 ```
 
@@ -41,10 +41,10 @@ occulta version
 
 ```bash
 echo 0.2.0 > VERSION && git commit -am "release 0.2.0"
-git tag v0.2.0 && git push origin occulta v0.2.0
+git tag v0.2.0 && git push origin main v0.2.0
 ```
 
-설치된 쪽은 `occulta` 브랜치에 있는 `v*` 태그만 따라간다. 태그를 찍기 전의 커밋은 배포되지 않는다.
+설치된 쪽은 `main` 브랜치에 있는 `v*` 태그만 따라간다. 태그를 찍기 전의 커밋은 배포되지 않는다.
 
 ## 지원 범위와 한계
 

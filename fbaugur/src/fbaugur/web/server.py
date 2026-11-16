@@ -51,7 +51,7 @@ def version_info() -> dict:
     if time.time() - _version_cache.get("at", 0) > 3600:
         latest = ""
         try:
-            branch = git("config", "occulta.branch") or "occulta"
+            branch = git("config", "occulta.branch") or "main"
             git("fetch", "--quiet", "--tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=60)
             tags = git("tag", "--list", "v*", "--merged", f"origin/{branch}").split()
             def key(tag: str):
