@@ -93,7 +93,7 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
         tiers.update({k: v for k, v in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)) if v})
         argv += ["--strong-model", tiers["1"], "--coding-model", tiers["2"], "--candidate-model", tiers["3"],
                  "--model", tiers["3"]]
-        argv += ["--ollama-url", args.ollama_url] if args.provider == "ollama" else ["--codex", args.codex]
+        argv += ["--ollama-url", args.ollama_url] if args.provider == "ollama" else ["--codex", args.codex, "--daybreak"]
     return argv
 
 

@@ -186,7 +186,8 @@ def sp_duplicate_of(new_description: str, existing: list[dict[str, Any]], cfg: R
         if cfg.provider == "codex":
             with tempfile.TemporaryDirectory(prefix="fba-dedup-") as tmp:
                 out = Path(tmp) / "answer.txt"
-                subprocess.run([cfg.codex_executable, "exec", "--ignore-user-config", "--skip-git-repo-check", "-m", model,
+                subprocess.run([cfg.codex_executable, "exec", "--ignore-user-config", "-c", "daybreak=true", "--enable",
+                                "cli_daybreak", "--skip-git-repo-check", "-m", model,
                                 "-s", "read-only",
                                 "-C", tmp, "-o", str(out), "-"], input=SP_DEDUP_SYSTEM + "\n\n" + prompt,
                                capture_output=True, text=True, timeout=300)

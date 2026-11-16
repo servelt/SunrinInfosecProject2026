@@ -104,7 +104,8 @@ def _ask(prompt: str, provider: str) -> list[dict[str, Any]]:
         if provider == "codex":
             with tempfile.TemporaryDirectory(prefix="occulta-label-") as tmp:
                 out = Path(tmp) / "answer.txt"
-                subprocess.run(["codex", "exec", "--ignore-user-config", "--skip-git-repo-check", "-m", model,
+                subprocess.run(["codex", "exec", "--ignore-user-config", "-c", "daybreak=true", "--enable", "cli_daybreak",
+                                "--skip-git-repo-check", "-m", model,
                                 "-s", "read-only", "-C", tmp, "-o", str(out), "-"],
                                input=prompt, capture_output=True, text=True, timeout=300)
                 text = out.read_text(encoding="utf-8") if out.is_file() else ""

@@ -70,7 +70,7 @@ async def make_llm(args: argparse.Namespace, run_dir: Path, extra_roles: tuple[s
         base = OllamaProvider(role_models=roles, role_efforts=efforts, url=args.ollama_url)
     else:
         from ..llm.codex_app_server import CodexAppServer
-        base = CodexAppServer(cwd=run_dir, model=model, role_models=roles,
+        base = CodexAppServer(cwd=run_dir, model=model, role_models=roles, daybreak=True,
                               effort="high" if args.effort == "max" else args.effort,
                               executable=args.codex, on_event=event)
     trajectory = run_dir / "trajectories" / "contexts-llm.jsonl"

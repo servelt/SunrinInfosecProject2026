@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import RunConfig
+from .config import CODEX_DAYBREAK, RunConfig
 from .store import Store, new_id
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
@@ -203,7 +203,8 @@ class AgentRunner:
             workdir = Path(tmp)
             server = json.loads(self._mcp_config(workdir, binding, run_id, tool_log).read_text())["mcpServers"]["fba"]
             env_table = "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in server["env"].items()) + "}"
-            argv = [self.cfg.codex_executable, "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-m", model,
+            argv = [self.cfg.codex_executable, "exec", "--json", "--ignore-user-config", *CODEX_DAYBREAK,
+                    "--skip-git-repo-check", "-m", model,
                     "-s", "read-only", "-C", str(workdir),
                     "-c", f"model_reasoning_effort={json.dumps(effort)}",
                     "-c", f"mcp_servers.fba.command={json.dumps(server['command'])}",

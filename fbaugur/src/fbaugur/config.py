@@ -41,6 +41,9 @@ DEFAULT_MAX_TURNS = {
 # model and a fast model (Codex: models_cache of codex-cli 0.167; Ollama: the cloud models
 # HarnessCreator already routes its roles to).
 PROVIDERS = ("claude", "codex", "ollama")
+# Every Codex request runs with Daybreak (/daybreak) enabled: --ignore-user-config drops the
+# user's `daybreak = true`, so it is set here explicitly.
+CODEX_DAYBREAK = ["-c", "daybreak=true", "--enable", "cli_daybreak"]
 PROVIDER_MODELS = {
     "claude": {"1": "claude-opus-5-5", "2": "claude-sonnet-5-5", "3": "claude-haiku-5-5"},
     "codex": {"1": "gpt-6-sol", "2": "gpt-6-sol", "3": "gpt-6-luna"},

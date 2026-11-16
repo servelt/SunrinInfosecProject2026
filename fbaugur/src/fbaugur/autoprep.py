@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import PROVIDER_MODELS
+from .config import CODEX_DAYBREAK, PROVIDER_MODELS
 
 REFERENCE = Path(__file__).resolve().parents[2] / "targets" / "tinyproxy"
 
@@ -240,7 +240,8 @@ class AutoPrep:
         """One agent session (continued when one exists); returns its final text."""
         (self.work / "profile").mkdir(parents=True, exist_ok=True)
         if self.provider == "codex":
-            argv = [self.codex, "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-m", self.model,
+            argv = [self.codex, "exec", "--json", "--ignore-user-config", *CODEX_DAYBREAK, "--skip-git-repo-check",
+                    "-m", self.model,
                     "-s", "workspace-write", "-C", str(self.work),
                     "-c", 'model_reasoning_effort="high"', "-c", "sandbox_workspace_write.network_access=true"]
             argv += (["resume", self.session_id, "-"] if self.session_id else ["-"])
