@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import sqlite3
 import time
 from pathlib import Path
@@ -51,6 +52,34 @@ def _rows(path: Path) -> list[dict[str, Any]]:
                 except ValueError:
                     pass
     return out
+
+
+_names_lock = threading.Lock()
+_names_cache: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
+
+
+def _function_names(path: Path) -> dict[str, str]:
+    """function_id -> name, read once per file version.
+
+    functions.jsonl holds every function's full source (183 MB for a large program).  Parsing it on
+    every status poll, from several pollers at once, kept the server busy until it stopped answering.
+    It is now parsed once, under a lock, and the names are kept until the file changes.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    key = (stat.st_mtime_ns, stat.st_size)
+    with _names_lock:
+        cached = _names_cache.get(str(path))
+        if cached and cached[0] == key:
+            return cached[1]
+        names: dict[str, str] = {}
+        for row in _rows(path):
+            if "function_id" in row:
+                names[row["function_id"]] = row.get("name", row["function_id"])
+        _names_cache[str(path)] = (key, names)
+        return names
 
 
 def read_log(path: Path | None) -> list[str]:
@@ -177,10 +206,7 @@ def _workflow_step(lines: list[str], number: str) -> str:
 def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
     finished = any(re.search(r"\[stage 1\] (finished|skipped)", l) or "[stage 2]" in l for l in lines)
     events = _rows(hc / "debug" / "agent-events.jsonl") if hc else []
-    fn_names: dict[str, str] = {}
-    if hc and (hc / "analysis" / "functions.jsonl").is_file():
-        for r in _rows(hc / "analysis" / "functions.jsonl"):
-            fn_names[r["function_id"]] = r.get("name", r["function_id"])
+    fn_names = _function_names(hc / "analysis" / "functions.jsonl") if hc else {}
     st = {
         "eg": "done" if any(e.get("agent") == "entry_generator" and e.get("event") == "completed" for e in events)
         or any("entry generation completed" in l for l in lines)
