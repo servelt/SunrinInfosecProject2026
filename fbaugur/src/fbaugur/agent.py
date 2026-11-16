@@ -162,8 +162,7 @@ class AgentRunner:
         # MCP tools) runs on an Ollama model when Claude Code is pointed at it.
         env = None
         if self.cfg.provider == "ollama":
-            env = dict(os.environ, ANTHROPIC_BASE_URL=self.cfg.ollama_url.rstrip("/"),
-                       ANTHROPIC_AUTH_TOKEN="ollama", ANTHROPIC_API_KEY="")
+            env = ollama_env(self.cfg, model)
         with tempfile.TemporaryDirectory(prefix="fbaugur-agent-") as tmp:
             workdir = Path(tmp)
             config = self._mcp_config(workdir, binding, run_id, tool_log)
@@ -204,7 +203,7 @@ class AgentRunner:
             workdir = Path(tmp)
             server = json.loads(self._mcp_config(workdir, binding, run_id, tool_log).read_text())["mcpServers"]["fba"]
             env_table = "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in server["env"].items()) + "}"
-            argv = [self.cfg.codex_executable, "exec", "--json", "--skip-git-repo-check", "-m", model,
+            argv = [self.cfg.codex_executable, "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-m", model,
                     "-s", "read-only", "-C", str(workdir),
                     "-c", f"model_reasoning_effort={json.dumps(effort)}",
                     "-c", f"mcp_servers.fba.command={json.dumps(server['command'])}",
@@ -310,3 +309,33 @@ def parse_codex(run_id: str, role: str, stdout: str, stderr: str, tool_log: Path
         return AgentResult(run_id, role, "completed", text.strip(), turns, tool_calls, "", usage)
     return AgentResult(run_id, role, "error", text.strip(), turns, tool_calls,
                        (errors[-1] if errors else stderr.strip()[-1500:] or "no turn.completed event"), usage)
+
+
+def ollama_env(cfg: Any, model: str) -> dict[str, str]:
+    """Claude Code as the agent loop, every request answered by Ollama.
+
+    Besides the main model, Claude Code calls its own helper models (the haiku/sonnet/opus aliases,
+    the small fast model); they are mapped to the same Ollama model so nothing reaches Anthropic."""
+    return dict(os.environ, ANTHROPIC_BASE_URL=cfg.ollama_url.rstrip("/"), ANTHROPIC_AUTH_TOKEN="ollama",
+                ANTHROPIC_API_KEY="", ANTHROPIC_MODEL=model, ANTHROPIC_SMALL_FAST_MODEL=model,
+                ANTHROPIC_DEFAULT_HAIKU_MODEL=model, ANTHROPIC_DEFAULT_SONNET_MODEL=model,
+                ANTHROPIC_DEFAULT_OPUS_MODEL=model, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+                DISABLE_TELEMETRY="1", DISABLE_ERROR_REPORTING="1")
+
+
+def check_backend(cfg: Any) -> str:
+    """What is missing for the chosen LLM back end, or "" when it can be used."""
+    import shutil
+    import urllib.request
+    if cfg.provider == "codex":
+        return "" if shutil.which(cfg.codex_executable) else f"Codex CLI not found: {cfg.codex_executable}"
+    if not shutil.which(cfg.claude_executable):
+        return (f"Claude Code not found: {cfg.claude_executable}" if cfg.provider == "claude" else
+                f"Claude Code (used only as the agent runner; every request goes to Ollama) not found: "
+                f"{cfg.claude_executable}")
+    if cfg.provider == "ollama":
+        try:
+            urllib.request.urlopen(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=5).read()
+        except OSError as exc:
+            return f"Ollama is not answering at {cfg.ollama_url}: {exc}"
+    return ""

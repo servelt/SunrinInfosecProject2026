@@ -86,6 +86,9 @@ class CodexAppServer:
             # Explicit opt-in also works with older 0.161-0.163 CLI builds.
             command.extend(["--enable", "cli_daybreak"])
         command.append("app-server")
+        # Only the client's own requests: MCP servers registered in the user's ~/.codex/config.toml
+        # (an IDA server, for example) are not offered to these threads.
+        command.extend(["-c", "mcp_servers={}"])
         return command
 
     async def start(self) -> dict[str, Any]:

@@ -240,7 +240,7 @@ class AutoPrep:
         """One agent session (continued when one exists); returns its final text."""
         (self.work / "profile").mkdir(parents=True, exist_ok=True)
         if self.provider == "codex":
-            argv = [self.codex, "exec", "--json", "--skip-git-repo-check", "-m", self.model,
+            argv = [self.codex, "exec", "--json", "--ignore-user-config", "--skip-git-repo-check", "-m", self.model,
                     "-s", "workspace-write", "-C", str(self.work),
                     "-c", 'model_reasoning_effort="high"', "-c", "sandbox_workspace_write.network_access=true"]
             argv += (["resume", self.session_id, "-"] if self.session_id else ["-"])
@@ -248,12 +248,13 @@ class AutoPrep:
         else:
             argv = [self.claude, "-p", "--model", self.model, "--output-format", "stream-json", "--verbose",
                     "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
-                    "--add-dir", str(self.work), "--setting-sources", "", "--max-turns", "200"]
+                    "--add-dir", str(self.work), "--setting-sources", "", "--strict-mcp-config", "--max-turns", "200"]
             argv += ["--resume", self.session_id] if self.session_id else []
             env = None
             if self.provider == "ollama":
-                env = dict(os.environ, ANTHROPIC_BASE_URL=self.ollama_url.rstrip("/"), ANTHROPIC_AUTH_TOKEN="ollama",
-                           ANTHROPIC_API_KEY="")
+                from types import SimpleNamespace
+                from .agent import ollama_env
+                env = ollama_env(SimpleNamespace(ollama_url=self.ollama_url), self.model)
         process = subprocess.Popen(argv, cwd=str(self.work), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
         process.stdin.write(prompt)

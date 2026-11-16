@@ -10,6 +10,11 @@ records stage 1 already wrote into display labels, and the answer is kept next t
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
+import tempfile
+import os
+import contextvars
 import re
 import subprocess
 import threading
@@ -86,14 +91,41 @@ def load(hc: Path) -> dict[str, dict[str, str]]:
         return {}
 
 
-def _ask(prompt: str, claude: str) -> list[dict[str, Any]]:
-    proc = subprocess.run([claude, "-p", "--model", MODEL, "--output-format", "json", "--tools", "",
-                           "--disable-slash-commands", "--max-turns", "1"],
-                          input=prompt, capture_output=True, text=True, timeout=240)
+# The labels follow the LLM back end the scan was started with: no other vendor is called.
+CURRENT = contextvars.ContextVar("occulta_label_provider", default="claude")
+FAST_MODELS = {"claude": MODEL, "codex": "gpt-6-luna", "ollama": "glm-5.3-flash:cloud"}
+OLLAMA_URL = os.environ.get("OCCULTA_OLLAMA_URL", "http://localhost:11434")
+
+
+def _ask(prompt: str, provider: str) -> list[dict[str, Any]]:
+    model = FAST_MODELS.get(provider, MODEL)
+    text = ""
     try:
-        text = json.loads(proc.stdout).get("result", "")
-    except ValueError:
-        text = proc.stdout
+        if provider == "codex":
+            with tempfile.TemporaryDirectory(prefix="occulta-label-") as tmp:
+                out = Path(tmp) / "answer.txt"
+                subprocess.run(["codex", "exec", "--ignore-user-config", "--skip-git-repo-check", "-m", model,
+                                "-s", "read-only", "-C", tmp, "-o", str(out), "-"],
+                               input=prompt, capture_output=True, text=True, timeout=300)
+                text = out.read_text(encoding="utf-8") if out.is_file() else ""
+        elif provider == "ollama":
+            request = urllib.request.Request(
+                OLLAMA_URL.rstrip("/") + "/api/chat", method="POST", headers={"Content-Type": "application/json"},
+                data=json.dumps({"model": model, "stream": False,
+                                 "messages": [{"role": "user", "content": prompt}]}).encode())
+            with urllib.request.urlopen(request, timeout=300) as response:
+                text = json.loads(response.read()).get("message", {}).get("content", "")
+        else:
+            proc = subprocess.run(["claude", "-p", "--model", model, "--output-format", "json", "--tools", "",
+                                   "--disable-slash-commands", "--max-turns", "1", "--strict-mcp-config",
+                                   "--setting-sources", ""],
+                                  input=prompt, capture_output=True, text=True, timeout=240)
+            try:
+                text = json.loads(proc.stdout).get("result", "")
+            except ValueError:
+                text = proc.stdout
+    except (OSError, ValueError, subprocess.SubprocessError, urllib.error.URLError):
+        return []
     match = re.search(r"\[.*\]", text, re.S)
     if not match:
         return []
@@ -105,7 +137,8 @@ def _ask(prompt: str, claude: str) -> list[dict[str, Any]]:
 
 
 def ensure(hc: Path, entries: list[dict[str, Any]], contexts: list[dict[str, Any]],
-           harnesses: list[dict[str, Any]] | None = None, claude: str = "claude") -> None:
+           harnesses: list[dict[str, Any]] | None = None, claude: str | None = None) -> None:
+    provider = claude or CURRENT.get()
     """Label whatever has no label yet, in a background thread (one at a time per run)."""
     have = load(hc)
     todo_e = [e for e in entries if e["id"] not in have]
@@ -124,15 +157,15 @@ def ensure(hc: Path, entries: list[dict[str, Any]], contexts: list[dict[str, Any
             found: dict[str, dict[str, str]] = {}
             for i in range(0, len(todo_e), 40):
                 batch = todo_e[i:i + 40]
-                for item in _ask(ENTRY_PROMPT + json.dumps(batch, ensure_ascii=False, indent=1), claude):
+                for item in _ask(ENTRY_PROMPT + json.dumps(batch, ensure_ascii=False, indent=1), provider):
                     found[str(item["id"])] = {"code": str(item.get("code", ""))[:120], "summary": str(item.get("summary", ""))[:60]}
             if todo_c:
-                for item in _ask(CONTEXT_PROMPT + json.dumps(todo_c, ensure_ascii=False, indent=1), claude):
+                for item in _ask(CONTEXT_PROMPT + json.dumps(todo_c, ensure_ascii=False, indent=1), provider):
                     found[ctx_key(str(item["id"]))] = {"name": str(item.get("name", ""))[:40],
                                               "description": str(item.get("description", ""))[:200]}
             for h in todo_h:
                 item = {k: v for k, v in h.items() if k != "key"}
-                for answer in _ask(HARNESS_PROMPT + json.dumps([item], ensure_ascii=False, indent=1), claude)[:1]:
+                for answer in _ask(HARNESS_PROMPT + json.dumps([item], ensure_ascii=False, indent=1), provider)[:1]:
                     found[h["key"]] = {"name": str(answer.get("name", ""))[:40],
                                        "description": str(answer.get("description", ""))[:200]}
             if found:
@@ -167,7 +200,8 @@ def direction_key(direction_id: str) -> str:
     return f"{direction_id}@dir{DIRECTION_VERSION}"
 
 
-def ensure_directions(scan: Path, directions: list[dict[str, Any]], claude: str = "claude") -> None:
+def ensure_directions(scan: Path, directions: list[dict[str, Any]], claude: str | None = None) -> None:
+    provider = claude or CURRENT.get()
     """Korean labels for one scan's directions, kept in `<scan>/occulta-labels.json`."""
     have = load(scan)
     todo = [d for d in directions if direction_key(d["id"]) not in have]
@@ -182,7 +216,7 @@ def ensure_directions(scan: Path, directions: list[dict[str, Any]], claude: str 
     def work():
         try:
             found = {}
-            for item in _ask(DIRECTION_PROMPT + json.dumps(todo, ensure_ascii=False, indent=1), claude):
+            for item in _ask(DIRECTION_PROMPT + json.dumps(todo, ensure_ascii=False, indent=1), provider):
                 found[direction_key(str(item["id"]))] = {"name": str(item.get("name", ""))[:40],
                                                          "description": str(item.get("description", ""))[:200]}
             if found:
@@ -228,7 +262,8 @@ def item_key(kind: str, item_id: str) -> str:
     return f"{item_id}@{kind}{SCAN_PROMPTS[kind][0]}"
 
 
-def ensure_scan_items(scan: Path, kind: str, items: list[dict[str, Any]], claude: str = "claude") -> None:
+def ensure_scan_items(scan: Path, kind: str, items: list[dict[str, Any]], claude: str | None = None) -> None:
+    provider = claude or CURRENT.get()
     have = load(scan)
     todo = [i for i in items if item_key(kind, str(i["id"])) not in have]
     key = f"{scan}#{kind}"
@@ -243,7 +278,7 @@ def ensure_scan_items(scan: Path, kind: str, items: list[dict[str, Any]], claude
         try:
             for start in range(0, len(todo), 25):
                 found = {}
-                for got in _ask(SCAN_PROMPTS[kind][1] + json.dumps(todo[start:start + 25], ensure_ascii=False, indent=1), claude):
+                for got in _ask(SCAN_PROMPTS[kind][1] + json.dumps(todo[start:start + 25], ensure_ascii=False, indent=1), provider):
                     found[item_key(kind, str(got["id"]))] = {"name": str(got.get("name", ""))[:40],
                                                              "description": str(got.get("description", ""))[:200],
                                                              "reason": str(got.get("reason", ""))[:120]}

@@ -599,6 +599,7 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def session_status(session: dict[str, Any]) -> dict[str, Any]:
+    labels.CURRENT.set(session.get("provider") or "claude")
     lines = read_log(Path(session["log"])) if session.get("log") else []
     pipeline_dir = Path(session["pipeline_dir"]) if session.get("pipeline_dir") else pipeline_dir_of(lines)
     alive = pid_alive(session.get("pid")) if session.get("pid") else \

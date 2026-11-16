@@ -178,8 +178,10 @@ async def _scan(args: argparse.Namespace) -> int:
                 raise SystemExit(f"unknown role {role!r}; roles: {', '.join(sorted(DEFAULT_MAX_TURNS))}")
             cfg.max_turns[role] = int(number)
         cfg.save()
-    if not shutil.which(cfg.claude_executable):
-        raise SystemExit(f"Claude Code executable not found: {cfg.claude_executable}")
+    from .agent import check_backend
+    problem = check_backend(cfg)
+    if problem:
+        raise SystemExit(problem)
     _emit(f"run directory: {run_dir}")
     _emit(f"deliveries: {deliveries} | models: {cfg.models} | wall clock: {cfg.max_hours} h")
     run = Run(run_dir, cfg, harnesscreator_src=args.harnesscreator_src.resolve(), emit=_emit)

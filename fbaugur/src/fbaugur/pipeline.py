@@ -240,8 +240,12 @@ async def run(args, emit) -> int:
         emit("no built harness, so there is nothing to analyse; stage 1's log holds the reason")
         return 3
 
-    if not shutil.which(args.claude):
-        emit(f"Claude Code executable not found: {args.claude}")
+    from .agent import check_backend
+    problem = check_backend(RunConfig(run_dir=".", hc_run=".", context_id="", deliveries=[],
+                                      claude_executable=args.claude, provider=args.provider,
+                                      codex_executable=args.codex, ollama_url=args.ollama_url))
+    if problem:
+        emit(problem)
         return 3
     # Every built context is analysed, not just the first.  A channel can hold several
     # distinct contexts -- on LightFTP the tcp/stream contexts were the control connection
