@@ -32,6 +32,8 @@ aside{width:236px;flex:none;min-height:100vh;padding:14px 10px;border-right:1px 
 .newscan{display:flex;align-items:center;gap:10px;min-height:34px;padding:0 10px;border:0;border-radius:8px;background:transparent;font-size:13px}
 .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.grid3 input{font-size:13px}
 .seg-s button{font-size:12.5px;padding:6px 14px}
+.updnote{position:fixed;top:14px;right:18px;z-index:5;border:1px solid rgba(255,255,255,.3);border-radius:999px;background:rgba(0,0,0,.6);color:#fff;font-size:12px;padding:6px 14px;cursor:pointer;box-shadow:0 0 16px rgba(255,255,255,.25)}
+.updnote.bad{color:var(--pink);border-color:rgba(255,179,179,.35);box-shadow:none;cursor:default}
 .ver{margin-top:auto;padding:10px 12px 4px;font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:6px}
 .ver button{align-self:flex-start;border:1px solid rgba(255,255,255,.25);border-radius:999px;background:transparent;color:#fff;font-size:11.5px;padding:4px 12px;cursor:pointer;box-shadow:0 0 12px rgba(255,255,255,.18)}
 .srow{position:relative}.srow .del{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:28px;height:28px;border:0;border-radius:7px;background:transparent;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s,background .15s;cursor:pointer}
@@ -137,6 +139,7 @@ label.f input{background:transparent;border:0;border-bottom:1px solid rgba(255,2
 <div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:11.5px;letter-spacing:.24em;color:var(--dim);padding:0 12px 8px">기록</span><div id="slist"></div></div>
 <div class="ver" id="ver"></div>
 </aside>
+<button class="updnote" id="updnote" hidden></button>
 <main id="main">
 <button class="icon menu" id="menu" aria-label="기록 열기"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="#F5F5F7" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
 <div id="view"></div>
@@ -178,12 +181,16 @@ async function loadVersion() {
   try {
     const v = await api('/api/version'), el = $('ver');
     el.innerHTML = `<span>${esc(v.current || v.version)}</span>` + (v.update ? `<button id="upd">업데이트 ${esc(v.latest)}</button>` : '');
-    if (v.update) $('upd').onclick = async () => {
+    const note = $('updnote');
+    const run = async (btn) => {
       if (!confirm(`${v.latest} 로 업데이트할까? 서버가 잠깐 다시 시작돼.`)) return;
-      $('upd').disabled = true; $('upd').textContent = '업데이트 중…';
+      btn.disabled = true; btn.textContent = '업데이트 중…';
       try { await api('/api/update', {}); setTimeout(() => location.reload(), 4000); }
       catch (e) { alert('업데이트 못 함: ' + e.message); loadVersion(); }
     };
+    if (v.update) { $('upd').onclick = () => run($('upd')); note.hidden = false; note.className = 'updnote'; note.textContent = `새 버전 ${v.latest} · 업데이트`; note.onclick = () => run(note); }
+    else if (v.check_error) { note.hidden = false; note.className = 'updnote bad'; note.textContent = '업데이트 확인 실패 (GitHub 인증)'; note.title = v.check_error; note.onclick = null; }
+    else note.hidden = true;
   } catch (e) {}
 }
 loadVersion();

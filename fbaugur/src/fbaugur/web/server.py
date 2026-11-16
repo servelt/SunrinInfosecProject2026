@@ -52,7 +52,10 @@ def version_info() -> dict:
         latest = ""
         try:
             branch = git("config", "occulta.branch") or "main"
-            git("fetch", "--quiet", "--tags", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}", timeout=60)
+            fetched = subprocess.run(["git", "-C", str(APP_ROOT), "fetch", "--quiet", "--tags", "origin",
+                                      f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+                                     capture_output=True, text=True, timeout=60)
+            _version_cache["error"] = "" if fetched.returncode == 0 else (fetched.stderr.strip()[-200:] or "git fetch failed")
             tags = git("tag", "--list", "v*", "--merged", f"origin/{branch}").split()
             def key(tag: str):
                 return tuple(int(p) if p.isdigit() else 0 for p in tag.lstrip("v").split("."))
@@ -62,7 +65,7 @@ def version_info() -> dict:
         _version_cache.update(at=time.time(), latest=latest)
     latest = _version_cache.get("latest", "")
     head_tag = git("describe", "--tags", "--exact-match")
-    return {"version": version, "current": current, "latest": latest,
+    return {"version": version, "current": current, "latest": latest, "check_error": _version_cache.get("error", ""),
             "update": bool(latest) and latest != head_tag and (APP_ROOT / ".git").exists()}
 
 
