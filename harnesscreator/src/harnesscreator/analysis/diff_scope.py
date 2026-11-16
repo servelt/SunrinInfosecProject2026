@@ -118,7 +118,7 @@ def _indirect_callers(functions: dict[str, Any]) -> dict[tuple[int, str], set[st
     return table
 
 
-def diff_scope(functions: dict[str, Any], edges: list[Any], diff_text: str, max_depth: int = 6) -> dict[str, Any]:
+def diff_scope(functions: dict[str, Any], edges: list[Any], diff_text: str, max_depth: int = 0) -> dict[str, Any]:
     """Changed functions and their transitive callers.  `scope` is None when nothing matched."""
     changed = changed_lines(diff_text)
     seeds: list[str] = []

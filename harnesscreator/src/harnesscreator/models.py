@@ -328,7 +328,7 @@ class ProjectSpec:
     entry_batch_size: int = 32
     # Delta scans: a unified diff; Entries are searched only where data can reach changed code.
     entry_diff: Path | None = None
-    entry_diff_depth: int = 6
+    entry_diff_depth: int = 0
     # Optional output produced by the unmodified (or export-only patched)
     # research implementations.  HarnessCreator consumes these files through
     # process/data adapters; it does not reimplement their analyses.
