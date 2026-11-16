@@ -111,4 +111,4 @@ fi
 
 echo
 say "설치 끝. 점검: occulta doctor   실행: occulta   업데이트: occulta update"
-"$APP/bin/occulta" doctor || true
+bash "$APP/bin/occulta" doctor || true

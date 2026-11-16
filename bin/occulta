@@ -10,8 +10,8 @@ PY="${OCCULTA_PYTHON:-$ROOT/venv/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3)"
 
 case "${1:-}" in
-  update)  shift; exec "$APP/bin/occulta-update" "$@" ;;
-  doctor)  shift; exec "$APP/bin/occulta-doctor" "$@" ;;
+  update)  shift; exec bash "$APP/bin/occulta-update" "$@" ;;      # bash: works without the file's x bit
+  doctor)  shift; exec bash "$APP/bin/occulta-doctor" "$@" ;;
   version|--version)
     echo "occulta $(cat "$APP/VERSION") ($(git -C "$APP" describe --tags --always --dirty 2>/dev/null || echo 'no git'))"
     exit 0 ;;

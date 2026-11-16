@@ -31,6 +31,7 @@ if [ -n "$(git -C "$APP" status --porcelain)" ]; then
   echo "[occulta] 설치 폴더의 로컬 변경을 보관함: git -C $APP stash list"
 fi
 git -C "$APP" checkout --quiet "$new"
+chmod +x "$APP/bin/"* "$APP/install.sh" 2>/dev/null || true
 if [ -n "$deps_changed" ] && [ -x "$VENV/bin/python" ]; then
   echo "[occulta] 의존성이 바뀌어서 다시 설치"
   "$VENV/bin/python" -m pip install -q -e "$APP/harnesscreator" -e "$APP/fbaugur"

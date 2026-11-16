@@ -150,7 +150,7 @@ def _handler(sessions: Sessions):
                                        body.get("commit", ""), int(hours), provider=provider, models=models)
                     return self._json({"id": s["id"]})
                 if url.path == "/api/update":
-                    out = subprocess.run([str(APP_ROOT / "bin" / "occulta-update")], capture_output=True, text=True,
+                    out = subprocess.run(["bash", str(APP_ROOT / "bin" / "occulta-update")], capture_output=True, text=True,
                                          timeout=900)
                     if out.returncode != 0:
                         return self._error(409 if out.returncode == 2 else 500, (out.stdout + out.stderr).strip()[-600:])
