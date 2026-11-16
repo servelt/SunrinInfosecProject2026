@@ -216,10 +216,8 @@ function renderHome() {
       </div>
     </div>
     <div style="display:flex;flex-direction:column;gap:14px">
-      <span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">MODEL</span>
+      <span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">LLM</span>
       <div class="seg seg-s">${PROVIDERS.map(p => `<button data-p="${p.id}" class="${f.provider===p.id?'on':''}">${p.label}</button>`).join('')}</div>
-      <div class="grid3">${TIERS.map((t, i) => `<label class="f"><span>${t}</span><input data-t="${i+1}" value="${esc(tierModels()[i+1])}" autocomplete="off" spellcheck="false"></label>`).join('')}</div>
-      <em class="hint" style="font-style:normal">${esc((PROVIDERS.find(p => p.id === f.provider) || {}).note || '')}</em>
     </div>
     ${delta ? `<div style="display:flex;flex-direction:column;gap:10px"><span style="font-size:12px;letter-spacing:.18em;color:var(--dim)">COMMIT</span><div class="commits" id="commits"></div><span class="hint" id="cmsg"></span></div>` : ''}
     <span class="hint bad" id="serr" style="text-align:center"></span>
@@ -227,19 +225,18 @@ function renderHome() {
   </div>`;
   $('mfull').onclick = () => { f.mode = 'full'; renderHome(); };
   $('mdelta').onclick = () => { f.mode = 'delta'; renderHome(); loadCommits(); };
-  $('repo').oninput = (e) => { f.repo = e.target.value; f.commits = []; clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
+  $('repo').oninput = (e) => { f.repo = e.target.value; f.commits = []; updateHomeBits(); clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
   $('branch').oninput = (e) => { f.branch = e.target.value; clearTimeout(S.ct); if (delta) S.ct = setTimeout(loadCommits, 700); };
   $('hours').oninput = (e) => { f.hours = e.target.value; updateHomeBits(); };
   $('start').onclick = startScan;
   for (const b of document.querySelectorAll('.seg-s button')) b.onclick = () => { f.provider = b.dataset.p; f.models = null; renderHome(); };
-  for (const inp of document.querySelectorAll('input[data-t]')) inp.oninput = (e) => { f.models = {...tierModels(), [e.target.dataset.t]: e.target.value}; };
   updateHomeBits(); if (delta) renderCommits();
 }
 // Defaults per back end (fbaugur/config.py PROVIDER_MODELS): reasoning / main / fast tiers.
 const PROVIDERS = [
-  {id:'claude', label:'Claude', models:{1:'claude-opus-5-5', 2:'claude-sonnet-5-5', 3:'claude-haiku-5-5'}, note:'Claude Code 로그인 계정으로 실행'},
-  {id:'codex', label:'Codex', models:{1:'gpt-6-sol', 2:'gpt-6-sol', 3:'gpt-6-luna'}, note:'codex exec (Codex CLI 로그인 필요)'},
-  {id:'ollama', label:'Ollama', models:{1:'glm-5.3:cloud', 2:'kimi-k2.7-code:cloud', 3:'glm-5.3-flash:cloud'}, note:'Ollama(localhost:11434)의 Anthropic 호환 API 로 Claude Code 실행'},
+  {id:'claude', label:'Claude', models:{1:'claude-opus-5-5', 2:'claude-sonnet-5-5', 3:'claude-haiku-5-5'}},
+  {id:'codex', label:'Codex', models:{1:'gpt-6-sol', 2:'gpt-6-sol', 3:'gpt-6-luna'}},
+  {id:'ollama', label:'Ollama', models:{1:'glm-5.3:cloud', 2:'kimi-k2.7-code:cloud', 3:'glm-5.3-flash:cloud'}},
 ];
 const TIERS = ['REASONING', 'MAIN', 'FAST'];
 function tierModels() { const f = S.form; return f.models || (PROVIDERS.find(p => p.id === f.provider) || PROVIDERS[0]).models; }
@@ -267,7 +264,7 @@ async function loadCommits() {
 }
 async function startScan() {
   const f = S.form; $('start').disabled = true; $('serr').textContent = '';
-  try { const d = await api('/api/scan', {repo:f.repo, branch:f.branch, mode:f.mode, commit:f.commit, hours:f.hours, provider:f.provider, models:tierModels()}); await loadSessions(); openSession(d.id); }
+  try { const d = await api('/api/scan', {repo:f.repo, branch:f.branch, mode:f.mode, commit:f.commit, hours:f.hours, provider:f.provider}); await loadSessions(); openSession(d.id); }
   catch (e) { $('serr').textContent = e.message; updateHomeBits(); }
 }
 

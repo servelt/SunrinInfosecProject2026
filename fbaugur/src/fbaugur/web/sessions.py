@@ -201,9 +201,14 @@ class Sessions:
         return "run" if log and log.is_file() and time.time() - log.stat().st_mtime < 120 else "stopped"
 
     # ------------------------------------------------------------------ profiles
+    @property
+    def auto_targets(self) -> Path:
+        """Profiles the preparation agent produced and Occulta verified (autoprep.save_profile)."""
+        return self.home / "targets"
+
     def profile_for(self, repo: str) -> tuple[Path, dict[str, Any]] | None:
         key = normalise_repo(repo).lower()
-        for path in sorted(self.targets.glob("*/profile.json")):
+        for path in sorted(self.targets.glob("*/profile.json")) + sorted(self.auto_targets.glob("*/profile.json")):
             data = json.loads(path.read_text(encoding="utf-8"))
             if any(normalise_repo(r).lower() == key for r in data.get("repos", [])):
                 return path.parent, data
@@ -259,6 +264,30 @@ class Sessions:
         else:
             self.update(sid, state="stopped")
 
+    def _auto_prepare(self, sid: str, session: dict[str, Any], work: Path, hc_root: Path) -> tuple[Path, dict[str, Any]]:
+        """No profile for this repository: an agent writes one in WORK/profile, Occulta checks it."""
+        from ..autoprep import AutoPrep, default_model, save_profile
+        provider = session.get("provider") or "claude"
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", session["repo"].split("/")[-1]).lower() or "target"
+        self._log(sid, f"[autoprep] no profile for {session['repo']}: the preparation agent works it out")
+        self.update(sid, prep_progress=0.15, prep_label="자동 준비: 빌드 방법 찾는 중")
+        steps = {"n": 0}
+
+        def progress(label: str) -> None:
+            steps["n"] += 1
+            self.update(sid, prep_progress=min(0.48, 0.15 + 0.004 * steps["n"]), prep_label="자동 준비: " + label)
+
+        prep = AutoPrep(work, repo=session["repo"], name=name, provider=provider,
+                        model=default_model(provider, session.get("models")), python=self.python, hc=hc_root,
+                        emit=lambda m: self._log(sid, m), progress=progress)
+        ok, problems, summary = prep.run()
+        if not ok:
+            raise RuntimeError("자동 준비가 실패함: " + " / ".join(p[:200] for p in problems[:3]))
+        dest = save_profile(work, self.auto_targets, name)
+        self._log(sid, f"[autoprep] profile verified and kept in {dest}")
+        self.update(sid, prep_progress=0.5, prep_label="자동 준비 완료")
+        return dest, json.loads((dest / "profile.json").read_text(encoding="utf-8"))
+
     def _log(self, sid: str, text: str) -> None:
         with open(self.home / "sessions" / sid / "pipeline.log", "a", encoding="utf-8") as handle:
             handle.write(time.strftime("[%H:%M:%S] ") + text + "\n")
@@ -290,27 +319,28 @@ class Sessions:
                                       capture_output=True, text=True, timeout=120)
                 (work / "delta.diff").write_text(diff.stdout, encoding="utf-8")
             self.update(sid, prep_progress=0.12, prep_label="대상 준비")
+            hc_root = self.package_root.parent.parent / "harnesscreator"
+            if not (hc_root / "src" / "harnesscreator").is_dir():
+                hc_root = Path(os.environ.get("HARNESSCREATOR", hc_root))
+            prepared = False
             if found is None:
-                raise RuntimeError("이 저장소의 준비 프로필(targets/<이름>/profile.json)이 없어. 빌드·실행 방법을 자동으로 "
-                                   "알아내는 기능은 아직 없어서, 지금은 프로필이 있는 저장소만 스캔할 수 있어: "
-                                   + ", ".join(self.profiles()))
+                found = self._auto_prepare(sid, session, work, hc_root)
+                prepared = True       # the check already ran prepare.sh on this WORK
             profile_dir, profile = found
-            env = dict(os.environ, WORK=str(work), PROFILE=str(profile_dir), PY=self.python,
-                       HC=str(self.package_root.parent.parent / "harnesscreator"))
-            if not (Path(env["HC"]) / "src" / "harnesscreator").is_dir():
-                env["HC"] = os.environ.get("HARNESSCREATOR", env["HC"])
-            proc = subprocess.Popen(["bash", str(profile_dir / profile["prepare"])], cwd=str(work), env=env,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            steps = 0
-            for line in proc.stdout:
-                line = line.rstrip()
-                self._log(sid, "  " + line)
-                m = re.match(r"\[prep\] (.+)", line)
-                if m:
-                    steps += 1
-                    self.update(sid, prep_progress=min(0.5, 0.12 + 0.1 * steps), prep_label=m.group(1))
-            if proc.wait() != 0:
-                raise RuntimeError(f"대상 준비가 실패함 (exit {proc.returncode}); {work}/*.log 확인")
+            env = dict(os.environ, WORK=str(work), PROFILE=str(profile_dir), PY=self.python, HC=str(hc_root))
+            if not prepared:
+                proc = subprocess.Popen(["bash", str(profile_dir / profile["prepare"])], cwd=str(work), env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                steps = 0
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    self._log(sid, "  " + line)
+                    m = re.match(r"\[prep\] (.+)", line)
+                    if m:
+                        steps += 1
+                        self.update(sid, prep_progress=min(0.5, 0.12 + 0.1 * steps), prep_label=m.group(1))
+                if proc.wait() != 0:
+                    raise RuntimeError(f"대상 준비가 실패함 (exit {proc.returncode}); {work}/*.log 확인")
             hours = UNLIMITED_HOURS if int(session["hours"]) == -1 else float(session["hours"])
             args = [self.python, "-m", "fbaugur.cli", "pipeline", str(work / "source"), "--name", profile["name"],
                     "--output", str(root / "runs"), "--python", self.python, "--max-hours", str(hours),
