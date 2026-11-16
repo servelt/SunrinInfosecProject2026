@@ -93,9 +93,12 @@ fi
 # ---------------------------------------------------------------- command
 mkdir -p "$HOME/.local/bin"
 ln -sf "$APP/bin/occulta" "$HOME/.local/bin/occulta"
+# /usr/local/bin is on every shell's PATH, also the shell that ran this installer (root's PATH often
+# lacks ~/.local/bin, and an open terminal never re-reads .bashrc).
+$SUDO ln -sf "$APP/bin/occulta" /usr/local/bin/occulta 2>/dev/null || true
 chmod +x "$APP/bin/"*
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-  [ -f "$rc" ] && ! grep -q '.local/bin' "$rc" && echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+  if [ -f "$rc" ] && ! grep -q '.local/bin' "$rc"; then echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"; fi
 done
 
 # ---------------------------------------------------------------- Claude Code
