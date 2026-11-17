@@ -250,8 +250,10 @@ class Toolbox:
                                 _schema({}), self.get_fuzzer_info),
         }
         if (self.run_dir / "delta.diff").is_file():
-            code["get_diff"] = ("Read the code change (unified diff) this delta scan analyses.", _schema({}),
-                                self.get_diff)
+            code["get_diff"] = ("Read the code change (unified diff) this delta scan analyses.  A long diff "
+                                "comes in parts: the answer says how many; call again with part=2, 3, ... "
+                                "until you have read every part.",
+                                _schema({}, {"part": "integer"}), self.get_diff)
         role_tools: dict[str, dict[str, tuple[str, dict[str, Any], Callable[..., Any]]]] = {
             "threat_model": {"set_threat_model": (
                 "Store the audit's threat model (call once).",
@@ -514,9 +516,44 @@ class Toolbox:
         sizes = [len(b) for b in blobs]
         return f"{len(paths)} seeds added to the corpus (sizes {sizes})"
 
-    def get_diff(self) -> str:
-        """FBv2 get_diff: the whole diff, plus where each changed function sits in this program."""
+    _DIFF_PART_CHARS = 20000
+
+    def get_diff(self, part: int = 1) -> str:
+        """FBv2 get_diff: the whole diff, plus where each changed function sits in this program.
+
+        Served in parts of at most ~20k characters cut at hunk boundaries.  A single larger answer
+        is not shown to the model: Claude Code moves a tool result over its output limit into a
+        file the analysis agents have no tool to open (redis 81d653f5d: a 1,369-line diff, and the
+        delta SP generator read none of it)."""
         text = (self.run_dir / "delta.diff").read_text(encoding="utf-8", errors="replace")
+        parts, current = [], ""
+        for block in re.split(r"(?m)^(?=diff --git |@@ )", text):
+            while len(block) > self._DIFF_PART_CHARS:          # one enormous hunk: cut it by lines
+                cut = block.rfind("\n", 0, self._DIFF_PART_CHARS) + 1 or self._DIFF_PART_CHARS
+                if current:
+                    parts.append(current)
+                    current = ""
+                parts.append(block[:cut])
+                block = block[cut:]
+            if current and len(current) + len(block) > self._DIFF_PART_CHARS:
+                parts.append(current)
+                current = ""
+            current += block
+        if current:
+            parts.append(current)
+        parts = parts or [""]
+        try:
+            part = int(part or 1)
+        except (TypeError, ValueError):
+            part = 1
+        if not 1 <= part <= len(parts):
+            raise ToolError(f"part must be 1..{len(parts)}")
+        header = (f"Diff part {part} of {len(parts)}"
+                  + (f"; call get_diff(part={part + 1}) for the next part" if part < len(parts) else "; last part")
+                  + ".\n\n")
+        if part > 1:
+            return header + parts[part - 1]
+        text = parts[0]
         mapping = self.run_dir / "delta-changes.json"
         note = ""
         if mapping.is_file():
@@ -524,9 +561,7 @@ class Toolbox:
             files = ", ".join(f"{f['diff_file']} -> {f['source_file']}" for f in data["report"].get("files", []))
             note = (f"Paths in the diff are relative to its repository; in this program: {files}. "
                     "Line numbers on the new side match the analysed source.\n\n")
-        if len(text) > 60000:
-            text = text[:60000] + "\n... (diff truncated; read individual functions with get_function_source)"
-        return note + text
+        return header + note + text
 
     # ----------------------------------------------------------------------------- suspicious points
     def create_suspicious_point(self, function_name: str, vuln_type: str, description: str, score: float = 0.5,
