@@ -276,6 +276,41 @@ class Sessions:
         threading.Thread(target=self._run, args=(sid,), daemon=True).start()
         return session
 
+    def resume(self, sid: str) -> dict[str, Any]:
+        """Continue a stopped or failed session in place.
+
+        The checkout and the builds of the first attempt are kept (a finished preparation is not run
+        again), harnesses stage 1 already built are reused (--skip-harness), and when stage 1 must run
+        again the Entry answers it paid for are replayed instead of asked again (llm/base.py).  The
+        time limit counts again from now.
+        """
+        session = self.load(sid)
+        if not session:
+            raise ValueError("no such session")
+        if self.light_phase(session) in ("run", "prep", "done"):
+            raise ValueError("진행 중이거나 끝난 세션은 이어할 수 없어")
+        proctrack.reset(sid)
+        self.update(sid, state="preparing", error="", pid=None, created=time.time(),
+                    prep_progress=0.05, prep_label="이어하기")
+        self._log(sid, "occulta: resumed by the user")
+        threading.Thread(target=self._run, args=(sid,), kwargs={"resume": True}, daemon=True).start()
+        return self.load(sid) or session
+
+    def _built_harness_run(self, sid: str) -> Path | None:
+        """The newest stage-1 run of this session that built at least one harness."""
+        log = (self.home / "sessions" / sid / "pipeline.log")
+        if not log.is_file():
+            return None
+        found, current = None, None
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.search(r"\[stage 1\] (?:run directory: |skipped; reusing )(\S+)", line)
+            if m:
+                current = m.group(1)
+            m = re.search(r"\[stage 1\] built harnesses: (.+)", line)
+            if m and current and m.group(1).strip() != "none" and Path(current).is_dir():
+                found = Path(current)
+        return found
+
     def stop(self, sid: str) -> None:
         proctrack.cancel(sid)              # clone / prepare.sh / preparation agent, before any pipeline
         session = self.load(sid) or {}
@@ -332,15 +367,65 @@ class Sessions:
         with open(self.home / "sessions" / sid / "pipeline.log", "a", encoding="utf-8") as handle:
             handle.write(time.strftime("[%H:%M:%S] ") + text + "\n")
 
-    def _run(self, sid: str) -> None:
+    def _launch(self, sid: str, session: dict[str, Any], root: Path, work: Path,
+                found: tuple[Path, dict[str, Any]]) -> None:
+        """Start the pipeline of a prepared session (also used by resume)."""
+        session = self.load(sid) or session          # the limit may have been changed during preparation
+        profile_dir, profile = found
+        if int(session["hours"]) == -1:
+            hours = UNLIMITED_HOURS
+        else:   # counted from when the scan was started, like a limit changed later (set_hours)
+            hours = max(0.1, (float(session.get("created") or time.time()) + float(session["hours"]) * 3600
+                              - time.time()) / 3600)
+        args = [self.python, "-m", "fbaugur.cli", "pipeline", str(work / "source"), "--name", profile["name"],
+                "--output", str(root / "runs"), "--python", self.python, "--max-hours", str(hours),
+                "--product-version", session["rev"]]
+        # The scan's time limit governs stage 1 (half of it); a stage-1 cap written into a profile
+        # (earlier auto-prepared profiles copied "--harness-max-minutes 55" from the example) would
+        # cut harness generation off whatever limit the scan was started with.
+        extra = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
+        for i, a in enumerate(extra):
+            if a == "--harness-max-minutes":
+                del extra[i:i + 2]
+                break
+        args += extra
+        if session["mode"] == "Delta":
+            args += ["--diff", str(work / "delta.diff")]
+        built = self._built_harness_run(sid)
+        if built is not None:
+            args += ["--skip-harness", str(built)]
+            self._log(sid, f"resume: harnesses built earlier are reused ({built})")
+        args += ["--provider", session.get("provider") or "claude"]
+        for tier, model in sorted((session.get("models") or {}).items()):
+            if tier in ("1", "2", "3"):
+                args += [f"--model-t{tier}", model]
+        if proctrack.cancelled(sid):
+            raise proctrack.Cancelled("사용자가 멈춤")
+        self.update(sid, prep_progress=0.52, prep_label="정적 분석 준비", state="starting")
+        log = open(root / "pipeline.log", "a", encoding="utf-8")
+        pipeline = subprocess.Popen(args, cwd=str(self.package_root.parent), stdout=log, stderr=subprocess.STDOUT,
+                                    env=dict(os.environ, PYTHONPATH=str(self.package_root)), start_new_session=True)
+        self.update(sid, pid=pipeline.pid, state="running")
+
+    def _run(self, sid: str, resume: bool = False) -> None:
         session = self.load(sid)
         root = self.home / "sessions" / sid
         work = root / "work"
+        prepared_marker = work / ".occulta-prepared"
+        if resume and not prepared_marker.is_file() and (root / "pipeline.log").is_file() and re.search(
+                r"\[stage 1\]", (root / "pipeline.log").read_text(encoding="utf-8", errors="replace")):
+            prepared_marker.touch()     # sessions from before the marker: a pipeline ran, so preparation finished
         try:
             found = self.profile_for(session["repo"])
+            if resume and prepared_marker.is_file() and found is not None and (work / "source" / ".git").is_dir():
+                self._log(sid, "resume: checkout and builds of the first attempt are kept")
+                self._launch(sid, session, root, work, found)
+                return
             self._log(sid, f"occulta: {session['repo']} @ {session['rev']} ({session['mode']})")
             url = session.get("url") or clone_url(session["repo"])
             self._log(sid, f"clone {url}")
+            if (work / "source").exists():          # a resumed session whose preparation did not finish
+                shutil.rmtree(work / "source", ignore_errors=True)
             cloned = proctrack.run(sid, ["git", "clone", "--filter=blob:none", "--no-checkout", url, str(work / "source")],
                                    text=True, timeout=600)
             if cloned.returncode != 0:
@@ -386,37 +471,8 @@ class Sessions:
                     raise proctrack.Cancelled("사용자가 멈춤")
                 if proc.wait() != 0:
                     raise RuntimeError(f"대상 준비가 실패함 (exit {proc.returncode}); {work}/*.log 확인")
-            session = self.load(sid) or session          # the limit may have been changed during preparation
-            if int(session["hours"]) == -1:
-                hours = UNLIMITED_HOURS
-            else:   # counted from when the scan was started, like a limit changed later (set_hours)
-                hours = max(0.1, (float(session.get("created") or time.time()) + float(session["hours"]) * 3600
-                                  - time.time()) / 3600)
-            args = [self.python, "-m", "fbaugur.cli", "pipeline", str(work / "source"), "--name", profile["name"],
-                    "--output", str(root / "runs"), "--python", self.python, "--max-hours", str(hours),
-                    "--product-version", session["rev"]]
-            # The scan's time limit governs stage 1 (half of it); a stage-1 cap written into a profile
-            # (earlier auto-prepared profiles copied "--harness-max-minutes 55" from the example) would
-            # cut harness generation off whatever limit the scan was started with.
-            extra = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
-            for i, a in enumerate(extra):
-                if a == "--harness-max-minutes":
-                    del extra[i:i + 2]
-                    break
-            args += extra
-            if session["mode"] == "Delta":
-                args += ["--diff", str(work / "delta.diff")]
-            args += ["--provider", session.get("provider") or "claude"]
-            for tier, model in sorted((session.get("models") or {}).items()):
-                if tier in ("1", "2", "3"):
-                    args += [f"--model-t{tier}", model]
-            if proctrack.cancelled(sid):
-                raise proctrack.Cancelled("사용자가 멈춤")
-            self.update(sid, prep_progress=0.52, prep_label="정적 분석 준비", state="starting")
-            log = open(root / "pipeline.log", "a", encoding="utf-8")
-            pipeline = subprocess.Popen(args, cwd=str(self.package_root.parent), stdout=log, stderr=subprocess.STDOUT,
-                                        env=dict(os.environ, PYTHONPATH=str(self.package_root)), start_new_session=True)
-            self.update(sid, pid=pipeline.pid, state="running")
+            prepared_marker.touch()
+            self._launch(sid, session, root, work, found)
         except proctrack.Cancelled:
             if (self.home / "sessions" / sid).is_dir():
                 self._log(sid, "stopped by the user during preparation")

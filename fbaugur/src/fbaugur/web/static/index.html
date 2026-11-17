@@ -70,6 +70,7 @@ label.f input{background:transparent;border:0;border-bottom:1px solid rgba(255,2
 .err{max-width:560px;color:var(--pink);font-size:14px;text-align:center}
 .flow{position:relative;padding:18px 0 60px}
 .title{text-align:center;font-size:12px;letter-spacing:.32em;color:var(--dim);padding-bottom:12px;display:flex;justify-content:center;gap:14px;align-items:center}
+.resume{color:#6EF0A8!important;border-color:rgba(110,240,168,.5)!important}
 .title button{background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:999px;font-size:11.5px;letter-spacing:.1em;color:var(--dim);padding:4px 12px}
 .col{width:36%;max-width:440px;display:flex;flex-direction:column;transition:margin-left .7s cubic-bezier(.2,.8,.2,1) .22s;margin-left:32%}
 .col.shift{margin-left:60%;transition-delay:0s}
@@ -310,7 +311,7 @@ function renderPrep(st) {
   if (!$('prepbar')) $('view').innerHTML = `<div class="prep fade"><span id="pname" style="font-size:12px;letter-spacing:.32em;color:var(--dim)"></span>
     <div class="bar"><i id="prepbar" style="width:0%"></i></div>
     <div style="display:flex;justify-content:space-between;width:min(400px,80vw);font-size:12px;color:var(--dim)"><span id="plabel"></span><span id="ppct" style="color:var(--ink)"></span></div>
-    <p class="err" id="perr"></p><button class="tchip" id="ptime"></button><button class="pstop" id="pstop" hidden>중지</button></div>`;
+    <p class="err" id="perr"></p><button class="tchip" id="ptime"></button><button class="pstop" id="pstop" hidden>중지</button><button class="pstop resume" id="presume" hidden>이어하기</button></div>`;
   $('pname').textContent = `${st.name} ${st.rev}`.toUpperCase();
   const shown = Math.max(S.prepShown?.[st.id] || 0, st.prep.progress);
   S.prepShown = {...(S.prepShown||{}), [st.id]: shown};
@@ -322,6 +323,16 @@ function renderPrep(st) {
   const stop = $('pstop');
   stop.hidden = st.phase !== 'prep';
   stop.onclick = async () => { if (confirm('준비를 멈출까?')) { stop.disabled = true; await api(`/api/sessions/${encodeURIComponent(st.id)}/stop`, {}); poll(); } };
+  const rs = $('presume'); rs.hidden = !canResume(st); rs.onclick = () => resumeSession(st, rs);
+}
+function canResume(st) {
+  return (st.phase === 'stopped' || st.phase === 'failed') && S.sessions.some(x => x.id === st.id && !/pipeline$/.test(x.id));
+}
+async function resumeSession(st, btn) {
+  btn.disabled = true;
+  try { await api(`/api/sessions/${encodeURIComponent(st.id)}/resume`, {}); S.prepShown = {...(S.prepShown||{}), [st.id]: 0}; S.flowFor = null; poll(); }
+  catch (e) { alert('이어하기 못 함: ' + e.message); }
+  finally { btn.disabled = false; }
 }
 // slowly creep the bar between milestones so it never looks frozen
 setInterval(() => {
@@ -341,7 +352,7 @@ function buildFlow(st) {
   S.flowFor = st.id; let i = 0;
   const seq = (ids, side) => ids.map(id => nodeHtml(id, side, i++)).join('');
   $('view').innerHTML = `<div class="flow">
-    <div class="title"><span id="ftitle"></span><button id="ftime" class="tchip" title="시간 제한 바꾸기"></button><button id="fstop" hidden>중지</button></div>
+    <div class="title"><span id="ftitle"></span><button id="ftime" class="tchip" title="시간 제한 바꾸기"></button><button id="fstop" hidden>중지</button><button id="fresume" class="resume" hidden>이어하기</button></div>
     <section class="panel" id="panel" aria-hidden="true"></section>
     <div class="col" id="col">
       <div class="box" id="b-hc"><div class="hd"><span class="bt">Harness Create</span><span class="bs" id="bs-hc"></span></div><div style="display:flex;flex-direction:column">${seq(HC)}</div></div>
@@ -365,6 +376,7 @@ function updateFlow(st) {
   $('ftitle').textContent = `${st.name} ${st.rev} · ${st.mode} · ${PHASE[st.phase] || st.phase}`;
   { const ft = $('ftime'); ft.textContent = st.phase === 'run' ? timeText(st) : ''; ft.onclick = () => changeHours(st); }
   $('fstop').hidden = !(st.phase === 'run' && S.sessions.find(x => x.id === st.id && !/pipeline$/.test(x.id)));
+  { const r = $('fresume'); r.hidden = !canResume(st); r.onclick = () => resumeSession(st, r); }
   for (const id of [...HC, ...VR]) {
     const n = $('n-' + id); n.className = `node rise ${n.classList.contains("left")?"left":""} ${s[id]} ${S.sel===id?"on":""}`;
     $('d-' + id).className = 'd' + (s[id] === 'run' ? ' pulse' : '');

@@ -7,6 +7,7 @@ Serves one page (static/index.html) and a small JSON API:
     GET  /api/sessions/<id>             one session's phase, prep bar, agent statuses and details
     POST /api/scan                      {repo, branch, mode, commit, hours} -> a new session
     POST /api/sessions/<id>/stop
+    POST /api/sessions/<id>/resume      continue a stopped/failed session in place
     GET  /api/commits?repo=&branch=&q=  commits for the Delta picker (q: hash or message search)
     GET  /api/file?session=<id>&path=   an advisory or report inside that session's pipeline directory
 Standard library only.  Binds to 127.0.0.1.
@@ -167,6 +168,12 @@ def _handler(sessions: Sessions):
                     if not re.fullmatch(r"-?\d+", raw) or (int(raw) != -1 and int(raw) <= 0):
                         return self._error(400, "시간은 양의 정수, 제한 없음은 -1")
                     return self._json(sessions.set_hours(url.path.split("/")[3], int(raw)))
+                if url.path.startswith("/api/sessions/") and url.path.endswith("/resume"):
+                    try:
+                        sessions.resume(url.path.split("/")[3])
+                    except ValueError as exc:
+                        return self._error(400, str(exc))
+                    return self._json({"ok": True})
                 if url.path.startswith("/api/sessions/") and url.path.endswith("/stop"):
                     sessions.stop(url.path.split("/")[3])
                     return self._json({"ok": True})

@@ -90,6 +90,12 @@ def cancel(key: str) -> int:
     return len(pids)
 
 
+def reset(key: str) -> None:
+    """Allow spawning again for `key` (a stopped session that is resumed)."""
+    with _lock:
+        _cancelled.discard(key)
+
+
 def cancelled(key: str) -> bool:
     with _lock:
         return key in _cancelled
