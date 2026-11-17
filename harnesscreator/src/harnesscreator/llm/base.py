@@ -280,24 +280,10 @@ class RecordingLLM:
         effort = effort_resolver(role) if callable(effort_resolver) else getattr(self.delegate, "effort", None)
         record["reasoning_effort"] = effort
         key = _replay_key(role, record.get("model"), instructions, record["input_sha256"])
-        response = None
-        if role in _REPLAY_ROLES and not session_key:
-            response = self.replay.get(key)
-        elif role in _REPLAY_ROLES and session_key in self.replay_sessions:
-            turn = self.replay_turn.get(session_key, 0)
-            if turn == -2:
-                raise RuntimeError("replayed conversation diverged from the recorded one")
-            recorded = self.replay_sessions[session_key]
-            if turn >= 0 and turn < len(recorded) and recorded[turn][0] == key:
-                response = recorded[turn][1]
-                self.replay_turn[session_key] = turn + 1
-            elif turn > 0:
-                # The conversation diverged after replayed turns; the live model never saw them, so
-                # answering now would lack that context.  Fail this call like any provider error.
-                self.replay_turn[session_key] = -2
-                raise RuntimeError("replayed conversation diverged from the recorded one")
-            else:
-                self.replay_turn[session_key] = -1
+        # Only stateless questions are replayed.  A conversational call (session_key) depends on the
+        # turns before it; replaying some turns and asking the rest live left the model without the
+        # replayed context, so conversations are always asked again.
+        response = self.replay.get(key) if role in _REPLAY_ROLES and not session_key else None
         if response is not None:
             record.update(response=response, status="completed", replayed=True,
                           duration_seconds=0.0)
