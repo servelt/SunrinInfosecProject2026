@@ -159,7 +159,16 @@ def diff_scope(functions: dict[str, Any], edges: list[Any], diff_text: str, max_
                 scope.add(caller)
                 depth[caller] = depth[current] + 1
                 queue.append(caller)
+    # The acquisition site itself is usually not a caller of the change but a callee of one:
+    # readQueryFromClient -> connRead -> (pointer) connSocketRead -> read().  Walking callers upward
+    # never reaches it, so every function that calls a known input API is always inspected.
+    from .input_apis import SOURCE_APIS
+    acquisition = {fid for fid, function in functions.items()
+                   if set(getattr(function, "external_calls", None) or ()) & SOURCE_APIS.keys()}
+    if seeds:
+        scope |= acquisition
     return {
+        "acquisition_functions": len(acquisition),
         "changed_files": sorted(changed),
         "changed_functions": sorted(seeds),
         "changed_function_names": sorted({functions[f].name for f in seeds}),
