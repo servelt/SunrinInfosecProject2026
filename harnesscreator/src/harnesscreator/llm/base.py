@@ -184,6 +184,59 @@ class ScriptedLLM:
         return None
 
 
+_REPLAY_ROLES = frozenset({"entry_generator", "entry_verifier"})
+
+
+def _replay_key(role: str, model: Any, instructions: str, input_sha256: str) -> str:
+    return hashlib.sha256(json.dumps([role, model, instructions, input_sha256]).encode()).hexdigest()
+
+
+def _load_replay() -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[str, dict[str, Any]]]]]:
+    """Completed Entry answers of earlier runs (HARNESSCREATOR_LLM_REPLAY: llm.jsonl paths, ':'-separated).
+
+    A run that stopped (time cap, usage limit, a crash) loses every Entry answer it paid for.  The
+    same question - same role, model, instructions and byte-identical payload, i.e. the same source -
+    gets the same answer here instead of a new model call.  Only the stateless Entry roles are
+    replayed; conversational roles depend on their session and are always asked again.
+    """
+    import os
+    table: dict[str, dict[str, Any]] = {}
+    # Conversational (session) calls: replayed only for a session that reached its close marker, turn
+    # by turn in the recorded order, so a replayed turn never answers a question asked in a different
+    # conversation state.
+    sessions: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for path in filter(None, os.environ.get("HARNESSCREATOR_LLM_REPLAY", "").split(":")):
+        try:
+            handle = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            turns: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                key_s = row.get("session_key")
+                if row.get("status") == "session_closed" and key_s in turns:
+                    if key_s not in sessions:
+                        sessions[key_s] = turns.pop(key_s)
+                    continue
+                if row.get("role") not in _REPLAY_ROLES:
+                    continue
+                if row.get("status") != "completed" or not isinstance(row.get("response"), dict):
+                    if key_s:
+                        turns[key_s] = [("", {})]    # a failed turn: this conversation is not replayable
+                    continue
+                key = _replay_key(row["role"], row.get("model"), row.get("instructions", ""),
+                                  row.get("input_sha256", ""))
+                if key_s:
+                    turns.setdefault(key_s, []).append((key, row["response"]))
+                else:
+                    table[key] = row["response"]
+    return table, sessions
+
+
 class RecordingLLM:
     """Emit completed audit records without retaining large prompts in memory."""
 
@@ -196,6 +249,9 @@ class RecordingLLM:
         self.max_concurrency = getattr(delegate, "max_concurrency", 1)
         self.on_record = on_record
         self.completed_count = 0
+        self.replay, self.replay_sessions = _load_replay()
+        self.replay_turn: dict[str, int] = {}      # session -> next recorded turn; -1 = went live
+        self.replayed = 0
 
     async def complete_json(
         self,
@@ -223,6 +279,32 @@ class RecordingLLM:
         effort_resolver = getattr(self.delegate, "effort_for_role", None)
         effort = effort_resolver(role) if callable(effort_resolver) else getattr(self.delegate, "effort", None)
         record["reasoning_effort"] = effort
+        key = _replay_key(role, record.get("model"), instructions, record["input_sha256"])
+        response = None
+        if role in _REPLAY_ROLES and not session_key:
+            response = self.replay.get(key)
+        elif role in _REPLAY_ROLES and session_key in self.replay_sessions:
+            turn = self.replay_turn.get(session_key, 0)
+            if turn == -2:
+                raise RuntimeError("replayed conversation diverged from the recorded one")
+            recorded = self.replay_sessions[session_key]
+            if turn >= 0 and turn < len(recorded) and recorded[turn][0] == key:
+                response = recorded[turn][1]
+                self.replay_turn[session_key] = turn + 1
+            elif turn > 0:
+                # The conversation diverged after replayed turns; the live model never saw them, so
+                # answering now would lack that context.  Fail this call like any provider error.
+                self.replay_turn[session_key] = -2
+                raise RuntimeError("replayed conversation diverged from the recorded one")
+            else:
+                self.replay_turn[session_key] = -1
+        if response is not None:
+            record.update(response=response, status="completed", replayed=True,
+                          duration_seconds=0.0)
+            self.replayed += 1
+            if self.on_record:
+                self.on_record(record)
+            return response
         try:
             response = await self.delegate.complete_json(
                 role=role,
