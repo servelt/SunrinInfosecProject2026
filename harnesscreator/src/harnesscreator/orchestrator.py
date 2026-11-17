@@ -815,7 +815,8 @@ class HarnessCreator:
                 entry_generator.scope_function_ids = delta["scope"]
                 self._emit(f"delta: {len(delta['changed_functions'])} changed function(s) "
                            f"({', '.join(delta['changed_function_names'][:8])}); Entry search limited to "
-                           f"{delta['scope_size']} function(s) within {delta['max_depth']} calls above them")
+                           f"{delta['scope_size']} function(s) that call them"
+                           + (f" within {delta['max_depth']} calls" if delta['max_depth'] else ""))
         product_analysis = AnalysisBundle(
             functions={
                 function_id: analysis.functions[function_id]

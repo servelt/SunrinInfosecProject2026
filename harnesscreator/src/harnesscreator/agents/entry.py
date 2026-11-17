@@ -329,6 +329,10 @@ class EntryGeneratorAgent:
     ) -> list[EntryCandidate]:
         self.incomplete_functions = []
         product_ids = self.product_function_ids(bundle)
+        if self.scope_function_ids is not None:
+            # Delta scope applies to the static scan too: a candidate in a function no batch covers
+            # would never be finalized, and the run stops at "changed after finalization".
+            product_ids = product_ids & set(self.scope_function_ids)
         candidates = self._deterministic_candidates(
             bundle, product_function_ids=product_ids
         )
