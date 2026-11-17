@@ -395,7 +395,15 @@ class Sessions:
             args = [self.python, "-m", "fbaugur.cli", "pipeline", str(work / "source"), "--name", profile["name"],
                     "--output", str(root / "runs"), "--python", self.python, "--max-hours", str(hours),
                     "--product-version", session["rev"]]
-            args += [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
+            # The scan's time limit governs stage 1 (half of it); a stage-1 cap written into a profile
+            # (earlier auto-prepared profiles copied "--harness-max-minutes 55" from the example) would
+            # cut harness generation off whatever limit the scan was started with.
+            extra = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
+            for i, a in enumerate(extra):
+                if a == "--harness-max-minutes":
+                    del extra[i:i + 2]
+                    break
+            args += extra
             if session["mode"] == "Delta":
                 args += ["--diff", str(work / "delta.diff")]
             args += ["--provider", session.get("provider") or "claude"]

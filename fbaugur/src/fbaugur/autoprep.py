@@ -81,8 +81,7 @@ Deliver two files, written by you:
     "--daemon-command", "{{WORK}}/daemon-asan/<binary> <args>",
     "--daemon-msan-command", "{{WORK}}/daemon-msan/<binary> <args>",          (omit both if no msan build)
     "--daemon-plain-command", "{{WORK}}/daemon-plain/<binary> <args>",
-    "--daemon-cwd", "{{WORK}}",
-    "--harness-max-minutes", "55"
+    "--daemon-cwd", "{{WORK}}"
   ]
 }}
 The program's main network input is what will be fuzzed: choose the listener a remote client reaches
