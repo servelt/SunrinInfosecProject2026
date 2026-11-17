@@ -39,19 +39,52 @@ PREP_MARKS = [
 TS = re.compile(r"^\[(\d\d:\d\d:\d\d)\]\s*")
 
 
+_rows_lock = threading.Lock()
+_rows_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
+
+
 def _rows(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
+    """Rows of a JSON-lines file, parsing only what was appended since the last call.
+
+    The status page polls every few seconds from every open browser, and HarnessCreator's logs
+    (agent-events.jsonl: tens of MB) only grow.  Re-parsing them whole on each poll piled up
+    requests until the server stopped answering.  A replaced or truncated file is read again.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
         return []
-    out = []
+    key = str(path)
+    with _rows_lock:
+        inode, offset, rows = _rows_cache.get(key, (0, 0, []))
+        if inode != stat.st_ino or stat.st_size < offset:
+            inode, offset, rows = stat.st_ino, 0, []
+        if stat.st_size > offset:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(stat.st_size - offset)
+            end = chunk.rfind(b"\n") + 1           # a half-written last line waits for the next poll
+            for line in chunk[:end].decode("utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+            offset += end
+        _rows_cache[key] = (inode, offset, rows)
+        return list(rows)
+
+
+def _rows_once(path: Path):
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             line = line.strip()
             if line:
                 try:
-                    out.append(json.loads(line))
+                    yield json.loads(line)
                 except ValueError:
                     pass
-    return out
 
 
 _names_lock = threading.Lock()
@@ -83,7 +116,7 @@ def _function_index(path: Path) -> dict[str, tuple[str, str]]:
         if cached and cached[0] == key:
             return cached[1]
         names: dict[str, tuple[str, str]] = {}
-        for row in _rows(path):
+        for row in _rows_once(path):        # not _rows: its cache would keep every function's source
             if "function_id" in row:
                 names[row["function_id"]] = (row.get("name", row["function_id"]), row.get("file", ""))
         _names_cache[str(path)] = (key, names)
@@ -638,7 +671,26 @@ def pid_alive(pid: int | None) -> bool:
         return True
 
 
+_status_locks: dict[str, threading.Lock] = {}
+_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_status_guard = threading.Lock()
+
+
 def session_status(session: dict[str, Any]) -> dict[str, Any]:
+    """Status of one session; concurrent polls of the same session share one computation (2 s)."""
+    key = str(session.get("id") or session.get("pipeline_dir") or id(session))
+    with _status_guard:
+        lock = _status_locks.setdefault(key, threading.Lock())
+    with lock:
+        cached = _status_cache.get(key)
+        if cached and time.time() - cached[0] < 2.0:
+            return cached[1]
+        result = _session_status(session)
+        _status_cache[key] = (time.time(), result)
+        return result
+
+
+def _session_status(session: dict[str, Any]) -> dict[str, Any]:
     labels.CURRENT.set(session.get("provider") or "claude")
     lines = read_log(Path(session["log"])) if session.get("log") else []
     pipeline_dir = Path(session["pipeline_dir"]) if session.get("pipeline_dir") else pipeline_dir_of(lines)
