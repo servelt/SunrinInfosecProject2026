@@ -48,6 +48,76 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _mirror_root(root: Path, db: Path) -> Path | None:
+    """The directory the compile database was recorded in when it is a copy of `root`.
+
+    A preparation script may build in a copy of the checkout so the checkout stays clean; the
+    database then names files in the copy.  The copy also holds the generated headers the build
+    made, so the harness is built there."""
+    try:
+        records = json.loads(db.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        directory = Path(str(record.get("directory") or db.parent))
+        src = Path(str(record.get("file") or ""))
+        src = (src if src.is_absolute() else directory / src).resolve()
+        if _inside(src, root) or not src.is_file():
+            continue
+        for candidate in src.parents:
+            relative = src.relative_to(candidate)
+            if (root / relative).is_file():
+                return candidate
+        return None
+    return None
+
+
+def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[SourceUnit], Path | None]:
+    """Translation units the executable was linked from, read from its DWARF compile units.
+
+    The compile database lists every compilation of a build, including other programs (a bundled
+    interpreter's own CLI) and test mains behind #ifdef.  The executable's debug information names
+    exactly the sources linked into it, and `nm -l` names the file that defines its main()."""
+    try:
+        dump = subprocess.run(["readelf", "--debug-dump=info", "--dwarf-depth=1", str(target_binary)],
+                              text=True, capture_output=True, timeout=300).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeBuildUnresolved(f"cannot read debug information of {target_binary}: {exc}") from exc
+    linked: set[Path] = set()
+    for block in dump.split("Compilation Unit @")[1:]:
+        name = re.search(r"DW_AT_name\s*:\s*(?:\(indirect[^)]*\):\s*)?(\S+)", block)
+        comp_dir = re.search(r"DW_AT_comp_dir\s*:\s*(?:\(indirect[^)]*\):\s*)?(\S+)", block)
+        if name:
+            path = Path(name.group(1))
+            if not path.is_absolute() and comp_dir:
+                path = Path(comp_dir.group(1)) / path
+            linked.add(path.resolve())
+    if not linked:
+        raise NativeBuildUnresolved(f"{target_binary} has no DWARF compile units; build it with -g")
+    records = json.loads(db.read_text(encoding="utf-8"))
+    units: dict[Path, SourceUnit] = {}
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        directory = Path(str(record.get("directory") or db.parent)).resolve()
+        src = Path(str(record.get("file") or ""))
+        src = (src if src.is_absolute() else directory / src).resolve()
+        if src in linked and _inside(src, root) and src.suffix.lower() in _SOURCE_EXTENSIONS:
+            units[src] = SourceUnit(src, _flags_from_compile_record(record, directory))
+    main_source = None
+    try:
+        symbols = subprocess.run(["nm", "-l", "--defined-only", str(target_binary)],
+                                 text=True, capture_output=True, timeout=300).stdout
+        found = re.search(r"(?m)^\S+\s+T\s+main\s+(\S+?):\d+\s*$", symbols)
+        if found:
+            main_source = Path(found.group(1)).resolve()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return sorted(units.values(), key=lambda unit: str(unit.source)), main_source
+
+
 def _find_compile_database(root: Path) -> Path | None:
     for path in (root / "compile_commands.json", root / "build" / "compile_commands.json", root / "out" / "build" / "compile_commands.json"):
         if path.is_file():
@@ -171,7 +241,10 @@ def _main_units(units: list[SourceUnit]) -> list[Path]:
 
 # sanitizer -> (compile -fsanitize, link -fsanitize, extra flags for both)
 _SANITIZERS = {
-    "address+undefined": ("fuzzer-no-link,address,undefined", "fuzzer,address,undefined", []),
+    # -fsanitize=function (part of `undefined` since clang 17) reports every call through a cast
+    # function pointer, an idiom C servers use for module and command tables (redis' RM_* API);
+    # clang 14 never checked it in C, so it stays off to keep the reports comparable.
+    "address+undefined": ("fuzzer-no-link,address,undefined", "fuzzer,address,undefined", ["-fno-sanitize=function"]),
     "memory": ("fuzzer-no-link,memory", "fuzzer,memory", ["-fsanitize-memory-track-origins=2"]),
 }
 # Measured on this WSL kernel (vm.mmap_rnd_bits=32): MemorySanitizer started 6/10 times with
@@ -186,6 +259,12 @@ def _compilers(sanitizer: str) -> tuple[str | None, str | None]:
     cc, cxx = os.environ.get("HARNESSCREATOR_NATIVE_CC"), os.environ.get("HARNESSCREATOR_NATIVE_CXX")
     if cc:
         return shutil.which(cc), shutil.which(cxx) if cxx else shutil.which(cc.replace("clang", "clang++"))
+    # The newest installed clang: an old default clang may not compile current C (clang 14 rejects
+    # redis' `static _Atomic(T*) x = NULL;`).
+    for version in range(30, (_MSAN_MIN_CLANG if sanitizer == "memory" else 14) - 1, -1):
+        found = shutil.which(f"clang-{version}")
+        if found:
+            return found, shutil.which(f"clang++-{version}")
     if sanitizer != "memory":
         return shutil.which("clang"), shutil.which("clang++")
     for version in range(30, _MSAN_MIN_CLANG - 1, -1):
@@ -210,6 +289,10 @@ def build_native(
     # does not reveal which executable owns a translation unit, so we never
     # merge unrelated targets into one fuzzing binary.
     db = compile_database or _find_compile_database(root)
+    if db is not None:
+        mirror = _mirror_root(root, db)
+        if mirror is not None:
+            root = mirror.resolve()
     required_sources: set[Path] = set()
     hints_file = harness.parent / "harness-plan.json"
     if hints_file.is_file():
@@ -234,7 +317,25 @@ def build_native(
     ) if db else None
     selected_make_target = None
     extra_link_flags: list[str] = []
-    if selected_target is not None:
+    binary_main: Path | None = None
+    linked_units: list[SourceUnit] | None = None
+    if selected_target is None and db is not None and target_binary is not None:
+        linked_units, binary_main = _binary_closure(target_binary.resolve(), db, root)
+        if not linked_units:
+            raise NativeBuildUnresolved(
+                f"no compile-database record matches a translation unit linked into {target_binary}")
+    if linked_units is not None:
+        units = linked_units
+        evidence = f"translation units linked into {target_binary} (DWARF) from {db}"
+        # Libraries the project built without -g leave no compile unit behind (a bundled Lua, xxhash).
+        # Its own static archives supply them; a linker takes an archive member only for a symbol
+        # nothing else defines, so archives never duplicate the units compiled above.
+        archives: dict[str, Path] = {}
+        for archive in sorted(root.rglob("*.a"), key=lambda p: (len(p.parts), str(p))):
+            archives.setdefault(archive.name, archive)
+        if archives:
+            extra_link_flags = ["-Wl,--start-group", *(str(a) for a in archives.values()), "-Wl,--end-group"]
+    elif selected_target is not None:
         # CMake may compile the SAME source for several executable targets
         # with different macros, include directories, and ABI flags. Selecting
         # flags by filename (the former behavior) made the result dependent on
@@ -325,7 +426,8 @@ def build_native(
             "build closure does not cover required Entry/handler sources: "
             + ", ".join(unresolved[:10])
         )
-    mains = _main_units(units)
+    mains = [binary_main] if linked_units is not None and binary_main in {u.source for u in units} else (
+        [] if linked_units is not None and binary_main is None else _main_units(units))
     if len(mains) > 1:
         names = ", ".join(str(src.relative_to(root)) for src in mains[:8])
         raise NativeBuildUnresolved(

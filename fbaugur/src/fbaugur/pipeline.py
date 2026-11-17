@@ -44,6 +44,9 @@ def add_arguments(parser) -> None:
                               "of the highest-priority network context)")
     harness.add_argument("--analysis-compile-database", type=Path,
                          help="compile_commands.json of the program's build")
+    harness.add_argument("--harness-link-binary", type=Path,
+                         help="the program as its own build linked it (with -g); the harness is built from "
+                              "the translation units its debug information names")
     harness.add_argument("--require-fuzz-introspector", action="store_true",
                          help="require Fuzz Introspector (default: allow source indexing, which is "
                               "enough for a small program)")
@@ -79,6 +82,8 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
         argv += ["--channel", channel]
     if args.analysis_compile_database:
         argv += ["--analysis-compile-database", str(args.analysis_compile_database.resolve())]
+    if getattr(args, "harness_link_binary", None):
+        argv += ["--harness-link-binary", str(args.harness_link_binary.resolve())]
     if not args.only_verified_entries:
         argv += ["--include-unresolved-entries"]
     if args.diff:                          # delta: Entries only where data reaches the change

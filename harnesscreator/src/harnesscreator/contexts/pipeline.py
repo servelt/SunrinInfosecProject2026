@@ -63,6 +63,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--max-frontier-targets", type=int, default=0, help="0 (default) = no limit")
     group.add_argument("--time-budget", type=float, default=0.0,
                        help="seconds for not-yet-executed exploration per channel; 0 (default) = no limit")
+    group.add_argument("--harness-link-binary", type=Path, default=None, metavar="PATH",
+                       help="the program as the project's own build linked it, compiled with -g.  Its debug "
+                            "information names the translation units it was linked from; the harness is built "
+                            "from exactly those (needed when the compile database holds several programs)")
     group.add_argument("--harness-attempts", type=int, default=3,
                        help="harness generation attempts per context and channel (default: 3)")
 
@@ -238,7 +242,7 @@ async def run_after_entries(args: argparse.Namespace, run_dir: Path, entry_count
         code, error = await stage(f"3.{index} harness for {context_id} over {channel} ({index}/{len(units)})",
                                   stages._harness(argparse.Namespace(
             run_dir=run_dir, context=[context_id], delivery=delivery, source=None, compile_database=None,
-            target_binary=None, attempts=args.harness_attempts, no_build=False, legacy_generator=False,
+            target_binary=getattr(args, "harness_link_binary", None), attempts=args.harness_attempts, no_build=False, legacy_generator=False,
             server_args=None, host=_host(args), port=_port(args), reading_turns=30, **llm)))
         row["harness"] = {"exit": code, "error": error, **_harness_digest(run_dir, context_id, delivery)}
         save()
