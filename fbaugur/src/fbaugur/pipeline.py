@@ -105,11 +105,10 @@ async def generate_harness(args, run_root: Path, budget: float, emit, deadline_f
     log_path = run_root / "harnesscreator.log"
     run_root.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, PYTHONPATH=str((args.harnesscreator / "src").resolve()))
-    # Entry answers already paid for by earlier runs (stopped by a cap, a usage limit or a crash) are
-    # reused for byte-identical questions instead of asking the model again (llm/base.py).
-    logs = sorted({str(p) for root, pattern in (
-        (Path.home() / ".occulta" / "sessions", "*/runs/*/harness/*/trajectories/llm.jsonl"),
-        (args.output.expanduser(), "*/harness/*/trajectories/llm.jsonl")) for p in root.glob(pattern)})
+    # Entry answers this session already paid for in an earlier attempt (resumed after a cap, a usage
+    # limit or a crash) are reused for byte-identical questions instead of asking the model again (llm/base.py).
+    # Only this session's own earlier runs (its --output); a new session always asks afresh.
+    logs = sorted(str(p) for p in args.output.expanduser().glob("*/harness/*/trajectories/llm.jsonl"))
     if logs:
         env["HARNESSCREATOR_LLM_REPLAY"] = ":".join(logs)
         emit(f"[stage 1] earlier Entry answers available for reuse from {len(logs)} run(s)")
