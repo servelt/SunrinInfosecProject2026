@@ -492,7 +492,7 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
     st = {k: "wait" for k in VR_AGENTS}
     details: dict[str, dict[str, Any]] = {k: {"rows": []} for k in VR_AGENTS}
     if not scans:
-        return {"status": st, "details": details, "context": ""}
+        return {"status": st, "details": details, "context": "", "delta": False}
     scan = scans[-1]
     total = len({m.group(2) for l in lines for m in [re.search(r"\[stage 2\] scan (\d+)/(\d+)", l)] if m}) and \
         max(int(m.group(2)) for l in lines for m in [re.search(r"\[stage 2\] scan (\d+)/(\d+)", l)] if m)
@@ -523,8 +523,19 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
 
         open_pool = (pool_open[0]["n"] if pool_open else 0) > 0
         st["tm"] = state("threat_model" in roles, bool(tm))
-        st["dr"] = state("direction" in roles, bool(directions))
-        st["spg"] = state(bool({"sp_generator", "delta_sp_generator"} & roles.keys()) or (live and open_pool and not drained), bool(sps))
+        delta = (scan / "delta.diff").is_file()
+        delta_changes = _json((scan / "delta-changes.json").read_text(encoding="utf-8")) \
+            if (scan / "delta-changes.json").is_file() else {}
+        delta_runs = _q(conn, "SELECT status, subject FROM agent_runs WHERE role='delta_sp_generator'")
+        if delta:
+            # A delta scan has no Direction step: the diff takes its place (changed functions in batches).
+            st["dr"] = state(False, bool(delta_changes))
+            st["spg"] = state("delta_sp_generator" in roles,
+                              bool(sps) or (bool(delta_runs) and "delta_sp_generator" not in roles and
+                                            (drained or finished)))
+        else:
+            st["dr"] = state("direction" in roles, bool(directions))
+            st["spg"] = state(bool({"sp_generator", "delta_sp_generator"} & roles.keys()) or (live and open_pool and not drained), bool(sps))
         verifying = any(s["status"] in ("pending_verify", "verifying") for s in sps)
         st["spv"] = state("sp_verifier" in roles or (live and verifying), any(s["status"] not in ("pending_verify", "verifying") for s in sps))
         pov_open = any(s["status"] in ("verified", "pending_pov", "pov_running", "generating_pov") for s in sps)
@@ -554,6 +565,19 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
                                 level.upper(), risk_tag.get(level, "")))
         details["dr"] = {"summary": f"위험 영역 {len(directions)}개", "now": "코드를 위험 영역으로 나누는 중",
                          "layout": "groups", "rows": dir_rows}
+        if delta:
+            changes = delta_changes.get("changes") or []
+            per_file: dict[str, int] = {}
+            for c in changes:
+                per_file[c.get("file", "")] = per_file.get(c.get("file", ""), 0) + 1
+            batches = max((int(m.group(2)) for r in delta_runs
+                           for m in [re.search(r"delta (\d+)/(\d+)", r["subject"] or "")] if m), default=0)
+            done_runs = sum(1 for r in delta_runs if r["status"] != "running")
+            details["dr"] = {"summary": f"바뀐 함수 {len(changes)}개 · 파일 {len(per_file)}개"
+                                        + (f" · 분석 {done_runs}/{batches}" if batches else ""),
+                             "now": "diff에서 바뀐 함수를 찾는 중", "layout": "groups",
+                             "rows": [row(f, f"바뀐 함수 {n}개", "", "") for f, n in
+                                      sorted(per_file.items(), key=lambda kv: -kv[1])]}
         by_worker = {}
         for s in sps:
             by_worker[s["worker_id"]] = by_worker.get(s["worker_id"], 0) + 1

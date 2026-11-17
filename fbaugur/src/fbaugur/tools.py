@@ -252,8 +252,8 @@ class Toolbox:
         if (self.run_dir / "delta.diff").is_file():
             code["get_diff"] = ("Read the code change (unified diff) this delta scan analyses.  A long diff "
                                 "comes in parts: the answer says how many; call again with part=2, 3, ... "
-                                "until you have read every part.",
-                                _schema({}, {"part": "integer"}), self.get_diff)
+                                "until you have read every part.  file='src/x.c' returns only that file's change.",
+                                _schema({}, {"part": "integer", "file": "string"}), self.get_diff)
         role_tools: dict[str, dict[str, tuple[str, dict[str, Any], Callable[..., Any]]]] = {
             "threat_model": {"set_threat_model": (
                 "Store the audit's threat model (call once).",
@@ -518,7 +518,7 @@ class Toolbox:
 
     _DIFF_PART_CHARS = 20000
 
-    def get_diff(self, part: int = 1) -> str:
+    def get_diff(self, part: int = 1, file: str = "") -> str:
         """FBv2 get_diff: the whole diff, plus where each changed function sits in this program.
 
         Served in parts of at most ~20k characters cut at hunk boundaries.  A single larger answer
@@ -526,6 +526,15 @@ class Toolbox:
         file the analysis agents have no tool to open (redis 81d653f5d: a 1,369-line diff, and the
         delta SP generator read none of it)."""
         text = (self.run_dir / "delta.diff").read_text(encoding="utf-8", errors="replace")
+        if file:
+            wanted = file.strip().removeprefix("a/").removeprefix("b/")
+            sections = re.split(r"(?m)^(?=diff --git )", text)
+            chosen = [sec for sec in sections if re.match(r"diff --git a/(\S+) b/(\S+)", sec)
+                      and any(name == wanted or name.endswith("/" + wanted) or wanted.endswith("/" + name)
+                              for name in re.match(r"diff --git a/(\S+) b/(\S+)", sec).groups())]
+            if not chosen:
+                raise ToolError(f"the diff does not change `{file}`")
+            text = "".join(chosen)
         parts, current = [], ""
         for block in re.split(r"(?m)^(?=diff --git |@@ )", text):
             while len(block) > self._DIFF_PART_CHARS:          # one enormous hunk: cut it by lines
@@ -549,7 +558,8 @@ class Toolbox:
         if not 1 <= part <= len(parts):
             raise ToolError(f"part must be 1..{len(parts)}")
         header = (f"Diff part {part} of {len(parts)}"
-                  + (f"; call get_diff(part={part + 1}) for the next part" if part < len(parts) else "; last part")
+                  + (f"; call get_diff(part={part + 1}{f', file={file!r}' if file else ''}) for the next part"
+                     if part < len(parts) else "; last part")
                   + ".\n\n")
         if part > 1:
             return header + parts[part - 1]

@@ -74,6 +74,13 @@ def _mirror_root(root: Path, db: Path) -> Path | None:
     return None
 
 
+def _relative(path: Path, root: Path | None) -> str | None:
+    try:
+        return str(path.relative_to(root)) if root is not None else None
+    except ValueError:
+        return None
+
+
 def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[SourceUnit], Path | None]:
     """Translation units the executable was linked from, read from its DWARF compile units.
 
@@ -96,6 +103,11 @@ def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[Sou
             linked.add(path.resolve())
     if not linked:
         raise NativeBuildUnresolved(f"{target_binary} has no DWARF compile units; build it with -g")
+    # The database may describe a copy of the tree the executable was built in (fbaugur rebuilds an
+    # instrumented copy), so a unit also matches by its path inside the build tree.
+    existing = [p for p in linked if p.is_file()]
+    tree = Path(os.path.commonpath([str(p) for p in existing])) if existing else None
+    linked_relative = {_relative(p, tree) for p in existing} if tree else set()
     records = json.loads(db.read_text(encoding="utf-8"))
     units: dict[Path, SourceUnit] = {}
     for record in records if isinstance(records, list) else []:
@@ -104,7 +116,8 @@ def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[Sou
         directory = Path(str(record.get("directory") or db.parent)).resolve()
         src = Path(str(record.get("file") or ""))
         src = (src if src.is_absolute() else directory / src).resolve()
-        if src in linked and _inside(src, root) and src.suffix.lower() in _SOURCE_EXTENSIONS:
+        if (src in linked or _relative(src, root) in linked_relative) and _inside(src, root) \
+                and src.suffix.lower() in _SOURCE_EXTENSIONS:
             units[src] = SourceUnit(src, _flags_from_compile_record(record, directory))
     main_source = None
     try:
@@ -426,6 +439,10 @@ def build_native(
             "build closure does not cover required Entry/handler sources: "
             + ", ".join(unresolved[:10])
         )
+    if linked_units is not None and binary_main is not None and binary_main not in {u.source for u in units}:
+        # main() was found in the build tree; the units may be a copy of it (matched by path inside).
+        suffix = [u.source for u in units if str(binary_main).endswith("/" + (_relative(u.source, root) or "\0"))]
+        binary_main = suffix[0] if len(suffix) == 1 else binary_main
     mains = [binary_main] if linked_units is not None and binary_main in {u.source for u in units} else (
         [] if linked_units is not None and binary_main is None else _main_units(units))
     if len(mains) > 1:
@@ -476,6 +493,7 @@ def build_native(
         "link_flags_from_build_graph": extra_link_flags,
         "original_sources": [str(unit.source) for unit in units],
         "renamed_main": [str(p) for p in mains],
+        "target_binary": str(target_binary) if linked_units is not None else None,
         "compile_commands": [],
     }
     plan_file = scratch / "build-plan.json"

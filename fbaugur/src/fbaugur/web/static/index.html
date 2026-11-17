@@ -152,6 +152,10 @@ label.f input{background:transparent;border:0;border-bottom:1px solid rgba(255,2
 <script>
 const NAMES = {eg:'Entry Generator',ev:'Entry Verifier',cg:'Context Grouping',ig:'Input Generator',hg:'Harness Generator',hv:'Harness Verifier',
   tm:'Threat Model',dr:'Direction',spg:'SP Generator',spv:'SP Verifier',pov:'PoV',inv:'Invariant 삽입',fz:'Fuzzing',ct:'Crash Triage',val:'Validation',adv:'Advisory'};
+// A delta scan has no Direction step: the diff's changed functions take its place, and the SP
+// generator works through them file by file.
+const DELTA_NAMES = {dr:'Diff 분석', spg:'Delta SP Generator'};
+const nameOf = (id, st) => ((st && st.mode === 'Delta' && DELTA_NAMES[id]) || NAMES[id]);
 const HC = ['eg','ev','cg','ig','hg','hv'];
 const VR = ['tm','dr','spg','spv','pov','inv','fz','ct','val','adv'];
 const COL = {done:'#6EF0A8',run:'#FFD66B',wait:'#6B6B72',fail:'#FF7A7A',prep:'#FFD66B',stop:'#9A9AA0',stopped:'#9A9AA0',failed:'#FF7A7A'};
@@ -379,6 +383,7 @@ function updateFlow(st) {
   { const r = $('fresume'); r.hidden = !canResume(st); r.onclick = () => resumeSession(st, r); }
   for (const id of [...HC, ...VR]) {
     const n = $('n-' + id); n.className = `node rise ${n.classList.contains("left")?"left":""} ${s[id]} ${S.sel===id?"on":""}`;
+    { const nm = n.querySelector('.nm'); if (nm) nm.textContent = nameOf(id, st); }
     $('d-' + id).className = 'd' + (s[id] === 'run' ? ' pulse' : '');
   }
   const line = (el, ok) => { el.className = 'ln' + (ok === null ? ' none' : ok ? ' ok' : ''); };
@@ -419,7 +424,7 @@ function renderPanel(st) {
   } else {
     const d = st.details[S.sel] || {rows:[]}, s = st.status[S.sel];
     const status = {done:'완료', run:'진행 중', wait:'대기', fail:'실패'}[s];
-    html = `<span class="grp">${HC.includes(S.sel) ? 'HARNESS CREATE' : 'VULNERABILITY RESEARCH'}</span><h2>${NAMES[S.sel]}</h2>
+    html = `<span class="grp">${HC.includes(S.sel) ? 'HARNESS CREATE' : 'VULNERABILITY RESEARCH'}</span><h2>${nameOf(S.sel, S.status)}</h2>
       <span style="font-size:12px;letter-spacing:.16em;color:${COL[s]}">${status}</span>
       ${s === 'run' && d.now ? `<p class="now">${esc(d.now)}</p>` : ''}
       ${s === 'run' && d.bytes ? `<pre>${esc(d.bytes)}</pre>` : ''}

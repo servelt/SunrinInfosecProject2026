@@ -283,6 +283,19 @@ class InvariantBuilder:
         self.extra_cflags = extra_cflags
         self.sanitizer = sanitizer
         self.compile_database = compile_database
+        # The harness was built in the tree its compile database describes (redis: a copy of the
+        # checkout made by prepare.sh, holding the generated headers and the bundled libraries'
+        # archives), from the units linked into one program.  Rebuilds start from that same tree and
+        # program; from the checkout they compiled nothing (no database path pointed into it).
+        built_in = Path(str(self.plan.get("source_root") or ""))
+        if self.plan.get("source_root") and built_in.is_dir() and built_in.resolve() != source_root.resolve():
+            source_root = built_in.resolve()
+            self.source_root = source_root
+        target = self.plan.get("target_binary")
+        if not target:
+            found = re.search(r"translation units linked into (\S+) \(DWARF\)", str(self.plan.get("build_evidence") or ""))
+            target = found.group(1) if found else None
+        self.target_binary = Path(target) if target and Path(target).is_file() else None
         self.macros = function_like_macros(source_root)
         self.base = work_dir / "src-base"
 
@@ -414,6 +427,8 @@ class InvariantBuilder:
         database = self._relocated_database(src, root)
         if database is not None:
             argv += ["--compile-database", str(database)]
+        if self.target_binary is not None:
+            argv += ["--target-binary", str(self.target_binary)]
         proc = subprocess.run(argv,
                               capture_output=True, text=True, env=env, timeout=1800)
         output = proc.stdout + proc.stderr
