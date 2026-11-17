@@ -279,6 +279,24 @@ class StaticAnalyzer:
                 if len({item[1] for item in selected_matches}) == 1:
                     function.declaration = selected_matches[0][1]
 
+    def _visible(self, caller: FunctionMetadata, targets: list[FunctionMetadata]) -> list[FunctionMetadata]:
+        """Drop definitions the caller's translation unit cannot see.
+
+        A function defined in a header exists for a caller only when the caller's file includes that
+        header (directly or through other headers).  Name-only linking connected socket.c's libc
+        read() to a Qt adapter's C++ member read() in deps/hiredis/adapters/qt.h, which socket.c never
+        includes; the real input call then counted as internal and its Entry was rejected.
+        """
+        if not targets:
+            return targets
+        visible = []
+        for target in targets:
+            if Path(target.file).suffix.lower() in _HEADER_SUFFIXES and target.file != caller.file:
+                if target.file not in _include_closure(self.source_root, caller.file):
+                    continue
+            visible.append(target)
+        return visible
+
     def _link(self, functions: list[FunctionMetadata], provider: str) -> AnalysisBundle:
         by_name: dict[str, list[FunctionMetadata]] = {}
         for function in functions:
@@ -308,7 +326,7 @@ class StaticAnalyzer:
                     # edge to a same-named member; retain the external call
                     # for later compiler/source verification.
                     targets = []
-                targets = _link_targets_for_caller(function, targets)
+                targets = _link_targets_for_caller(function, self._visible(function, targets))
                 call_line = function.start_line + body.count("\n", 0, call.start())
                 if len(targets) == 1 and targets[0].function_id != function.function_id:
                     target = targets[0]
@@ -335,7 +353,7 @@ class StaticAnalyzer:
                     continue
                 referenced_name = reference.group(1)
                 targets = by_name.get(referenced_name) or []
-                targets = _link_targets_for_caller(function, targets)
+                targets = _link_targets_for_caller(function, self._visible(function, targets))
                 if len(targets) != 1 or targets[0].function_id == function.function_id:
                     continue
                 prefix = masked_body[max(0, reference.start() - 32):reference.start()]
@@ -451,8 +469,11 @@ class StaticAnalyzer:
         }
         existing = {(edge.caller_id, edge.callee_id) for edge in bundle.edges}
         for caller_id, names in reported_callees.items():
+            caller = bundle.functions.get(caller_id)
             for name in names:
                 callee = by_name.get(name) or by_name.get(name.rsplit("::", 1)[-1])
+                if callee and caller is not None and not self._visible(caller, [callee]):
+                    callee = None
                 if not callee or (caller_id, callee.function_id) in existing:
                     continue
                 bundle.edges.append(
@@ -1015,6 +1036,51 @@ def _looks_like_function_reference(prefix: str, suffix: str) -> bool:
         re.search(r"(?:&|=|,|\(|\{|\breturn)\s*$", prefix)
         or re.match(r"\s*[,)};]", suffix)
     )
+
+
+_HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", ".tcc"}
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
+
+
+@lru_cache(maxsize=None)
+def _project_headers(source_root: Path) -> dict[str, tuple[str, ...]]:
+    """basename -> project-relative paths of headers with that name."""
+    table: dict[str, list[str]] = {}
+    for path in source_root.rglob("*"):
+        if path.suffix.lower() in _HEADER_SUFFIXES and path.is_file():
+            table.setdefault(path.name, []).append(str(path.relative_to(source_root)))
+    return {name: tuple(paths) for name, paths in table.items()}
+
+
+@lru_cache(maxsize=None)
+def _direct_includes(source_root: Path, relative: str) -> tuple[str, ...]:
+    try:
+        text = (source_root / relative).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    headers = _project_headers(source_root)
+    found: list[str] = []
+    for spelled in _INCLUDE_RE.findall(text):
+        here = os.path.normpath(str(Path(relative).parent / spelled))
+        candidates = headers.get(Path(spelled).name, ())
+        # Prefer the header the spelling names relative to the including file; otherwise any project
+        # header whose path ends with the spelling (include directories are not known here).
+        exact = [c for c in candidates if os.path.normpath(c) == here]
+        tail = [c for c in candidates if Path(c).parts[-len(Path(spelled).parts):] == Path(spelled).parts]
+        found.extend(exact or tail)
+    return tuple(found)
+
+
+@lru_cache(maxsize=None)
+def _include_closure(source_root: Path, relative: str) -> frozenset[str]:
+    seen: set[str] = set()
+    stack = [relative]
+    while stack:
+        for header in _direct_includes(source_root, stack.pop()):
+            if header not in seen:
+                seen.add(header)
+                stack.append(header)
+    return frozenset(seen)
 
 
 def _link_targets_for_caller(
