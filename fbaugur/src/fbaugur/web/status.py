@@ -135,11 +135,13 @@ def strip_ts(line: str) -> str:
 
 
 def pipeline_dir_of(lines: list[str]) -> Path | None:
-    for line in lines[:20]:
+    """The run directory of the latest pipeline start in the log (a resumed session starts a new one)."""
+    found = None
+    for line in lines:
         m = re.search(r"pipeline directory: (\S+)", line)
         if m:
-            return Path(m.group(1))
-    return None
+            found = Path(m.group(1))
+    return found
 
 
 def hc_run_of(lines: list[str], pipeline_dir: Path | None) -> Path | None:
@@ -693,7 +695,7 @@ def session_status(session: dict[str, Any]) -> dict[str, Any]:
 def _session_status(session: dict[str, Any]) -> dict[str, Any]:
     labels.CURRENT.set(session.get("provider") or "claude")
     lines = read_log(Path(session["log"])) if session.get("log") else []
-    pipeline_dir = Path(session["pipeline_dir"]) if session.get("pipeline_dir") else pipeline_dir_of(lines)
+    pipeline_dir = pipeline_dir_of(lines) or (Path(session["pipeline_dir"]) if session.get("pipeline_dir") else None)
     alive = pid_alive(session.get("pid")) if session.get("pid") else \
         bool(session.get("log")) and Path(session["log"]).is_file() and time.time() - Path(session["log"]).stat().st_mtime < 120
     hc = hc_run_of(lines, pipeline_dir)
