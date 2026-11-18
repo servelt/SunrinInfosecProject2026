@@ -127,6 +127,7 @@ class Run:
                                                      encoding="utf-8")
         self.delta_changes: list[dict[str, Any]] = []
         self._delta_running: set[str] = set()
+        self._recording: set[str] = set()
         self._build_lock = asyncio.Lock()
         self._last_build = 0.0
         for directory in ("logs", "agents", "reports", "inputs", "povs", "work"):
@@ -594,6 +595,13 @@ class Run:
         return self.builders[harness_id]
 
     async def invariant_recorder(self, worker: Worker) -> None:
+        self._recording.add(worker.worker_id)
+        try:
+            await self._invariant_recorder(worker)
+        finally:
+            self._recording.discard(worker.worker_id)
+
+    async def _invariant_recorder(self, worker: Worker) -> None:
         seen: set[str] = set()
         while not self.out_of_time():
             rows = self.store.rows(
@@ -636,9 +644,11 @@ class Run:
         while not self.out_of_time():
             pending = self.store.rows("SELECT * FROM invariants WHERE status='pending_build'")
             if not pending or time.time() - self._last_build < self.cfg.rebuild_min_interval_seconds:
-                if not pending and self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying') "
-                        "AND worker_id=?", worker.worker_id):
+                # The recorder writes an invariant after the last SP is judged; stopping before it
+                # has finished left that invariant at pending_build forever (redis 81d653f5d).
+                if not pending and self.sp_done.is_set() and worker.worker_id not in self._recording and \
+                        not self.store.scalar("SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying') "
+                                              "AND worker_id=?", worker.worker_id):
                     return
                 await asyncio.sleep(IDLE * 2)
                 continue
