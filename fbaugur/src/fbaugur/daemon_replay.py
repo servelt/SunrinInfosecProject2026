@@ -118,8 +118,48 @@ def _send_datagrams(host: str, port: int, data: bytes) -> dict:
     return {"sent": sent, "packets": len(packets)}
 
 
+def _run_once(spec: dict, data: bytes) -> dict:
+    """stdin / file delivery: the program reads one input and exits, so each run is a new process.
+
+    The command names the input as {input_file} (file) or reads it on standard input (stdin)."""
+    with tempfile.TemporaryDirectory(prefix="replay-") as tmp:
+        path = os.path.join(tmp, "input")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        argv = [word.replace("{input_file}", path) for word in shlex.split(spec["command"])]
+        try:
+            done = subprocess.run(argv, cwd=spec.get("cwd") or None, input=data if spec.get("delivery") == "stdin" else None,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, **spec.get("env", {})),
+                                  timeout=float(spec.get("io_timeout", 10)) + float(spec.get("startup_timeout", 15)))
+            return {"returncode": done.returncode, "stderr": done.stderr.decode("utf-8", "replace")[-60000:],
+                    "timed_out": False}
+        except subprocess.TimeoutExpired as exc:
+            return {"returncode": None, "stderr": (exc.stderr or b"").decode("utf-8", "replace")[-60000:],
+                    "timed_out": True}
+
+
+def _main_once(spec: dict) -> int:
+    data = bytes.fromhex(spec["input_hex"])
+    result: dict = {"started": True, "sent": len(data), "received": 0, "response_hex": ""}
+    runs, stderr, returncode = 0, "", 0
+    for _ in range(max(1, int(spec.get("repeat", 1)))):
+        once = _run_once(spec, data)
+        runs += 1
+        stderr, returncode = once["stderr"], once["returncode"]
+        # A run that dies of a signal or a sanitizer report is the finding; stop there.
+        if returncode is None or returncode < 0 or "Sanitizer" in stderr:
+            break
+    result.update({"runs_sent": runs, "returncode": returncode, "stderr": stderr,
+                   "crashed_on_its_own": returncode is not None and returncode < 0})
+    print(json.dumps(result))
+    return 0
+
+
 def main(spec_path: str) -> int:
     spec = json.loads(open(spec_path, encoding="utf-8").read())
+    if spec.get("delivery") in ("stdin", "file"):
+        return _main_once(spec)
     host, port = spec.get("host", "127.0.0.1"), int(spec["port"])
     kind = socket.SOCK_DGRAM if spec.get("delivery") == "datagram" else socket.SOCK_STREAM
     data = bytes.fromhex(spec["input_hex"])

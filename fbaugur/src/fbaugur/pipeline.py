@@ -37,7 +37,9 @@ def add_arguments(parser) -> None:
     harness.add_argument("--coverage-cwd", type=Path, help="working directory for --coverage-command")
     harness.add_argument("--thread-trace-command",
                          help="command of a second build linked with the thread-trace hook")
-    harness.add_argument("--port", type=int, required=True, help="port the program listens on")
+    harness.add_argument("--port", type=int, default=None,
+                         help="port the program listens on (required for --channel tcp/udp; a program read "
+                              "through --channel stdin/file has none)")
     harness.add_argument("--host", default="127.0.0.1")
     harness.add_argument("--channel", action="append", default=[], choices=["tcp", "udp", "stdin", "file"],
                          help="channel to produce a harness for (repeatable; default: every delivery "
@@ -73,7 +75,9 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
             "--provider", args.provider, "--workers", str(max(1, args.concurrency)),
             "--coverage-root", str(args.coverage_root.resolve()),
             "--coverage-command", args.coverage_command,
-            "--port", str(args.port), "--host", args.host]
+            "--host", args.host]
+    if args.port:
+        argv += ["--port", str(args.port)]
     if args.coverage_cwd:
         argv += ["--coverage-cwd", str(args.coverage_cwd.resolve())]
     if args.thread_trace_command:
