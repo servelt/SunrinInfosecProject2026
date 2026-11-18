@@ -74,6 +74,18 @@ def _mirror_root(root: Path, db: Path) -> Path | None:
     return None
 
 
+def _build_tree(db: Path) -> Path | None:
+    """The directory every compilation in the database ran under: the build tree (redis: the copy
+    of the checkout the preparation built in; meson/CMake: the out-of-tree build directory)."""
+    try:
+        records = json.loads(db.read_text(encoding="utf-8"))
+        dirs = {str(Path(str(r.get("directory") or db.parent)).resolve())
+                for r in records if isinstance(r, dict)}
+        return Path(os.path.commonpath(sorted(dirs))) if dirs else None
+    except (OSError, ValueError):
+        return None
+
+
 def _relative(path: Path, root: Path | None) -> str | None:
     try:
         return str(path.relative_to(root)) if root is not None else None
@@ -290,7 +302,12 @@ def _compilers(sanitizer: str) -> tuple[str | None, str | None]:
 def build_native(
     source_root: Path, harness: Path, output: Path,
     *, compile_database: Path | None = None, target_binary: Path | None = None,
+    archive_root: Path | None = None,
 ) -> Path:
+    """`archive_root`: where the static archives of libraries built without -g are taken from
+    (default: the build tree the compile database records).  A sanitizer build must take them from
+    a build made with the same sanitizer: an uninstrumented archive in a MemorySanitizer binary
+    makes every value it writes look uninitialised (redis: bundled Lua, at startup)."""
     root = source_root.resolve(strict=True)
     harness = harness.resolve(strict=True)
     output = output.resolve()
@@ -343,8 +360,10 @@ def build_native(
         # Libraries the project built without -g leave no compile unit behind (a bundled Lua, xxhash).
         # Its own static archives supply them; a linker takes an archive member only for a symbol
         # nothing else defines, so archives never duplicate the units compiled above.
+        build_tree = _build_tree(db) or root
+        archive_dir = Path(archive_root).resolve() if archive_root else build_tree
         archives: dict[str, Path] = {}
-        for archive in sorted(root.rglob("*.a"), key=lambda p: (len(p.parts), str(p))):
+        for archive in sorted(archive_dir.rglob("*.a"), key=lambda p: (len(p.parts), str(p))):
             archives.setdefault(archive.name, archive)
         if archives:
             extra_link_flags = ["-Wl,--start-group", *(str(a) for a in archives.values()), "-Wl,--end-group"]
@@ -494,6 +513,8 @@ def build_native(
         "original_sources": [str(unit.source) for unit in units],
         "renamed_main": [str(p) for p in mains],
         "target_binary": str(target_binary) if linked_units is not None else None,
+        "build_tree": str(_build_tree(db)) if linked_units is not None and db else None,
+        "archive_root": str(archive_root) if archive_root else None,
         "compile_commands": [],
     }
     plan_file = scratch / "build-plan.json"
@@ -554,12 +575,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-database", type=Path)
     parser.add_argument("--target-binary", type=Path)
+    parser.add_argument("--archive-root", type=Path,
+                        help="take static archives of libraries built without -g from this build tree")
     args = parser.parse_args(argv)
     try:
         path = build_native(
             args.source_root, args.harness, args.output,
             compile_database=args.compile_database,
             target_binary=args.target_binary,
+            archive_root=args.archive_root,
         )
     except (OSError, NativeBuildUnresolved) as exc:
         print(f"NATIVE_BUILD_UNRESOLVED: {exc}", file=sys.stderr)

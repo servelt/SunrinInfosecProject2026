@@ -175,6 +175,13 @@ class Run:
                 harnesscreator_src=Path(self.index["harnesscreator_src"]), python=self.cfg.python,
                 extra_cflags=self.cfg.native_extra_cflags, sanitizer="memory",
                 compile_database=self.project.compile_database)
+            tree, why = builder.sanitizer_tree(self.cfg.daemon_msan_command)
+            if why:
+                # Linking the uninstrumented archives instead would report every value they write as
+                # uninitialised, from the first input on.
+                self.emit(f"[msan] {worker.harness_id}: no MemorySanitizer build -- {why}")
+                continue
+            builder.archive_root = tree
             try:
                 result = await asyncio.to_thread(builder.build, 1, [], self.emit)
             except Exception as exc:                             # MSan is an addition; never fatal

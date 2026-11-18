@@ -47,7 +47,12 @@ Deliver two files, written by you:
    each step (they become the progress bar). `set -eu`, idempotent (it may run again on the same WORK),
    build output into log files, not the terminal. It must produce:
    a. $WORK/analysis/compile_commands.json for the program's own sources (use `bear -- <build>`;
-      keep the project's normal configure options; the analysis needs the real defines).
+      keep the project's normal configure options; the analysis needs the real defines). Build
+      only the server program's target, with -g, and KEEP the build: the harness is linked from the
+      translation units that program's debug information names and from the static archives the
+      build made (bundled libraries), so the executable and its build tree must stay in $WORK/analysis.
+      Build every variant below in the same layout (a copy of the source tree, or an out-of-tree
+      build directory) so the executable sits at the same path inside each build tree.
    b. $WORK/cov/: a build with `gcc --coverage -O0 -g` (or the project's build with
       CC=gcc CFLAGS="-O0 -g --coverage" LDFLAGS=--coverage). IMPORTANT: the source files must be
       INSIDE $WORK/cov (copy the source tree into $WORK/cov and build there), because coverage records
@@ -77,6 +82,7 @@ Deliver two files, written by you:
     "--coverage-cwd", "{{WORK}}/cov",
     "--thread-trace-command", "{{WORK}}/trace/<binary> <same args>",          (omit both if no trace build)
     "--analysis-compile-database", "{{WORK}}/analysis/compile_commands.json",
+    "--harness-link-binary", "{{WORK}}/analysis/<path to the server binary the analysis build made>",
     "--port", "<port>", "--channel", "tcp",
     "--daemon-command", "{{WORK}}/daemon-asan/<binary> <args>",
     "--daemon-msan-command", "{{WORK}}/daemon-msan/<binary> <args>",          (omit both if no msan build)
@@ -176,11 +182,19 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
             problems.append("prepare.sh printed no '[prep] ...' step lines")
     args = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
     opt = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i].startswith("--")}
-    for key in ("--coverage-root", "--coverage-command", "--analysis-compile-database", "--channel"):
+    for key in ("--coverage-root", "--coverage-command", "--analysis-compile-database", "--channel",
+                "--harness-link-binary"):
         if key not in opt:
             problems.append(f"pipeline_args has no {key}")
     if problems:
         return problems
+    link = Path(opt["--harness-link-binary"])
+    if not link.is_file():
+        problems.append(f"--harness-link-binary {link} does not exist; keep the analysis build")
+    else:
+        sections = subprocess.run(["readelf", "-S", str(link)], capture_output=True, text=True).stdout
+        if ".debug_info" not in sections:
+            problems.append(f"--harness-link-binary {link} has no debug information; build it with -g")
     try:
         entries = json.loads(Path(opt["--analysis-compile-database"]).read_text(encoding="utf-8"))
         if not entries:

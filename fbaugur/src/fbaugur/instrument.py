@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -271,7 +272,8 @@ class InvariantBuilder:
 
     def __init__(self, *, source_root: Path, harness_source: Path, build_plan: Path | None, work_dir: Path,
                  harnesscreator_src: Path, python: str, extra_cflags: str = "",
-                 sanitizer: str = "address+undefined", compile_database: Path | None = None):
+                 sanitizer: str = "address+undefined", compile_database: Path | None = None,
+                 archive_root: Path | None = None):
         self.source_root = source_root
         self.harness_source = harness_source
         self.work_dir = work_dir
@@ -296,8 +298,48 @@ class InvariantBuilder:
             found = re.search(r"translation units linked into (\S+) \(DWARF\)", str(self.plan.get("build_evidence") or ""))
             target = found.group(1) if found else None
         self.target_binary = Path(target) if target and Path(target).is_file() else None
+        self.archive_root = archive_root
         self.macros = function_like_macros(source_root)
         self.base = work_dir / "src-base"
+
+    def build_tree(self) -> Path | None:
+        """The build tree of the stage-1 harness build (where its link closure and archives came from)."""
+        if self.plan.get("build_tree"):
+            return Path(self.plan["build_tree"])
+        if self.compile_database is None or not Path(self.compile_database).is_file():
+            return None
+        try:
+            records = json.loads(Path(self.compile_database).read_text(encoding="utf-8"))
+            dirs = sorted({str(Path(str(r.get("directory") or "")).resolve()) for r in records if isinstance(r, dict)})
+            return Path(os.path.commonpath(dirs)) if dirs else None
+        except (OSError, ValueError):
+            return None
+
+    def sanitizer_tree(self, daemon_command: str) -> tuple[Path | None, str]:
+        """The build tree of the same program built with this builder's sanitizer, or why there is none.
+
+        The harness links the program's own archives for libraries built without -g.  They must
+        carry the same sanitizer, so for MemorySanitizer they come from the MSan daemon build: the
+        tree where that build's executable sits at the same path as the stage-1 target binary sits
+        in its build tree (redis: daemon-msan/ + src/redis-server; meson: daemon-msan/build/ + ...)."""
+        if self.target_binary is None:
+            return None, ""                       # no archives are linked; nothing to match
+        tree = self.build_tree()
+        if tree is None:
+            return None, "the stage-1 build tree is unknown"
+        try:
+            relative = self.target_binary.resolve().relative_to(tree.resolve())
+        except ValueError:
+            return None, f"{self.target_binary} is outside its build tree {tree}"
+        words = [w for w in shlex.split(daemon_command or "") if w != "env" and not re.match(r"^[A-Za-z_]\w*=", w)]
+        if not words:
+            return None, "no daemon command built with this sanitizer"
+        binary = Path(words[0]).resolve()
+        if not str(binary).endswith("/" + str(relative)):
+            return None, (f"{binary} does not sit at {relative} of a build tree like {self.target_binary} does, "
+                          "so its archives cannot be matched")
+        candidate = Path(str(binary)[: -len(str(relative)) - 1])
+        return (candidate, "") if candidate.is_dir() else (None, f"{candidate} is not a directory")
 
     # -- source copy -----------------------------------------------------------
     def ensure_base(self) -> None:
@@ -429,6 +471,8 @@ class InvariantBuilder:
             argv += ["--compile-database", str(database)]
         if self.target_binary is not None:
             argv += ["--target-binary", str(self.target_binary)]
+        if self.archive_root is not None:
+            argv += ["--archive-root", str(self.archive_root)]
         proc = subprocess.run(argv,
                               capture_output=True, text=True, env=env, timeout=1800)
         output = proc.stdout + proc.stderr
