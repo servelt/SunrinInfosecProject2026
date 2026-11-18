@@ -344,89 +344,51 @@ class Run:
             self.emit("[delta] the diff changes no function of this program; nothing to analyse")
         return bool(changes)
 
-    _DELTA_BATCH_FUNCTIONS = 20
-
-    def _delta_batches(self) -> list[list[dict[str, Any]]]:
-        """Changed functions grouped by file, at most _DELTA_BATCH_FUNCTIONS per batch.
-
-        FBv2 gives one agent the whole diff.  That holds for a small change (LightFTP: one function,
-        570 bytes) but not for a large one: on redis 81d653f5d (286 functions, 456 kB) the single agent
-        read five functions and stopped.  Each batch is one agent with one file's diff."""
-        by_file: dict[str, list[dict[str, Any]]] = {}
-        for change in self.delta_changes:
-            by_file.setdefault(change["file"], []).append(change)
-        batches = []
-        for changes in by_file.values():
-            changes = sorted(changes, key=lambda c: (not c["static_reachable"], c.get("distance") or 0))
-            for i in range(0, len(changes), self._DELTA_BATCH_FUNCTIONS):
-                batches.append(changes[i:i + self._DELTA_BATCH_FUNCTIONS])
-        return batches
-
     async def delta_sp_agent(self, worker: Worker) -> None:
-        """FBv2 DeltaSPGenerator, run once per batch of changed functions (see _delta_batches)."""
+        """FBv2 DeltaSPGenerator: one agent reads the diff and analyses every changed function."""
         try:
             if not self.delta_changes or self.out_of_time():
                 return
-            batches = self._delta_batches()
-            queue: asyncio.Queue = asyncio.Queue()
-            for number, batch in enumerate(batches, 1):
-                queue.put_nowait((number, batch))
-            self.emit(f"[delta] {len(self.delta_changes)} changed function(s) in {len(batches)} batch(es) "
-                      f"for {worker.worker_id}")
-
-            async def slot() -> None:
-                while not queue.empty() and not self.out_of_time() and not self.stop.is_set():
-                    number, batch = queue.get_nowait()
-                    await self._delta_batch(worker, batch, number, len(batches))
-
-            await asyncio.gather(*(slot() for _ in range(max(1, self.cfg.sp_generator_agents))))
+            harness = self.harness(worker)
+            fuzzer_code = harness.source_path.read_text(encoding="utf-8", errors="replace")
+            reachable = [c for c in self.delta_changes if c["static_reachable"]]
+            unreachable = [c for c in self.delta_changes if not c["static_reachable"]]
+            listing = ""
+            if reachable:
+                listing += "### Static-Reachable Functions:\n" + "".join(
+                    f"- {c['function']} ({c['file']})\n  Distance: {c['distance']}\n" for c in reachable) + "\n"
+            if unreachable:
+                listing += ("### Static-Unreachable Functions (MAY BE REACHABLE VIA FUNCTION POINTERS!):\n"
+                            + "".join(f"- {c['function']} ({c['file']})\n  Warning: Check for function pointer "
+                                      "patterns!\n" for c in unreachable) + "\n")
+            fuzzer = worker.harness_id
+            # FBv2 DeltaSPGenerator.get_initial_message, same structure and wording.
+            message = (f"Analyze the code changes for potential vulnerabilities.\n\n"
+                       f"## Your Target Configuration (FIXED - cannot change)\n\n"
+                       f"**Fuzzer**: `{fuzzer}`\n**Sanitizer**: `{worker.sanitizer}`\n\n"
+                       f"Only find vulnerabilities that are:\n1. REACHABLE from `{fuzzer}` (verify call path exists)\n"
+                       f"2. DETECTABLE by `{worker.sanitizer}` sanitizer (bug type must match)\n\n"
+                       f"## Fuzzer Source Code (CRITICAL - READ THIS FIRST!)\n\nThis code shows EXACTLY how input "
+                       f"enters the target library.\nVulnerabilities must be reachable through this entry point.\n\n"
+                       f"```c\n{fuzzer_code}\n```\n\n"
+                       f"## Changed Functions (ALL - including static-unreachable)\n\n**IMPORTANT**: Analyze ALL "
+                       f"functions below, even those marked as static-unreachable!\nStatic analysis cannot track "
+                       f"function pointer calls.\n\n{listing}"
+                       f"## Your Task\n\nFollow these steps IN ORDER:\n\n1. **READ THE DIFF**: Call get_diff to see "
+                       f"what code was changed\n\n2. **ANALYZE ALL CHANGED FUNCTIONS** (including static-unreachable!):"
+                       f"\n   - Read each function's source code with get_function_source\n   - Look for "
+                       f"{worker.sanitizer}-detectable vulnerabilities:\n     - {sanitizer_vuln_types(worker.sanitizer)}"
+                       f"\n\n3. **CREATE SUSPICIOUS POINTS**: For each potential vulnerability:\n   - One SP per unique "
+                       f"root cause (not per symptom)\n   - Use control flow description, not line numbers\n   - Set "
+                       f"confidence score based on vulnerability clarity\n   - Include static_reachable info if known"
+                       f"\n\n**IMPORTANT**: Do NOT skip static-unreachable functions! They may be reachable via "
+                       f"function pointers.\nThe Verify agent will judge actual reachability later.\n")
+            await self._agent("delta_sp_generator", worker.harness_id, message, subject="delta",
+                              worker=worker.worker_id, direction="delta", function="")
         finally:
             self._delta_running.discard(worker.worker_id)
             if not self._delta_running:
                 self.sp_done.set()
-
-    async def _delta_batch(self, worker: Worker, batch: list[dict[str, Any]], number: int, total: int) -> None:
-        harness = self.harness(worker)
-        fuzzer_code = harness.source_path.read_text(encoding="utf-8", errors="replace")
-        reachable = [c for c in batch if c["static_reachable"]]
-        unreachable = [c for c in batch if not c["static_reachable"]]
-        listing = ""
-        if reachable:
-            listing += "### Static-Reachable Functions:\n" + "".join(
-                f"- {c['function']} ({c['file']})\n  Distance: {c['distance']}\n" for c in reachable) + "\n"
-        if unreachable:
-            listing += ("### Static-Unreachable Functions (MAY BE REACHABLE VIA FUNCTION POINTERS!):\n"
-                        + "".join(f"- {c['function']} ({c['file']})\n  Warning: Check for function pointer "
-                                  "patterns!\n" for c in unreachable) + "\n")
-        file = batch[0]["file"]
-        fuzzer = worker.harness_id
-        # FBv2 DeltaSPGenerator.get_initial_message, same structure and wording; the diff step names
-        # this batch's file and the parts a long diff comes in.
-        message = (f"Analyze the code changes for potential vulnerabilities.\n\n"
-                   f"This is batch {number} of {total}: the changed functions of `{file}` listed below. Other "
-                   f"batches cover the rest of the change.\n\n"
-                   f"## Your Target Configuration (FIXED - cannot change)\n\n"
-                   f"**Fuzzer**: `{fuzzer}`\n**Sanitizer**: `{worker.sanitizer}`\n\n"
-                   f"Only find vulnerabilities that are:\n1. REACHABLE from `{fuzzer}` (verify call path exists)\n"
-                   f"2. DETECTABLE by `{worker.sanitizer}` sanitizer (bug type must match)\n\n"
-                   f"## Fuzzer Source Code (CRITICAL - READ THIS FIRST!)\n\nThis code shows EXACTLY how input "
-                   f"enters the target library.\nVulnerabilities must be reachable through this entry point.\n\n"
-                   f"```c\n{fuzzer_code}\n```\n\n"
-                   f"## Changed Functions (ALL - including static-unreachable)\n\n**IMPORTANT**: Analyze ALL "
-                   f"functions below, even those marked as static-unreachable!\nStatic analysis cannot track "
-                   f"function pointer calls.\n\n{listing}"
-                   f"## Your Task\n\nFollow these steps IN ORDER:\n\n1. **READ THE DIFF**: Call "
-                   f"get_diff(file=\"{file}\") to see what code was changed; a long diff comes in parts, read "
-                   f"every part\n\n2. **ANALYZE ALL CHANGED FUNCTIONS** (including static-unreachable!):"
-                   f"\n   - Read each function's source code with get_function_source\n   - Look for "
-                   f"{worker.sanitizer}-detectable vulnerabilities:\n     - {sanitizer_vuln_types(worker.sanitizer)}"
-                   f"\n\n3. **CREATE SUSPICIOUS POINTS**: For each potential vulnerability:\n   - One SP per unique "
-                   f"root cause (not per symptom)\n   - Use control flow description, not line numbers\n   - Set "
-                   f"confidence score based on vulnerability clarity\n   - Include static_reachable info if known"
-                   f"\n\n**IMPORTANT**: Do NOT skip static-unreachable functions! They may be reachable via "
-                   f"function pointers.\nThe Verify agent will judge actual reachability later.\n")
-        await self._agent("delta_sp_generator", worker.harness_id, message, subject=f"delta {number}/{total}",
-                          worker=worker.worker_id, direction="delta", function="")
 
     def _fill_pools(self) -> None:
         """FBv2 priority pools: core/general x not-yet-analysed/analysed (Table 2).
