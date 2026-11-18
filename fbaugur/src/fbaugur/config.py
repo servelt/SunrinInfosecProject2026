@@ -41,9 +41,16 @@ DEFAULT_MAX_TURNS = {
 # model and a fast model (Codex: models_cache of codex-cli 0.167; Ollama: the cloud models
 # HarnessCreator already routes its roles to).
 PROVIDERS = ("claude", "codex", "ollama")
-# Every Codex request runs with Daybreak (/daybreak) enabled: --ignore-user-config drops the
-# user's `daybreak = true`, so it is set here explicitly.
 CODEX_DAYBREAK = ["-c", "daybreak=true", "--enable", "cli_daybreak"]
+
+
+def codex_daybreak_args(model: str) -> list[str]:
+    """Request Daybreak only for models accepted by that program.
+
+    The backend rejects a Daybreak request for gpt-6.1-sol with HTTP 403.
+    Unknown models use the ordinary Codex path until support is confirmed.
+    """
+    return list(CODEX_DAYBREAK) if model in {"gpt-6-sol", "gpt-5.6-cyber"} else []
 PROVIDER_MODELS = {
     "claude": {"1": "claude-opus-5-5", "2": "claude-sonnet-5-5", "3": "claude-haiku-5-5"},
     "codex": {"1": "gpt-6-sol", "2": "gpt-6-sol", "3": "gpt-6-luna"},
@@ -75,7 +82,8 @@ class RunConfig:
     pov_agents: int = 2
     max_turns: dict[str, int] = dataclasses.field(default_factory=lambda: dict(DEFAULT_MAX_TURNS))
     agent_timeout_seconds: float = 1800.0
-    pov_min_score: float = 0.5           # FBv2 PipelineConfig.pov_min_score
+    pov_min_score: float = 0.5           # FBv2 PipelineConfig.pov_min_score; recorded only -- the verifier's
+                                         # is_important verdict admits an SP to PoV (orchestrator.verifier_agent)
     max_pov_attempts: int = 20           # FBv2 POVAgent max_pov_attempts
     trace_unlock_after: int = 3          # FBv2: trace_pov after 3 failed attempts
     max_directions: int = 5              # FBv2 §3.4.1
@@ -106,6 +114,11 @@ class RunConfig:
     # After the deadline: time allowed to confirm and validate crashes the fuzzers recorded while
     # they were being stopped, or that a cancelled lane left half-done.
     final_drain_minutes: float = 10.0
+    final_drain_passes: int = 4          # settle rounds: triage can add PoV work, refinement can add builds
+    sp_generation_attempts: int = 3      # tries per pool function before it is reported as not analysed
+    pov_attempts_without_input: int = 2  # PoV turns that ran no input (model error, empty turn) before 'not attempted'
+    triage_attempts: int = 2             # triage turns without a verdict (model error, no tool call) per violation
+    recorder_attempts: int = 2           # invariant recorder turns that failed before the candidate is given up
     # The pipeline's live end time (deadline.py) and how many contexts are still to come after this
     # scan: this scan's end is its equal share of what is left, recomputed when the file changes.
     deadline_file: str = ""

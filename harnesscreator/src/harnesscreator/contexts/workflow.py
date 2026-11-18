@@ -10,7 +10,7 @@ from typing import Any, Callable
 from ..analysis.graph import GraphStore
 from ..llm.base import is_terminal_llm_infrastructure_error
 from .agents import SeedFrontierAgent, SeedGeneratorAgent, describe_seed, seeds_from_items
-from .builder import CallGraph
+from .builder import CallGraph, entry_supports_delivery
 from .coverage import CoverageUnavailable, GcovCoverage, TargetMap
 from .execution import ProgramRunner
 from .model import Seed, SeedResult
@@ -139,6 +139,12 @@ class SeedWorkflow:
         beyond_baseline = (functions - self.baseline_functions) or (lines - self.baseline_lines)
         if problem:
             status, reason = "COVERAGE_UNAVAILABLE", problem
+        elif self.delivery == "peer_stream" and len(seed.messages) > 1 and not observation.peer_contact:
+            # The peer's bytes are what a peer_stream harness fuzzes.  Coverage the trigger alone
+            # caused (on 3proxy: DNS query bytes sent to an HTTP proxy port ran its line reader)
+            # says nothing about them: without the connection they were never delivered.
+            status, reason = "REJECTED_NO_PEER_CONTACT", (observation.error or
+                                                          "the program never connected to the peer listener")
         elif observation.error and not beyond_baseline:
             status, reason = "RUN_FAILED", observation.error
         elif not beyond_baseline:
@@ -151,7 +157,8 @@ class SeedWorkflow:
             seed_id=seed.seed_id, context_id=self.context_id, delivery=self.delivery, status=status, reason=reason,
             responses_hex=[response.hex() for response in observation.responses],
             covered_target_function_ids=sorted(functions), new_target_function_ids=sorted(new_functions),
-            new_target_lines=len(new_lines), process_exit=observation.exit_status)
+            new_target_lines=len(new_lines), process_exit=observation.exit_status,
+            entry_coverage=self._entry_coverage(functions))
         self.results[seed.seed_id] = result
         self.counts[status] += 1
         _append(self.out / "candidates.jsonl", dataclasses.asdict(seed))
@@ -174,6 +181,7 @@ class SeedWorkflow:
                 "seed_id": seed.seed_id, "context_id": self.context_id, "delivery": self.delivery,
                 "messages_hex": seed.messages_hex, "responses_hex": result.responses_hex,
                 "covered_target_function_ids": result.covered_target_function_ids,
+                "entry_coverage": result.entry_coverage,
                 "target_functions_beyond_baseline": sorted(
                     self._name(fid) for fid in functions - self.baseline_functions),
                 "origin": seed.origin, "rationale": seed.rationale}, ensure_ascii=False, indent=2) + "\n",
@@ -208,6 +216,15 @@ class SeedWorkflow:
                   f"{differing} executed fewer functions than with paced delivery")
         return {"seeds_measured": measured, "seeds_executing_fewer_functions": differing}
 
+    def _entry_coverage(self, functions: set[str]) -> str:
+        """Whether a run executed an Entry function of this context and delivery (by coverage)."""
+        entries = {entry.get("entry_function_id") for entry in self.context.get("entries", [])
+                   if entry_supports_delivery(self.context, entry, self.delivery)}
+        measurable = entries & set(getattr(self, "targets", set()) or set())
+        if not measurable:
+            return "not_measurable"
+        return "executed" if measurable & functions else "not_executed"
+
     async def measure_request_threads(self) -> dict[str, int]:
         """Record, per accepted seed, the functions run by the thread that ran the Entry function.
 
@@ -221,7 +238,7 @@ class SeedWorkflow:
         from .thread_trace import read_trace, request_functions
         runner, trace_file, symbols = self.thread_trace
         entry_names = {entry["entry_function"] for entry in self.context.get("entries", [])
-                       if entry.get("delivery") == self.delivery}
+                       if entry_supports_delivery(self.context, entry, self.delivery)}
         measured = without_entry = 0
         for seed_id, (seed, _responses, _functions) in self.accepted.items():
             path = self.out / "corpus" / self.context_id / f"{seed_id}.json"
@@ -411,8 +428,17 @@ class SeedWorkflow:
                     encoding="utf-8")
         for row in earlier.values():
             await self.verify(Seed(**row))
-        if self.skip_generator:
-            candidates, trace = [], {"turns": 0, "opened_functions": [], "opened_artifacts": [], "ended": "skipped"}
+        # No target function of this context is compiled into the coverage
+        # build (e.g. every one sits behind a platform #ifdef).  A seed is
+        # accepted only when it executes a target, so no input can be accepted
+        # here: asking the models would only spend time.  Recorded, not hidden.
+        no_compiled_target = bool(self.all_targets) and not self.targets
+        if no_compiled_target:
+            self.emit(f"[SEED] {self.key} none of its {len(self.all_targets)} target functions is in this build; "
+                      "seed generation and frontier exploration skipped")
+        if self.skip_generator or no_compiled_target:
+            candidates, trace = [], {"turns": 0, "opened_functions": [], "opened_artifacts": [],
+                                     "ended": "no_target_in_this_build" if no_compiled_target else "skipped"}
         else:
             generator = SeedGeneratorAgent(self.llm, self.graph, self.source_root, max_turns=self.generator_turns)
             candidates, trace = await generator.run(self.context, self.delivery, self.artifact_paths)
@@ -426,8 +452,8 @@ class SeedWorkflow:
                      if row.get("context_id") == self.context_id and row.get("delivery") == self.delivery
                      and row.get("outcome") != "REACHED"}
         frontier_records = []
-        stopped = "frontier_empty"
-        while True:
+        stopped = "no_target_in_this_build" if no_compiled_target else "frontier_empty"
+        while not no_compiled_target:
             pending = [item for item in self.frontier() if item[0] not in attempted]
             if not pending:
                 break
@@ -483,6 +509,16 @@ class SeedWorkflow:
             "executed_only_with_seeds": len(self.covered_functions - self.baseline_functions),
             "target_lines_executed_only_with_seeds": len(self.covered_lines - self.baseline_lines),
             "seed_results": dict(self.counts), "corpus_seeds": len(self.accepted),
+            # Entry reach of the accepted seeds, apart from their acceptance and from the harness's
+            # equivalence: "entry_executed" is coverage of the Entry in that run; when the run with no
+            # input already executes it, that coverage alone does not show the seed's bytes went through it.
+            "entry_reach": {
+                "accepted": len(self.accepted),
+                "entry_executed": sum(1 for seed_id in self.accepted
+                                      if self.results[seed_id].entry_coverage == "executed"),
+                "entry_not_measurable": sum(1 for seed_id in self.accepted
+                                            if self.results[seed_id].entry_coverage == "not_measurable"),
+                "entry_in_run_without_input": self._entry_coverage(self.baseline_functions) == "executed"},
             "generator": trace,
             "frontier_attempts": dict(collections.Counter(r["outcome"] for r in frontier_records)),
             "frontier_blocked_reasons": dict(collections.Counter(
@@ -496,6 +532,7 @@ class SeedWorkflow:
             **({"peer_trigger_hex": self.peer_trigger.hex()} if self.peer_trigger is not None else {}),
             "note": "A budget stop means not examined, not unreachable.",
         }
+        self.out.mkdir(parents=True, exist_ok=True)  # no seed may have been measured at all
         (self.out / f"summary-{self.key}.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (self.out / f"coverage-{self.key}.json").write_text(json.dumps({

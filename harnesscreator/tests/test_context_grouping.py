@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 
 from harnesscreator.contexts.agents import ContextLocatorAgent, EntryChannelClassifier
-from harnesscreator.contexts.builder import CallGraph, api_resource, build_contexts, resolve_channel
+from harnesscreator.contexts.builder import (CallGraph, api_resource, build_contexts,
+                                             entry_supports_delivery, resolve_channel)
 from harnesscreator.contexts.cli import load_graph
 from harnesscreator.llm.base import ScriptedLLM
 from test_contexts_stage import write_run
@@ -62,6 +63,87 @@ class DriverTests(unittest.TestCase):
 
 
 class ChannelTests(unittest.TestCase):
+    def test_classifier_unknown_delivery_measures_both_for_any_socket_api(self):
+        # Not an API list: recv, recvfrom and read on a socket can each sit on either socket type.
+        for api in ("recv", "recvfrom", "read"):
+            with self.subTest(api=api), tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                entry = {
+                    "entry_id": "e-open", "entry_function_id": "fn-tcp_read", "source_api": api,
+                    "status": "VERIFIED", "channel_kind": "ambiguous network/socket input",
+                    "consumer_hints": [], "unknowns": [],
+                }
+                write_run(run, entries=[entry], extra_functions=["tcp_read"])
+                write_rows(run / "contexts" / "classification.jsonl", [
+                    {"entry_id": "e-open", "resource_kind": "network", "delivery": "unknown"}])
+                context = next(ctx for ctx in build_contexts(run)["contexts"]
+                               if any(m.entry_id == "e-open" for m in ctx.entries))
+                member = next(m for m in context.entries if m.entry_id == "e-open")
+                self.assertEqual(context.deliveries, ["datagram", "stream"])
+                self.assertEqual(member.delivery_candidates, ["datagram", "stream"]
+                                 if member.delivery == "datagram" else ["stream", "datagram"])
+                self.assertEqual(member.delivery_basis, "unresolved:classifier")
+                data = context.to_json()
+                for delivery in ("stream", "datagram"):
+                    self.assertTrue(entry_supports_delivery(data, data["entries"][0], delivery))
+                self.assertFalse(entry_supports_delivery(data, data["entries"][0], "peer_stream"))
+
+    def test_verifier_unknowns_reopen_a_classifier_choice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            entry = {
+                "entry_id": "e-verified-ambiguous", "entry_function_id": "fn-tcp_read",
+                "source_api": "recvfrom", "status": "VERIFIED", "channel_kind": "network socket input",
+                "consumer_hints": [], "unknowns": ["Whether the socket transport is TCP or UDP is not established."],
+            }
+            write_run(run, entries=[entry], extra_functions=["tcp_read"])
+            write_rows(run / "contexts" / "classification.jsonl", [
+                {"entry_id": entry["entry_id"], "resource_kind": "network", "delivery": "datagram"},
+            ])
+            context = next(ctx for ctx in build_contexts(run)["contexts"]
+                           if any(m.entry_id == entry["entry_id"] for m in ctx.entries))
+            member = context.entries[0]
+            self.assertEqual(context.deliveries, ["datagram", "stream"])
+            self.assertEqual(member.delivery, "datagram")
+            self.assertEqual(member.delivery_basis, "unresolved:entry_verifier")
+            self.assertTrue(member.transport_unresolved)
+            self.assertTrue(entry_supports_delivery(context.to_json(), context.to_json()["entries"][0], "stream"))
+
+    def test_established_delivery_stays_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            verified_udp = {
+                "entry_id": "e-verified-udp", "entry_function_id": "fn-udp_read",
+                "source_api": "recvfrom", "status": "VERIFIED",
+                "channel_kind": "ambiguous network/socket input: UDP datagram socket", "consumer_hints": [],
+            }
+            unresolved = {
+                "entry_id": "e-ambiguous", "entry_function_id": "fn-tcp_read",
+                "source_api": "recvfrom", "status": "UNRESOLVED",
+                "channel_kind": "ambiguous network/socket input", "consumer_hints": [],
+                "unknowns": ["The socket transport is not established."],
+            }
+            write_run(run, entries=[verified_udp], extra_functions=["udp_read", "tcp_read"])
+            write_rows(run / "entries" / "unresolved.jsonl", [unresolved])
+            write_rows(run / "contexts" / "classification.jsonl", [
+                {"entry_id": "e-verified-udp", "resource_kind": "network", "delivery": "datagram"},
+                {"entry_id": "e-ambiguous", "resource_kind": "network", "delivery": "datagram"},
+            ])
+            contexts = build_contexts(run, include_unresolved=True)["contexts"]
+            by_entry = {entry.entry_id: context for context in contexts for entry in context.entries}
+            self.assertEqual(by_entry["e-verified-udp"].deliveries, ["datagram"])
+            self.assertEqual(by_entry["e-ambiguous"].deliveries, ["datagram", "stream"])
+            known = by_entry["e-verified-udp"].to_json()
+            unknown = by_entry["e-ambiguous"].to_json()
+            self.assertFalse(entry_supports_delivery(known, known["entries"][0], "stream"))
+            self.assertTrue(entry_supports_delivery(unknown, unknown["entries"][0], "stream"))
+
+    def test_legacy_context_json_without_candidates(self):
+        context = {"deliveries": ["datagram", "stream"]}
+        legacy = {"delivery": "datagram", "transport_unresolved": True}
+        self.assertTrue(entry_supports_delivery(context, legacy, "stream"))
+        self.assertFalse(entry_supports_delivery(context, {"delivery": "datagram"}, "stream"))
+
     def test_keyword_table_misplaces_the_recorded_descriptions(self):
         self.assertEqual(resolve_channel(ENTRIES[2], None), ("network", "datagram", "keyword_table"))
         self.assertEqual(resolve_channel(ENTRIES[3], None)[0], "network")

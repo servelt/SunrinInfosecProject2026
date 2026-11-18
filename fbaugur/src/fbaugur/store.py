@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS directions (
 CREATE TABLE IF NOT EXISTS pool (
     worker_id TEXT, direction_id TEXT, function_name TEXT, pool TEXT, phase INTEGER,
     status TEXT, sp_count INTEGER DEFAULT 0, error TEXT, updated_at REAL,
-    PRIMARY KEY (worker_id, direction_id, function_name));
+    function_id TEXT NOT NULL DEFAULT '', attempts INTEGER DEFAULT 0,
+    PRIMARY KEY (worker_id, direction_id, function_name, function_id));
 CREATE TABLE IF NOT EXISTS sps (
     sp_id TEXT PRIMARY KEY, worker_id TEXT, harness_id TEXT, direction_id TEXT, function_name TEXT,
     vuln_type TEXT, description TEXT, score REAL, important_controlflow TEXT,
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS sps (
     verification_notes TEXT, pov_guidance TEXT, reachability_status TEXT, reachability_multiplier REAL,
     reachability_reason TEXT, safety_reason TEXT, safety_location TEXT,
     origin TEXT, origin_ref TEXT, witness_path TEXT, merged_into TEXT, claimed_by TEXT,
-    pov_attempts INTEGER DEFAULT 0, created_at REAL, updated_at REAL);
+    pov_attempts INTEGER DEFAULT 0, created_at REAL, updated_at REAL, verdict_at REAL, function_id TEXT);
 CREATE TABLE IF NOT EXISTS povs (
     pov_id TEXT PRIMARY KEY, sp_id TEXT, worker_id TEXT, attempt INTEGER, variant INTEGER,
     blob_path TEXT, crashed INTEGER, crash_type TEXT, summary TEXT, created_at REAL);
@@ -59,6 +60,33 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, message TEXT);
 """
 
+# What a PoV turned into, read from the crashes recorded for its point (newest code and stored runs).
+POV_CONFIRMED_CRASHES = ("confirmed", "validated", "reported", "not_vulnerability", "needs_review", "duplicate",
+                         "possible_duplicate")
+
+
+def settled_pov_status(status: str, crash_statuses: list[str]) -> str:
+    """The SP status a PoV earned once its crash was checked independently.
+
+    A first replay that crashed in the point's function is `pov_unconfirmed` until the crash
+    confirmation lane reproduces it in a fresh process and attributes it to program code
+    (`pov_confirmed`).  A crash that did not reproduce, or faulted inside the harness, or had
+    no program frame, does not prove the point.  `pov_generated` is the status older runs
+    stored for a first replay; it is settled the same way."""
+    if status not in ("pov_generated", "pov_unconfirmed", "pov_confirmed", "pov_not_reproduced",
+                      "pov_harness_fault", "pov_unattributed"):
+        return status
+    if any(c in POV_CONFIRMED_CRASHES for c in crash_statuses):
+        return "pov_confirmed"
+    if any(c in ("pending", "confirming") for c in crash_statuses) or not crash_statuses:
+        return "pov_unconfirmed"
+    for crash, settled in (("unattributed", "pov_unattributed"), ("harness_fault", "pov_harness_fault"),
+                           ("not_reproduced", "pov_not_reproduced")):
+        if crash in crash_statuses:
+            return settled
+    return "pov_unconfirmed"
+
+
 JSON_FIELDS = {"core_functions", "entry_functions", "important_controlflow", "frames", "details",
                "history", "phis", "body"}
 
@@ -77,6 +105,47 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=60000")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def settle_pov(self, sp_id: str | None = None) -> None:
+        """Bring PoV states in line with the crash checks (one point, or every point)."""
+        rows = self.rows("SELECT sp_id, status FROM sps WHERE " + ("sp_id=?" if sp_id else "status LIKE 'pov_%'"),
+                         *((sp_id,) if sp_id else ()))
+        for row in rows:
+            crashes = [r["status"] for r in self.rows("SELECT status FROM crashes WHERE sp_id=?", row["sp_id"])]
+            settled = settled_pov_status(row["status"], crashes)
+            if settled != row["status"]:
+                self.update("sps", "sp_id", row["sp_id"], {"status": settled, "is_real": int(settled == "pov_confirmed"),
+                                                           "updated_at": time.time()})
+
+    def _migrate(self) -> None:
+        """Columns added after a run's database was created (resumed runs keep their database)."""
+        def columns(table: str) -> set[str]:
+            return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+        for column, kind in (("verdict_at", "REAL"), ("function_id", "TEXT")):
+            if column not in columns("sps"):
+                self.conn.execute(f"ALTER TABLE sps ADD COLUMN {column} {kind}")
+        if "function_id" not in columns("pool"):
+            # The key gains function_id (two definitions may share a name), so the table is rebuilt.
+            self.conn.executescript("""
+                BEGIN;
+                ALTER TABLE pool RENAME TO pool_before_function_id;
+                CREATE TABLE pool (
+                    worker_id TEXT, direction_id TEXT, function_name TEXT, pool TEXT, phase INTEGER,
+                    status TEXT, sp_count INTEGER DEFAULT 0, error TEXT, updated_at REAL,
+                    function_id TEXT NOT NULL DEFAULT '', attempts INTEGER DEFAULT 0,
+                    PRIMARY KEY (worker_id, direction_id, function_name, function_id));
+                INSERT INTO pool (worker_id, direction_id, function_name, pool, phase, status, sp_count,
+                                  error, updated_at)
+                    SELECT worker_id, direction_id, function_name, pool, phase, status, sp_count, error,
+                           updated_at FROM pool_before_function_id;
+                DROP TABLE pool_before_function_id;
+                COMMIT;""")
+        elif "attempts" not in columns("pool"):
+            self.conn.execute("ALTER TABLE pool ADD COLUMN attempts INTEGER DEFAULT 0")
+        if "triage_attempts" not in columns("violations"):
+            self.conn.execute("ALTER TABLE violations ADD COLUMN triage_attempts INTEGER DEFAULT 0")
 
     # -- generic helpers ---------------------------------------------------
     @contextmanager

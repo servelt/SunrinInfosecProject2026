@@ -72,6 +72,7 @@ from ..runtime.contracts import ContractAudit, audit_harness_plan
 from ..runtime.native_build import NativeBuildUnresolved, build_native
 from ..runtime.runner import SANITIZER_MARKERS, CommandRunner
 from ..storage import ArtifactStore
+from .builder import entry_supports_delivery
 
 OUTPUT_DIR = "context-harnesses"
 
@@ -368,7 +369,8 @@ def build_unit(
             return False
         return record.entry_function_id in functions
 
-    of_delivery = [item for item in context.get("entries") or [] if item.get("delivery") == delivery]
+    of_delivery = [item for item in context.get("entries") or []
+                   if entry_supports_delivery(context, item, delivery)]
     if not of_delivery:
         raise ValueError(f"context has no Entry with delivery {delivery}")
     candidates = [item for item in of_delivery if usable(item)]
@@ -692,7 +694,7 @@ def _settings(args: argparse.Namespace, run_dir: Path) -> _Settings:
         "compile_database", getattr(args, "compile_database", None), "analysis_compile_database")
     if database is not None and not database.is_file():
         raise ValueError(f"compile database does not exist: {database}")
-    binary = choose("target_binary", getattr(args, "target_binary", None), "")
+    binary = choose("target_binary", getattr(args, "target_binary", None), "analysis_binary")
     if binary is not None and not binary.is_file():
         raise ValueError(f"target binary does not exist: {binary}")
     attempts = int(getattr(args, "attempts", 2))

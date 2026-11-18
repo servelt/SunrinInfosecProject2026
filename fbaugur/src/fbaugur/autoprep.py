@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import proctrack
-from .config import CODEX_DAYBREAK, PROVIDER_MODELS
+from .config import codex_daybreak_args, PROVIDER_MODELS
 
 REFERENCE = Path(__file__).resolve().parents[2] / "targets" / "tinyproxy"
 
@@ -275,7 +275,7 @@ class AutoPrep:
         if self.provider == "ollama":
             return self._agent_ollama(prompt)
         if self.provider == "codex":
-            argv = [self.codex, "exec", "--json", "--ignore-user-config", *CODEX_DAYBREAK, "--skip-git-repo-check",
+            argv = [self.codex, "exec", "--json", "--ignore-user-config", *codex_daybreak_args(self.model), "--skip-git-repo-check",
                     "-m", self.model,
                     "-s", "workspace-write", "-C", str(self.work),
                     "-c", 'model_reasoning_effort="high"', "-c", "sandbox_workspace_write.network_access=true"]

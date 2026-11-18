@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import CODEX_DAYBREAK, RunConfig
+from .config import codex_daybreak_args, RunConfig
 from .store import Store, new_id
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
@@ -108,9 +108,9 @@ class AgentRunner:
     def _mcp_config(self, directory: Path, binding: dict[str, Any], run_id: str, log: Path) -> Path:
         argv = [sys.executable, "-m", "fbaugur.mcp_server", "--run-dir", str(self.run_dir),
                 "--role", binding["role"], "--agent-run", run_id, "--log", str(log)]
-        for key in ("worker", "harness", "sp", "violation", "direction", "function", "crash"):
+        for key in ("worker", "harness", "sp", "violation", "direction", "function", "function_id", "crash"):
             if binding.get(key):
-                argv += [f"--{key}", str(binding[key])]
+                argv += [f"--{key.replace('_', '-')}", str(binding[key])]
         if binding.get("phi") is not None:
             argv += ["--phi", str(binding["phi"])]
         path = directory / "mcp.json"
@@ -234,7 +234,7 @@ class AgentRunner:
             workdir = Path(tmp)
             server = json.loads(self._mcp_config(workdir, binding, run_id, tool_log).read_text())["mcpServers"]["fba"]
             env_table = "{" + ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in server["env"].items()) + "}"
-            argv = [self.cfg.codex_executable, "exec", "--json", "--ignore-user-config", *CODEX_DAYBREAK,
+            argv = [self.cfg.codex_executable, "exec", "--json", "--ignore-user-config", *codex_daybreak_args(model),
                     "--skip-git-repo-check", "-m", model,
                     "-s", "read-only", "-C", str(workdir),
                     "-c", f"model_reasoning_effort={json.dumps(effort)}",

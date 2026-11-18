@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .build_closure import _compiler_output, resolve_cmake_target
+from .build_closure import _compiler_output, resolve_cmake_target, resolve_recorded_link_target
 from .make_closure import (
     MakeClosureUnresolved, resolve_make_target, resolve_recorded_make_target,
 )
@@ -53,6 +53,17 @@ def _find_compile_database(root: Path) -> Path | None:
         if path.is_file():
             return path
     return None
+
+
+# Switches that change what the program's C/C++ means or how its symbols link.  They are kept
+# because the original build only works with them; they run no code and name no file.
+_LANGUAGE_SEMANTICS = frozenset({
+    "-fcommon", "-fno-common", "-funsigned-char", "-fsigned-char", "-fno-strict-aliasing",
+    "-fstrict-aliasing", "-fwrapv", "-fno-strict-overflow", "-fno-delete-null-pointer-checks",
+    "-fshort-enums", "-fshort-wchar", "-fgnu89-inline", "-fms-extensions", "-fno-builtin",
+    "-fno-math-errno", "-fno-signed-zeros", "-fpermissive", "-fno-threadsafe-statics",
+    "-fno-operator-names", "-fchar8_t", "-fno-char8_t",
+})
 
 
 def _flags_from_compile_record(entry: dict, directory: Path) -> tuple[str, ...]:
@@ -88,6 +99,10 @@ def _flags_from_compile_record(entry: dict, directory: Path) -> tuple[str, ...]:
         elif token.startswith(("-D", "-U")) and len(token) > 2:
             flags.append(token)
         elif token.startswith("-std=") or token in ("-pthread", "-fPIC", "-fpic", "-fno-exceptions", "-fexceptions", "-fno-rtti", "-frtti"):
+            flags.append(token)
+        elif token in _LANGUAGE_SEMANTICS:
+            # The program's own meaning: dropping -fcommon turned header tentative definitions
+            # into duplicate symbols and no harness of the program could link (measured).
             flags.append(token)
         # Unrecognized and plugin/driver flags are deliberately not copied.
         index += 1
@@ -169,6 +184,25 @@ def _main_units(units: list[SourceUnit]) -> list[Path]:
     return found
 
 
+def _recorded_main_units(objects: dict[Path, Path]) -> list[Path]:
+    """Find the original entry symbol in the objects actually linked.
+
+    A source may contain a conditional main() which the recorded compiler
+    flags rename or exclude. Source text alone cannot identify that object.
+    """
+    nm = shutil.which("nm")
+    if nm is None:
+        raise NativeBuildUnresolved("nm is required to verify a recorded link target's main object")
+    mains: list[Path] = []
+    for obj, source in objects.items():
+        result = subprocess.run([nm, "-g", "--defined-only", str(obj)], capture_output=True, text=True)
+        if result.returncode:
+            raise NativeBuildUnresolved(f"cannot inspect original linked object {obj}: {result.stderr[-500:]}")
+        if re.search(r"(?m)^\s*(?:[0-9A-Fa-f]+\s+)?[TW]\s+main$", result.stdout):
+            mains.append(source)
+    return mains
+
+
 # sanitizer -> (compile -fsanitize, link -fsanitize, extra flags for both)
 _SANITIZERS = {
     "address+undefined": ("fuzzer-no-link,address,undefined", "fuzzer,address,undefined", []),
@@ -195,9 +229,59 @@ def _compilers(sanitizer: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _replay_closure(plan_path: Path, root: Path) -> tuple[list[SourceUnit], list[str], list[Path], str]:
+    """The translation units, link flags and renamed main of an earlier successful build.
+
+    A rebuild of the same program from a copy of its tree (an instrumented copy for invariants,
+    a MemorySanitizer build) must link exactly what the original harness build linked.  That
+    closure was resolved once, from build evidence the copy no longer carries (the recorded link
+    command names the original binary and objects); re-resolving it from the copied compile
+    database alone cannot tell several programs' mains apart.  The plan the original build
+    wrote is moved onto the copy instead: every path under its source root is rewritten."""
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    original = str(Path(plan["source_root"]).resolve())
+    copy = str(root)
+
+    def move(value: str) -> str:
+        if value.startswith(original):
+            return copy + value[len(original):]
+        return value.replace("=" + original, "=" + copy).replace("-I" + original, "-I" + copy)
+
+    harness_source = str(plan.get("harness") or "")
+    if plan.get("units"):
+        pairs = [(str(u["source"]), [str(f) for f in u.get("flags") or []]) for u in plan["units"]]
+    else:
+        # Plans written before units were recorded: the project flags of a unit are what follows
+        # the builder's own include block (-I root and the source directories) and main rename.
+        include_dirs = {original, *(str(Path(s).parent) for s in plan.get("original_sources") or [])}
+        pairs = []
+        for argv in plan.get("compile_commands") or []:
+            if "-c" not in argv:
+                continue
+            at = argv.index("-c")
+            source = argv[at + 1]
+            if source == harness_source:
+                continue
+            index = argv.index("-I") if "-I" in argv[:at] else at
+            while index + 1 < at and argv[index] == "-I" and argv[index + 1] in include_dirs:
+                index += 2
+            if index < at and argv[index] == "-Dmain=hc_native_original_main":
+                index += 1
+            pairs.append((source, list(argv[index:at])))
+    units = [SourceUnit(Path(move(source)), tuple(move(flag) for flag in flags)) for source, flags in pairs]
+    missing = [str(u.source) for u in units if not u.source.is_file()]
+    if not units or missing:
+        raise NativeBuildUnresolved(f"closure plan {plan_path} does not map onto {root}: "
+                                    + (", ".join(missing[:5]) if missing else "no units"))
+    mains = [Path(move(str(m))) for m in plan.get("renamed_main") or []]
+    links = [move(str(f)) for f in plan.get("link_flags_from_build_graph") or []]
+    return units, links, mains, f"closure replayed from {plan_path}"
+
+
 def build_native(
     source_root: Path, harness: Path, output: Path,
     *, compile_database: Path | None = None, target_binary: Path | None = None,
+    closure_plan: Path | None = None,
 ) -> Path:
     root = source_root.resolve(strict=True)
     harness = harness.resolve(strict=True)
@@ -229,12 +313,21 @@ def build_native(
                     f"harness requires a source file absent from the project: {value}"
                 )
             required_sources.add(path)
-    selected_target = resolve_cmake_target(
+    replay = _replay_closure(closure_plan, root) if closure_plan else None
+    recorded_target = resolve_recorded_link_target(
         root, db, required_sources, target_binary=target_binary,
-    ) if db else None
+    ) if db and replay is None else None
+    if replay is None and db and (db.parent / "link_commands.json").is_file() and recorded_target is None:
+        raise NativeBuildUnresolved("recorded link target is incomplete, stale, or does not match the original binary")
+    selected_target = recorded_target or (resolve_cmake_target(
+        root, db, required_sources, target_binary=target_binary,
+    ) if db and replay is None else None)
     selected_make_target = None
     extra_link_flags: list[str] = []
-    if selected_target is not None:
+    replay_mains: list[Path] = []
+    if replay is not None:
+        units, extra_link_flags, replay_mains, evidence = replay
+    elif selected_target is not None:
         # CMake may compile the SAME source for several executable targets
         # with different macros, include directories, and ABI flags. Selecting
         # flags by filename (the former behavior) made the result dependent on
@@ -249,6 +342,7 @@ def build_native(
         selected_objects = set(selected_target.compile_objects)
         by_file: dict[Path, SourceUnit] = {}
         matched_objects: set[Path] = set()
+        linked_objects: dict[Path, Path] = {}
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -268,6 +362,7 @@ def build_native(
                 )
             by_file[src] = SourceUnit(src, flags)
             matched_objects.add(obj)
+            linked_objects[obj] = src
         if matched_objects != selected_objects or set(by_file) != set(selected_target.source_paths):
             raise NativeBuildUnresolved(
                 "CMake target compile object records incomplete or inconsistent"
@@ -275,7 +370,7 @@ def build_native(
         units = [by_file[path] for path in sorted(by_file)]
         extra_link_flags = list(selected_target.linker_flags)
         evidence = (
-            f"CMake target {selected_target.name} from "
+            f"recorded link target {selected_target.name} from "
             + ", ".join(str(p) for p in selected_target.evidence_files)
         )
     else:
@@ -325,7 +420,8 @@ def build_native(
             "build closure does not cover required Entry/handler sources: "
             + ", ".join(unresolved[:10])
         )
-    mains = _main_units(units)
+    mains = replay_mains if replay is not None else (
+        _recorded_main_units(linked_objects) if recorded_target else _main_units(units))
     if len(mains) > 1:
         names = ", ".join(str(src.relative_to(root)) for src in mains[:8])
         raise NativeBuildUnresolved(
@@ -375,6 +471,8 @@ def build_native(
         "original_sources": [str(unit.source) for unit in units],
         "renamed_main": [str(p) for p in mains],
         "compile_commands": [],
+        # Each unit's own project flags, so a rebuild from a copy can replay this closure.
+        "units": [{"source": str(unit.source), "flags": list(unit.flags)} for unit in units],
     }
     plan_file = scratch / "build-plan.json"
     for idx, unit in enumerate(inputs):
@@ -434,12 +532,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-database", type=Path)
     parser.add_argument("--target-binary", type=Path)
+    parser.add_argument("--closure-plan", type=Path,
+                        help="build-plan.json of an earlier successful build of this program; its units, "
+                             "link flags and renamed main are replayed on --source-root")
     args = parser.parse_args(argv)
     try:
         path = build_native(
             args.source_root, args.harness, args.output,
             compile_database=args.compile_database,
             target_binary=args.target_binary,
+            closure_plan=args.closure_plan,
         )
     except (OSError, NativeBuildUnresolved) as exc:
         print(f"NATIVE_BUILD_UNRESOLVED: {exc}", file=sys.stderr)

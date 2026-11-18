@@ -461,6 +461,10 @@ class CodexAppServer:
                     self._recycle_pending = True
                 return
             elif method == "error":
+                if _reconnect_progress_notification(params):
+                    # The app-server is still retrying this turn. Its eventual
+                    # turn/completed notification is the authoritative result.
+                    continue
                 # A failed turn can complete just before the compaction request
                 # response. Its trailing notification is stale, not a failure of
                 # the newly started compaction turn.
@@ -537,6 +541,13 @@ class CodexAppServer:
                 joined = ["".join(parts) for parts in deltas.values()]
                 return joined[-1] if joined else ""
             elif method == "error":
+                if _reconnect_progress_notification(params):
+                    # Reconnecting is progress, not the terminal turn result.
+                    # Starting a second turn here can duplicate a live request.
+                    continue
+                error_turn_id = _nested_string(params, "turnId")
+                if error_turn_id and error_turn_id != turn_id:
+                    continue
                 raise _notification_failure("app-server error notification", params)
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -712,6 +723,11 @@ def _notification_failure(prefix: str, params: Any) -> CodexAppServerError:
     return _turn_failure(prefix, params)
 
 
+def _reconnect_progress_notification(params: Any) -> bool:
+    message = _nested_string(params, "message")
+    return bool(message and message.strip().casefold().startswith("reconnecting..."))
+
+
 def _transient_transport_error(exc: CodexAppServerError) -> bool:
     message = str(exc).casefold()
     return "reconnecting" in message or "connection reset" in message
@@ -882,7 +898,7 @@ def _daybreak_program_for_model(model: str) -> str | None:
     Unsupported models (including gpt-5.6-sol) use standard safeguards.
     Access is validated by the remote service on the first inference turn.
     """
-    if model in {"gpt-6-sol", "gpt-6.1-sol", "gpt-6-astra"}:
+    if model == "gpt-6-sol":
         return "daybreakBlue"
     if model == "gpt-5.6-cyber":
         return "daybreakRed"

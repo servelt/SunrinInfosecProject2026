@@ -181,9 +181,9 @@ class Sessions:
         hidden = self._hidden()
         sessions = [s for s in self._own() + list(self._discovered().values()) if s.get("id") not in hidden]
         for s in sessions:
-            if not s.get("pipeline_dir") and s.get("log"):
-                directory = pipeline_dir_of(read_log(Path(s["log"]))[:20])
-                if directory:
+            if s.get("log"):
+                directory = pipeline_dir_of(read_log(Path(s["log"])))
+                if directory and str(directory) != s.get("pipeline_dir"):
                     s["pipeline_dir"] = str(directory)
                     if s.get("state") != "found":
                         self.update(s["id"], pipeline_dir=str(directory))
@@ -194,7 +194,8 @@ class Sessions:
             return "failed"
         if s.get("state") in ("preparing", "starting"):
             return "prep"
-        directory = Path(s["pipeline_dir"]) if s.get("pipeline_dir") else None
+        directory = pipeline_dir_of(read_log(Path(s["log"]))) if s.get("log") else None
+        directory = directory or (Path(s["pipeline_dir"]) if s.get("pipeline_dir") else None)
         if directory and (directory / "summary.json").is_file():
             return "done"
         if s.get("pid"):
@@ -264,11 +265,13 @@ class Sessions:
 
     # ------------------------------------------------------------------ start / stop
     def start(self, repo: str, branch: str, mode: str, commit: str, hours: int, *, provider: str = "claude",
-              models: dict[str, str] | None = None) -> dict[str, Any]:
+              models: dict[str, str] | None = None, fuzz_minutes: float = 0.0) -> dict[str, Any]:
         repo_n = normalise_repo(repo)
         sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
         session = {"id": sid, "repo": repo_n, "url": clone_url(repo), "provider": provider, "models": dict(models or {}), "branch": branch.strip(), "mode": "Delta" if mode == "delta" else "Full",
                    "commit": commit, "hours": hours, "name": repo_n.split("/")[-1],
+                   # Fuzzing per context after its analysis lanes drain; 0 = until the deadline.
+                   "fuzz_minutes": float(fuzz_minutes or 0),
                    "rev": (commit if mode == "delta" else branch.strip() or "기본 브랜치"), "when": time.strftime("%m/%d %H:%M"),
                    "created": time.time(), "state": "preparing", "prep_progress": 0.02, "prep_label": "저장소 받기",
                    "log": str(self.home / "sessions" / sid / "pipeline.log"), "pid": None, "error": ""}
@@ -334,7 +337,9 @@ class Sessions:
         start = float(session.get("created") or time.time())
         end = start + (UNLIMITED_HOURS if hours == -1 else float(hours)) * 3600
         session = self.update(sid, hours=hours)
-        target = Path(session["pipeline_dir"]) / "deadline" if session.get("pipeline_dir") else None
+        directory = pipeline_dir_of(read_log(Path(session["log"]))) if session.get("log") else None
+        directory = directory or (Path(session["pipeline_dir"]) if session.get("pipeline_dir") else None)
+        target = directory / "deadline" if directory else None
         if target is not None and target.parent.is_dir():
             live.write(target, end)
         return {"hours": hours, "ends_at": None if hours == -1 else end}
@@ -396,9 +401,14 @@ class Sessions:
             args += ["--skip-harness", str(built)]
             self._log(sid, f"resume: harnesses built earlier are reused ({built})")
         args += ["--provider", session.get("provider") or "claude"]
+        if float(session.get("fuzz_minutes") or 0) > 0:
+            # Each context hands what it does not use to the next, so every context gets analysed.
+            args += ["--fuzz-after-drain-minutes", str(session["fuzz_minutes"])]
         for tier, model in sorted((session.get("models") or {}).items()):
             if tier in ("1", "2", "3"):
                 args += [f"--model-t{tier}", model]
+            elif tier == "entry":
+                args += ["--model-entry", model]
         if proctrack.cancelled(sid):
             raise proctrack.Cancelled("사용자가 멈춤")
         self.update(sid, prep_progress=0.52, prep_label="정적 분석 준비", state="starting")

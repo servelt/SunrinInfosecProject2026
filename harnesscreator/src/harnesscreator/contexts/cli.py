@@ -203,9 +203,9 @@ async def _classify(args: argparse.Namespace, run_dir: Path) -> None:
 
 
 async def _peers(args: argparse.Namespace, run_dir: Path) -> None:
-    """Record, for every socket stream Entry, which peers' bytes reach it (accepted / initiated)."""
+    """Record, for every socket Entry that may be a stream, which peers' bytes reach it (accepted / initiated)."""
 
-    from .builder import resolve_channel
+    from .builder import delivery_candidates, resolve_channel
     out = run_dir / "contexts" / "peers.jsonl"
     done = set()
     if out.is_file():
@@ -222,7 +222,8 @@ async def _peers(args: argparse.Namespace, run_dir: Path) -> None:
         if entry["entry_id"] in done or entry.get("entry_function_id") not in graph.bundle.functions:
             continue
         resource, delivery, _ = resolve_channel(entry, chosen.get(entry["entry_id"]))
-        if resource in ("network", "local_ipc") and delivery == "stream":
+        candidates, _basis = delivery_candidates(entry, chosen.get(entry["entry_id"]), resource, delivery)
+        if resource in ("network", "local_ipc") and "stream" in candidates:
             pending.append(entry)
     if not pending:
         return

@@ -16,3 +16,12 @@ below 0.5 because something keeps the operation safe, also pass to update_suspic
 Give these even when the protection is a visible bounds check: what you are asserting is the relation
 the check is supposed to guarantee at the operation, not the check itself. Do not fill them for
 reachability-only or sanitizer-mismatch false positives.
+
+## is_important is your verdict (this resolves the 0.4/0.5 wording above)
+
+The scoring guide above passes "0.4-0.5: uncertain but possible" to PoV with is_important=True, while
+the output list says is_important=True only from 0.5. Follow the scoring guide: set is_important=True
+for every candidate you cannot prove to be a false positive under the STRICT FALSE POSITIVE RULES,
+whatever its score, and set is_important=False only for a proven false positive. The score orders the
+PoV queue; it does not decide admission. Always call update_suspicious_point once before you finish:
+a turn that records no verdict leaves the candidate unverified and it goes to PoV untested by you.

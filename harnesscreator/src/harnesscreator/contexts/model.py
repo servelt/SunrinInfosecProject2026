@@ -34,6 +34,15 @@ class ContextEntry:
     interpreter_source: str  # locator | actions | consumer_hint | entry_function
     driver_function_id: str | None
     resource_source: str = "keyword_table"  # source_api | classifier | keyword_table
+    # Every delivery the evidence leaves possible; one element when it is
+    # established.  delivery is the first measured / reported one.
+    delivery_candidates: list[str] = field(default_factory=list)
+    delivery_basis: str = ""  # resource_kind | classifier | keyword_table | unresolved:<who left it open>
+    transport_unresolved: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.delivery_candidates:
+            self.delivery_candidates = [self.delivery]
 
 
 @dataclass
@@ -100,3 +109,7 @@ class SeedResult:
     new_target_function_ids: list[str]
     new_target_lines: int
     process_exit: str
+    # Did this run execute the context's Entry function (by coverage)?  executed | not_executed |
+    # not_measurable (the Entry is not in the coverage map).  Acceptance does not depend on it: a
+    # seed is accepted for new target code; whether it went through the Entry is recorded apart.
+    entry_coverage: str = "not_measurable"

@@ -43,11 +43,13 @@ def _send_stream(host: str, port: int, data: bytes, io_timeout: float) -> dict:
     sent = 0
     received = 0
     head = bytearray()
+    closed = ""
     with socket.create_connection((host, port), timeout=io_timeout) as conn:
         conn.settimeout(io_timeout)
         try:
-            conn.sendall(data)
-            sent = len(data)
+            view = memoryview(data)
+            while sent < len(data):       # counted per write: a reset mid-input keeps what was sent
+                sent += conn.send(view[sent:sent + 65536])
             conn.shutdown(socket.SHUT_WR)
             while True:                   # wait for the program to close: processing is done
                 chunk = conn.recv(65536)
@@ -56,9 +58,11 @@ def _send_stream(host: str, port: int, data: bytes, io_timeout: float) -> dict:
                 received += len(chunk)
                 if len(head) < 4096:
                     head.extend(chunk[:4096 - len(head)])
-        except OSError:
-            pass                          # a reset is what a crashing server looks like
-    return {"sent": sent, "received": received, "response_hex": bytes(head).hex()}
+        except OSError as exc:            # a reset is what a crashing server looks like
+            closed = ("the program closed the connection after "
+                      f"{sent} of {len(data)} input bytes: {exc}") if sent < len(data) else ""
+    return {"sent": sent, "input_bytes": len(data), "received": received, "response_hex": bytes(head).hex(),
+            **({"closed_mid_input": closed} if closed else {})}
 
 
 def _send_peer(host: str, port: int, trigger: bytes, data: bytes, io_timeout: float) -> dict:

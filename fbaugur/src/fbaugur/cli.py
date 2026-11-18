@@ -90,6 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--model-t1", help="reasoning tier (threat model, directions, verification, triage)")
         parser.add_argument("--model-t2", help="main tier (seeds, PoV, invariants, reports)")
         parser.add_argument("--model-t3", help="fast tier (candidate generation)")
+        parser.add_argument("--model-entry",
+                            help="stage 1 analysis model: Entry generation and verification and the input-context "
+                                 "stage (classifier, locator, peers); seeds, harnesses and stage 2 keep the tiers")
         parser.add_argument("--concurrency", type=int, default=5, help="concurrent Claude agents")
         parser.add_argument("--sp-agents", type=int, default=3)
         parser.add_argument("--verify-agents", type=int, default=2)
@@ -129,6 +132,11 @@ def _built_deliveries(hc_run: Path, context: str) -> list[str]:
     for delivery in ("stream", "datagram", "peer_stream"):
         directory = base / f"{context}-{delivery}"
         if directory.is_dir() and any(directory.glob("attempt-*/build/hc-native-fuzzer")):
+            from .project import pick_attempt
+            try:
+                pick_attempt(hc_run, context, delivery)
+            except FileNotFoundError:
+                continue
             found.append(delivery)
     return found
 

@@ -26,7 +26,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .runner import NETNS, finding_type, is_finding, load_ub_baseline, parse_report, run_input, sanitizer_env
+from .runner import (NETNS, finding_identities, finding_type, is_finding, load_ub_baseline, parse_report, run_input,
+                     sanitizer_env)
 from .store import Store, new_id
 
 
@@ -41,6 +42,19 @@ class FuzzerSpec:
     max_len: int = 0
     continue_phis: list[int] = dataclasses.field(default_factory=list)
     extra: list[str] = dataclasses.field(default_factory=list)
+
+
+def _die_with_parent() -> None:
+    """Run in the child before exec: end it when the process that started it dies.
+
+    A fuzzer runs in its own session so that it can be signalled as a group, which also keeps it
+    out of a stop that signals the pipeline's group -- an interrupted scan left its fuzzers
+    running for hours.  The kernel's parent-death signal ties it to the pipeline instead."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)    # PR_SET_PDEATHSIG
+    except Exception:
+        pass
 
 
 class FuzzerProcess:
@@ -79,7 +93,7 @@ class FuzzerProcess:
         handle.flush()
         self.process = await asyncio.create_subprocess_exec(
             *self.argv(), stdout=handle, stderr=handle, stdin=asyncio.subprocess.DEVNULL,
-            cwd=str(spec.corpus.parent), env=env, start_new_session=True)
+            cwd=str(spec.corpus.parent), env=env, start_new_session=True, preexec_fn=_die_with_parent)
         self._log_handle = handle
         self.started_at = time.time()
 
@@ -116,7 +130,12 @@ class CrashWatcher:
         self.worker = worker
         self.harness = harness
         self.emit = emit or (lambda message: None)
-        self.seen: set[str] = set()
+        # Classified (binary, input digest) pairs: a new build carries new assertions, so every
+        # input is classified again on it; within one build an input is classified once.
+        self.seen: set[tuple[str, str]] = set()
+        # (input digest, fault identity) already recorded as a crash candidate: one input can show a
+        # different defect on a new build, or several UB sites in one run; each is its own candidate.
+        self.crashed: set[tuple[str, str]] = set()
         self.watch: list[tuple[Path, str]] = []            # (artifact dir, source label)
 
     def add(self, directory: Path, source: str) -> None:
@@ -130,6 +149,20 @@ class CrashWatcher:
         if not path.exists():
             path.write_bytes(data)
         return path
+
+    async def _past_assertions(self, binary: Path, data: bytes, violated: list[int]):
+        """The run of `data` with every assertion it violates in continue mode, or None.
+
+        Each new violation adds its phi and the input runs again, a bounded number of times."""
+        cont = set(violated)
+        for _ in range(8):
+            again = await asyncio.to_thread(run_input, binary, data, timeout=15,
+                                            env_extra={"FBA_PHI_CONTINUE": ",".join(map(str, sorted(cont)))})
+            new = set(again.violations) - cont
+            if not new:
+                return again
+            cont |= new
+        return None
 
     async def sweep(self, binary: Path, *, phis: dict[int, int] | None = None) -> list[dict[str, Any]]:
         """Classify every unseen artifact.  `phis` maps phi number -> invariant id."""
@@ -145,12 +178,19 @@ class CrashWatcher:
                 except OSError:
                     continue
                 digest = hashlib.sha1(data).hexdigest()
-                if digest in self.seen or not data:
+                if (str(binary), digest) in self.seen or not data:
                     continue
-                self.seen.add(digest)
+                # Marked seen only once classified: a replay cut off (deadline, build swap) is redone.
                 result = await asyncio.to_thread(run_input, binary, data, timeout=15)
                 now = time.time()
+                faulting = result
                 if result.violations:
+                    # The replay aborts at the first assertion; the fuzzer may have run past it
+                    # (continue mode) into a memory fault that this replay never reaches.  Run it
+                    # again past every assertion it violates, as the fuzzer did, and keep what
+                    # follows as a finding of its own (confirmed later on the build without
+                    # assertions).
+                    faulting = await self._past_assertions(binary, data, result.violations)
                     for phi in result.violations:
                         if phis is not None and phi not in phis:
                             continue
@@ -162,21 +202,28 @@ class CrashWatcher:
                             "created_at": now, "updated_at": now})
                         self.emit(f"[fuzz] invariant phi {phi} falsified by {source} ({len(data)} bytes)")
                         found.append({"kind": "violation", "phi": phi, "violation_id": violation_id})
-                elif is_finding(result, load_ub_baseline(self.run_dir)):
-                    stored = self._store_input(data, "crash")
-                    crash_id = new_id("crash")
-                    self.store.insert("crashes", {
-                        "crash_id": crash_id, "worker_id": self.worker, "source": source, "sp_id": None,
-                        "input_path": str(stored), "status": "pending",
-                        "crash_type": finding_type(result, load_ub_baseline(self.run_dir)),
-                        "frames": result.frames, "details": {"summary": result.summary(),
-                                                              "stderr_tail": result.stderr_tail[-3000:]},
-                        "created_at": now, "updated_at": now})
-                    self.emit(f"[fuzz] {source} crash: {result.summary()[:160]}")
-                    found.append({"kind": "crash", "crash_id": crash_id, "crash_type": result.crash_type})
-                else:
+                if faulting is not None and is_finding(faulting, load_ub_baseline(self.run_dir)):
+                    result = faulting
+                    for identity, crash_type, ub_site in finding_identities(result, load_ub_baseline(self.run_dir)):
+                        if (digest, identity) in self.crashed:
+                            continue
+                        self.crashed.add((digest, identity))
+                        stored = self._store_input(data, "crash")
+                        crash_id = new_id("crash")
+                        self.store.insert("crashes", {
+                            "crash_id": crash_id, "worker_id": self.worker, "source": source, "sp_id": None,
+                            "input_path": str(stored), "status": "pending", "crash_type": crash_type,
+                            "frames": result.frames, "details": {"summary": result.summary(), "identity": identity,
+                                                                  **({"ub_site": ub_site} if ub_site else {}),
+                                                                  "binary": str(binary),
+                                                                  "stderr_tail": result.stderr_tail[-3000:]},
+                            "created_at": now, "updated_at": now})
+                        self.emit(f"[fuzz] {source} finding {identity}: {result.summary()[:120]}")
+                        found.append({"kind": "crash", "crash_id": crash_id, "crash_type": crash_type})
+                elif not result.violations:
                     # libFuzzer saved it (slow unit, OOM, leak) but a clean replay says nothing happened.
                     self.emit(f"[fuzz] {source} artifact {path.name} did not reproduce ({result.summary()[:80]})")
+                self.seen.add((str(binary), digest))
         return found
 
 
@@ -198,6 +245,11 @@ class GlobalFuzzer:
         self.log = self.run_dir / "logs" / f"{harness}-global-fuzzer.log"
         self.extra_corpus = self.work / "corpus-extra"
         self.process: FuzzerProcess | None = None
+        # start, stop, swap and the restart in poll change self.process; they run one at a time.
+        # Interleaved, a restart saw the half-started process of a swap as "exited", started a
+        # second one and orphaned the first (measured: a v1 fuzzer kept running for 3 hours
+        # next to the v2..v6 ones and after the run ended).
+        self._process_lock = asyncio.Lock()
         self.share_from: Path | None = None       # another fuzzer's corpus to pull from at each start
         self.restarts: list[float] = []
         self.continue_phis: list[int] = []
@@ -234,6 +286,13 @@ class GlobalFuzzer:
         return moved
 
     async def start(self, binary: Path | None = None, continue_phis: list[int] | None = None) -> None:
+        async with self._process_lock:
+            await self._start(binary, continue_phis)
+
+    async def _start(self, binary: Path | None = None, continue_phis: list[int] | None = None) -> None:
+        if self.process is not None:              # never two at once: the old one is stopped first
+            await self.process.stop()
+            self.process = None
         if binary is not None:
             self.binary = binary
         if continue_phis is not None:
@@ -249,36 +308,41 @@ class GlobalFuzzer:
 
     async def swap(self, binary: Path, continue_phis: list[int]) -> None:
         """Restart on a new build, keeping the corpus (Code Augur persists C across calls)."""
-        await self.stop()
-        await self.start(binary, continue_phis)
+        async with self._process_lock:
+            await self._start(binary, continue_phis)
 
     async def stop(self) -> None:
-        if self.process is not None:
-            await self.process.stop()
-            self.process = None
+        async with self._process_lock:
+            if self.process is not None:
+                await self.process.stop()
+                self.process = None
 
     async def poll(self, phis: dict[int, int] | None = None) -> list[dict[str, Any]]:
         self.absorb_extra()
         events = await self.watcher.sweep(self.binary, phis=phis)
-        if self.process is not None and not self.process.running:
-            # libFuzzer exits after saving a crash or on an invariant abort; restart it.
-            code = self.process.process.returncode if self.process.process else None
-            removed = self.quarantine_seed_crash()
-            self.restarts.append(time.time())
-            recent = [s for s in self.restarts if s > time.time() - 600]
-            self.emit(f"[fuzz] global fuzzer exited (code {code}); restarting"
-                      + (f"; removed {removed} corpus input(s) that fault while the corpus loads" if removed else ""))
-            if len(recent) >= 10 and not removed:
-                # libFuzzer exits on every crash, and -fork / -merge cannot help here: an in-process
-                # server harness binds its fixed port in the parent, so the children's inputs are
-                # served -- and crash -- in the parent (measured on LightFTP).  Frequent restarts
-                # therefore mean either a shallow known bug being re-found, or a harness that
-                # returns before the program finishes an input.
-                self.emit(f"[fuzz] WARNING: {len(recent)} restarts in 10 min without a removable seed -- "
-                          "a shallow known bug is being re-found, or the harness returns before the program "
-                          "finishes an input so faults land on later inputs")
-            await self.start()
+        async with self._process_lock:                 # a swap is never half-way through here
+            if self.process is not None and self.process.process is not None and not self.process.running:
+                await self._restart()
         return events
+
+    async def _restart(self) -> None:
+        # libFuzzer exits after saving a crash or on an invariant abort; restart it.
+        code = self.process.process.returncode if self.process.process else None
+        removed = self.quarantine_seed_crash()
+        self.restarts.append(time.time())
+        recent = [s for s in self.restarts if s > time.time() - 600]
+        self.emit(f"[fuzz] global fuzzer exited (code {code}); restarting"
+                  + (f"; removed {removed} corpus input(s) that fault while the corpus loads" if removed else ""))
+        if len(recent) >= 10 and not removed:
+            # libFuzzer exits on every crash, and -fork / -merge cannot help here: an in-process
+            # server harness binds its fixed port in the parent, so the children's inputs are
+            # served -- and crash -- in the parent (measured on LightFTP).  Frequent restarts
+            # therefore mean either a shallow known bug being re-found, or a harness that
+            # returns before the program finishes an input.
+            self.emit(f"[fuzz] WARNING: {len(recent)} restarts in 10 min without a removable seed -- "
+                      "a shallow known bug is being re-found, or the harness returns before the program "
+                      "finishes an input so faults land on later inputs")
+        await self._start()
 
     def _last_session(self) -> str:
         """Log text of the most recent fuzzer start (each start writes an `=== HH:MM:SS` header)."""

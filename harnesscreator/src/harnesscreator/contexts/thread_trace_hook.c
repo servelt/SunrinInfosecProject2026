@@ -4,13 +4,19 @@
  * Link this object into a build of the original program compiled with
  * -finstrument-functions.  When the environment variable HC_THREAD_TRACE names
  * a file, every (thread, function) pair seen during the run is written to it at
- * normal process exit as "<thread index> <link-time address in hex>".
+ * process exit as "<thread index> <link-time address in hex>" -- normal exit, or
+ * SIGTERM/SIGINT when the program leaves those signals at their default (it then
+ * dies without running destructors, and nothing was written: measured on an FTP
+ * daemon stopped with SIGTERM after every seed).
  */
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <link.h>
+#include <signal.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #define HC_SLOTS (1u << 20)
 #define HC_NOINSTR __attribute__((no_instrument_function))
@@ -60,20 +66,63 @@ HC_NOINSTR void __cyg_profile_func_exit(void *fn, void *site)
     (void)fn; (void)site;
 }
 
-HC_NOINSTR __attribute__((destructor)) static void hc_dump(void)
+/* Async-signal-safe: open/write only, the line formatted by hand. */
+HC_NOINSTR static void hc_write_table(void)
 {
     const char *path = getenv("HC_THREAD_TRACE");
-    FILE *out;
+    char line[48];
+    int fd;
     uint32_t i;
     if (path == NULL || *path == '\0')
         return;
-    out = fopen(path, "w");
-    if (out == NULL)
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
         return;
     for (i = 0; i < HC_SLOTS; i++) {
-        uint64_t key = hc_table[i];
-        if (key != 0)
-            fprintf(out, "%u %llx\n", (unsigned)(key >> 48), (unsigned long long)(key & 0xffffffffffffULL));
+        uint64_t key = hc_table[i], value;
+        unsigned thread;
+        char digits[24];
+        int n = 0, d = 0;
+        if (key == 0)
+            continue;
+        thread = (unsigned)(key >> 48);
+        value = key & 0xffffffffffffULL;
+        do { digits[d++] = (char)('0' + thread % 10); thread /= 10; } while (thread && d < 10);
+        while (d) line[n++] = digits[--d];
+        line[n++] = ' ';
+        do { digits[d++] = "0123456789abcdef"[value & 0xf]; value >>= 4; } while (value && d < 16);
+        while (d) line[n++] = digits[--d];
+        line[n++] = '\n';
+        if (write(fd, line, (size_t)n) < 0)
+            break;
     }
-    fclose(out);
+    close(fd);
+}
+
+HC_NOINSTR __attribute__((destructor)) static void hc_dump(void)
+{
+    hc_write_table();
+}
+
+HC_NOINSTR static void hc_on_signal(int sig)
+{
+    hc_write_table();
+    signal(sig, SIG_DFL);           /* then die of the same signal, as the program would have */
+    raise(sig);
+}
+
+HC_NOINSTR __attribute__((constructor)) static void hc_install(void)
+{
+    static const int signals[] = {SIGTERM, SIGINT};
+    unsigned i;
+    for (i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+        struct sigaction current;
+        if (sigaction(signals[i], NULL, &current) == 0 && current.sa_handler == SIG_DFL) {
+            struct sigaction ours;
+            memset(&ours, 0, sizeof(ours));
+            ours.sa_handler = hc_on_signal;
+            sigemptyset(&ours.sa_mask);
+            sigaction(signals[i], &ours, NULL);
+        }
+    }
 }

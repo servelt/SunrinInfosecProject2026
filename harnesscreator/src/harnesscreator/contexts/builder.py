@@ -214,6 +214,83 @@ def classify_delivery(resource_kind: str, source_api: str, channel_kind: str) ->
     return "unknown"
 
 
+SOCKET_DELIVERIES = ("stream", "datagram")
+_TRANSPORT_UNKNOWN_WORDS = ("not established", "not shown", "unknown", "unestablished", "unconfirmed",
+                            "missing", "absent", "not supplied")
+
+
+def _verifier_left_transport_open(entry: dict[str, Any]) -> bool:
+    """The Entry Verifier's structured unknowns say the socket type was not established.
+
+    Only ``unknowns`` is read: the classifier does not see that list, while the
+    free-text channel description (which the Verifier prefixes with "ambiguous
+    network/socket input" for most sockets, including UDP and TLS ones whose
+    type it then states) is what the classifier already decided from.
+    """
+
+    for item in entry.get("unknowns") or []:
+        text = str(item).lower()
+        if any(word in text for word in ("transport", "socket type", "sock_stream", "sock_dgram",
+                                         "tcp or udp", "udp or tcp")) \
+                and any(word in text for word in _TRANSPORT_UNKNOWN_WORDS):
+            return True
+    return False
+
+
+def delivery_candidates(entry: dict[str, Any], chosen: dict[str, Any] | None,
+                        resource: str, delivery: str) -> tuple[list[str], str]:
+    """Every physical delivery the evidence leaves possible for one Entry, and why.
+
+    The candidates are derived from the resource kind, not from the acquisition
+    API: any socket read (recv, recvfrom, recvmsg, read, SSL_read, ...) can sit
+    on a stream or a datagram socket.  A delivery is fixed only when something
+    states it positively -- the classifier's enumerated choice, or socket words
+    in the keyword path -- and the Entry Verifier did not record the transport
+    as open.  Otherwise every candidate is measured on the original program and
+    the coverage decides; nothing is dropped for lack of evidence.
+    """
+
+    if resource not in ("network", "local_ipc"):
+        return [delivery], "resource_kind"
+    # The resolved delivery is listed first: it is the one reported for the Entry.
+    every = [delivery] + [item for item in SOCKET_DELIVERIES if item != delivery]
+    if _verifier_left_transport_open(entry):
+        return every, "unresolved:entry_verifier"
+    if chosen and chosen.get("resource_kind"):
+        if chosen.get("delivery") in SOCKET_DELIVERIES:
+            return [chosen["delivery"]], "classifier"
+        return every, "unresolved:classifier"
+    text = f"{entry.get('channel_kind', '')}".lower()
+    if any(word in text for word in ("udp", "datagram", "dgram")):
+        return ["datagram"], "keyword_table"
+    if any(word in text for word in ("tcp", "tls", "ssl", "stream", "connection", "accept")):
+        return ["stream"], "keyword_table"
+    return every, "unresolved:keyword_table"
+
+
+def entry_candidates(entry: dict[str, Any]) -> list[str]:
+    """Candidate deliveries recorded on one context Entry (JSON form)."""
+
+    candidates = [str(item) for item in entry.get("delivery_candidates") or []]
+    if not candidates and entry.get("transport_unresolved") is True:
+        candidates = list(SOCKET_DELIVERIES)  # contexts written before candidates were recorded
+    return candidates or [str(entry.get("delivery", ""))]
+
+
+def entry_supports_delivery(context: dict[str, Any], entry: dict[str, Any], delivery: str) -> bool:
+    """True when this Entry is measured, prompted and harnessed under ``delivery``.
+
+    An Entry whose delivery the evidence fixed stays bound to it.  An Entry
+    with several candidates serves each candidate the context measures; the
+    seed, build, replay and review gates are unchanged, so an untrue candidate
+    simply yields no accepted seed.
+    """
+
+    if entry.get("delivery") == delivery:
+        return True
+    return delivery in context.get("deliveries", []) and delivery in entry_candidates(entry)
+
+
 def _interpreters(entry: dict[str, Any], locator: dict[str, list[str]],
                   actions_by_entry: dict[str, list[dict[str, Any]]], graph: CallGraph) -> tuple[list[str], str]:
     entry_id = entry["entry_id"]
@@ -282,23 +359,29 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
             continue
         interpreters, origin = _interpreters(entry, locator, actions_by_entry, graph)
         driver = graph.driver(function_id, interpreters)
+        candidates, basis = delivery_candidates(entry, chosen.get(entry.get("entry_id", "")), resource, delivery)
+        if delivery not in candidates:
+            delivery = candidates[0]
         record = ContextEntry(
             entry_id=entry["entry_id"], entry_function_id=function_id, entry_function=meta.get("name", ""),
             entry_file=meta.get("file", ""), entry_line=int(entry.get("entry_line") or 0),
             source_api=entry.get("source_api", ""), channel_kind=entry.get("channel_kind", ""),
             attacker_control=entry.get("attacker_control", "unknown"), entry_status=entry.get("status", ""),
             resource_kind=resource, delivery=delivery, resource_source=resource_source,
-            interpreter_function_ids=interpreters, interpreter_source=origin, driver_function_id=driver)
+            interpreter_function_ids=interpreters, interpreter_source=origin, driver_function_id=driver,
+            delivery_candidates=candidates, delivery_basis=basis,
+            transport_unresolved=len(candidates) > 1)
         # A socket Entry whose descriptor may belong to a connection the program opened itself:
         # each such peer becomes its own Entry record with the peer_stream delivery, read by the
         # functions that interpret that peer's bytes.  The accepted side keeps the record above.
-        entry_peers = peers.get(entry["entry_id"], []) if delivery == "stream" else []
+        entry_peers = peers.get(entry["entry_id"], []) if "stream" in candidates else []
         initiated = [peer for peer in entry_peers if peer.get("role") == "initiated"]
         for peer in initiated:
             readers = [fid for fid in peer.get("reader_function_ids") or [] if fid in graph.functions] \
                 or [fid for fid in peer.get("via_function_ids") or [] if fid in graph.functions] or [function_id]
             peer_record = dataclasses.replace(
-                record, delivery="peer_stream", interpreter_function_ids=readers, interpreter_source="peer",
+                record, delivery="peer_stream", delivery_candidates=["peer_stream"],
+                transport_unresolved=False, interpreter_function_ids=readers, interpreter_source="peer",
                 driver_function_id=graph.driver(function_id, readers),
                 channel_kind=f"connection the program opens ({peer.get('descriptor', '')}; address from "
                              f"{peer.get('address_source', 'unknown')}: {peer.get('address_detail', '')})")
@@ -311,7 +394,13 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
             grouped[(resource, f"peer:{descriptor}")].append(peer_record)
         accepted = [peer for peer in entry_peers if peer.get("role") == "accepted"]
         if initiated and not accepted:
-            continue  # every peer of this descriptor is one the program connects to
+            rest = [item for item in candidates if item != "stream"]
+            if not rest:
+                continue  # every peer of this descriptor is one the program connects to
+            # The stream reading is the connection the program opens; a datagram
+            # reading of the same unresolved socket is still measured on its own.
+            record = dataclasses.replace(record, delivery=rest[0], delivery_candidates=rest,
+                                         transport_unresolved=len(rest) > 1)
         if accepted:
             # The accepted side follows the same rule: one client connection, one context.  The
             # locator may have followed a server path of a shared reader (tinyproxy: safe_read's
@@ -359,7 +448,8 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
             context_id=f"ctx-{digest}", resource_kind=resource, priority=RESOURCE_PRIORITY.get(resource, 9),
             driver_function_id=driver, driver_function=graph.name(driver) if driver else "",
             interpreter_function_ids=interpreters, interpreter_functions=[graph.name(fid) for fid in interpreters],
-            deliveries=sorted({member.delivery for member in members}), entries=members,
+            deliveries=sorted({item for member in members for item in member.delivery_candidates}),
+            entries=members,
             target_function_ids=sorted(graph.reachable(interpreters)), notes=notes))
     contexts.sort(key=lambda ctx: (ctx.priority, -len(ctx.target_function_ids), ctx.context_id))
 
@@ -371,7 +461,7 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
     # driver (e.g. a server response read inside a client connection handler).
     for record in sorted(unparsed, key=lambda item: (item.entry_function, item.entry_line, item.entry_id)):
         host = next((ctx for ctx in contexts if ctx.resource_kind == record.resource_kind
-                     and record.delivery in ctx.deliveries
+                     and set(record.delivery_candidates) <= set(ctx.deliveries)
                      and record.entry_function_id in ctx.target_function_ids), None)
         if host is not None:
             host.entries.append(record)
@@ -384,8 +474,7 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
         same = next((ctx for ctx in contexts if ctx.context_id == f"ctx-{digest}"), None)
         if same is not None:
             same.entries.append(record)
-            if record.delivery not in same.deliveries:
-                same.deliveries = sorted(same.deliveries + [record.delivery])
+            same.deliveries = sorted(set(same.deliveries) | set(record.delivery_candidates))
             continue
         contexts.append(InputContext(
             context_id=f"ctx-{digest}", resource_kind=record.resource_kind,
@@ -393,10 +482,22 @@ def build_contexts(run_dir: Path, *, include_unresolved: bool = False) -> dict[s
             driver_function_id=record.driver_function_id,
             driver_function=graph.name(record.driver_function_id) if record.driver_function_id else "",
             interpreter_function_ids=interpreters, interpreter_functions=[graph.name(fid) for fid in interpreters],
-            deliveries=[record.delivery], entries=[record], target_function_ids=sorted(graph.reachable(interpreters)),
+            deliveries=sorted(record.delivery_candidates), entries=[record],
+            target_function_ids=sorted(graph.reachable(interpreters)),
             notes=["interpreting function unknown for at least one Entry; the Entry function was used",
                    "the locator found no function that interprets these bytes and no other context reaches them"]))
     contexts.sort(key=lambda ctx: (ctx.priority, -len(ctx.target_function_ids), ctx.context_id))
+
+    for context in contexts:
+        open_entries = [member for member in context.entries if len(member.delivery_candidates) > 1]
+        if open_entries:
+            # Recorded for the reader; selection reads delivery_candidates.
+            context.notes.append(
+                "delivery not established for " + ", ".join(
+                    f"{member.entry_function}({member.delivery_basis})" for member in open_entries)
+                + "; each candidate delivery (" + ", ".join(sorted({item for member in open_entries
+                                                                    for item in member.delivery_candidates}))
+                + ") is measured separately on the original program")
 
     overlaps = []
     targets = {ctx.context_id: set(ctx.target_function_ids) for ctx in contexts}

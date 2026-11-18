@@ -1,8 +1,11 @@
 from pathlib import Path
 import json
 import asyncio
+import hashlib
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from harnesscreator.llm import CachingLLM, RecordingLLM, ScriptedLLM
 from harnesscreator.llm.base import _synthesize_input_action_checkpoint
@@ -68,6 +71,50 @@ class CrashRecoveryTest(unittest.TestCase):
 
 
 class StatefulCacheTest(unittest.IsolatedAsyncioTestCase):
+    async def test_closed_entry_session_replays_across_clang_id_reallocation(self) -> None:
+        old = {"external_call_sites": [{
+            "direct_argument_declaration_ids": ["0x111", "0x111", "0x222"],
+            "direct_argument_field_bindings": [{
+                "field_declaration_id": "0x333", "receiver_declaration_id": "0x111",
+            }],
+        }]}
+        equivalent = {"external_call_sites": [{
+            "direct_argument_declaration_ids": ["0xaaa", "0xaaa", "0xbbb"],
+            "direct_argument_field_bindings": [{
+                "field_declaration_id": "0xccc", "receiver_declaration_id": "0xaaa",
+            }],
+        }]}
+        different = {"external_call_sites": [{
+            "direct_argument_declaration_ids": ["0xaaa", "0xbbb", "0xccc"],
+            "direct_argument_field_bindings": [{
+                "field_declaration_id": "0xddd", "receiver_declaration_id": "0xaaa",
+            }],
+        }]}
+        record = {
+            "role": "entry_verifier", "instructions": "verify", "payload": old,
+            "output_schema": {"type": "object"}, "session_key": "entry_verifier:one",
+            "status": "completed", "response": {"verified": True},
+        }
+        marker = {"record_type": "session_closed", "session_key": "entry_verifier:one"}
+        with tempfile.TemporaryDirectory() as temporary:
+            trajectory = Path(temporary) / "llm.jsonl"
+            trajectory.write_text(json.dumps(record) + "\n" + json.dumps(marker) + "\n")
+            delegate = ScriptedLLM([])
+            cache = CachingLLM(delegate, trajectory)
+            result = await cache.complete_json(
+                role="entry_verifier", instructions="verify", payload=equivalent,
+                output_schema={"type": "object"}, session_key="entry_verifier:one",
+            )
+            self.assertEqual(result, {"verified": True})
+            self.assertEqual(delegate.calls, [])
+            fresh = ScriptedLLM([{"verified": False}])
+            separate = CachingLLM(fresh, trajectory)
+            self.assertEqual(await separate.complete_json(
+                role="entry_verifier", instructions="verify", payload=different,
+                output_schema={"type": "object"}, session_key="entry_verifier:one",
+            ), {"verified": False})
+            self.assertEqual(len(fresh.calls), 1)
+
     async def test_input_action_checkpoint_keeps_latest_draft_only(self) -> None:
         history = [
             {
@@ -599,6 +646,32 @@ class StatefulCacheTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RecordingMetadataTest(unittest.IsolatedAsyncioTestCase):
+    async def test_entry_generator_replays_across_clang_id_reallocation(self) -> None:
+        old = {"functions": [{"source": "recv(fd, buf, len, 0);", "external_call_sites": [
+            {"direct_argument_declaration_ids": ["0x111", "0x111", "0x222"]},
+        ]}]}
+        equivalent = {"functions": [{"source": "recv(fd, buf, len, 0);", "external_call_sites": [
+            {"direct_argument_declaration_ids": ["0xaaa", "0xaaa", "0xbbb"]},
+        ]}]}
+        record = {
+            "role": "entry_generator", "instructions": "find entries", "payload": old,
+            "input_sha256": hashlib.sha256(json.dumps(old).encode()).hexdigest(),
+            "output_schema": {"type": "object"}, "session_key": None,
+            "status": "completed", "response": {"candidates": []},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            trajectory = Path(temporary) / "llm.jsonl"
+            trajectory.write_text(json.dumps(record) + "\n")
+            with patch.dict(os.environ, {"HARNESSCREATOR_LLM_REPLAY": str(trajectory)}):
+                delegate = ScriptedLLM([])
+                provider = RecordingLLM(delegate)
+            result = await provider.complete_json(
+                role="entry_generator", instructions="find entries", payload=equivalent,
+                output_schema={"type": "object"},
+            )
+            self.assertEqual(result, {"candidates": []})
+            self.assertEqual(delegate.calls, [])
+
     async def test_records_a_completed_session_boundary(self) -> None:
         records = []
         provider = RecordingLLM(ScriptedLLM([]), on_record=records.append)

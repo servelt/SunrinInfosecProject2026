@@ -63,6 +63,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--max-frontier-targets", type=int, default=0, help="0 (default) = no limit")
     group.add_argument("--time-budget", type=float, default=0.0,
                        help="seconds for not-yet-executed exploration per channel; 0 (default) = no limit")
+    group.add_argument("--context-model", default=None, metavar="MODEL",
+                       help="model of the input-context stage (channel classifier, interpreter locator, peer "
+                            "analysis); default: --model.  Seeds and harnesses keep --model")
     group.add_argument("--harness-attempts", type=int, default=3,
                        help="harness generation attempts per context and channel (default: 3)")
 
@@ -190,7 +193,8 @@ async def run_after_entries(args: argparse.Namespace, run_dir: Path, entry_count
     resources = sorted({_CHANNEL_RESOURCE[channel] for channel in args.channel}) or ["network"]
     code, error = await stage("1 input contexts (group Entries, locate interpreters)", stages._contexts(
         argparse.Namespace(run_dir=run_dir, include_unresolved=args.include_unresolved_entries,
-                           classify=True, locate=True, locate_resource=resources, **llm)))
+                           classify=True, locate=True, locate_resource=resources,
+                           **{**llm, "model": getattr(args, "context_model", None) or llm["model"]})))
     report["contexts"] = {"exit": code, "error": error}
     if code != 0:
         save()

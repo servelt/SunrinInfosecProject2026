@@ -18,7 +18,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .config import PROVIDER_MODELS
+from .config import PROVIDER_MODELS, codex_daybreak_args
+from .project import attempt_status, pick_attempt
 
 _ARTIFACTS = re.compile(r"artifacts=(\S+)")
 
@@ -44,6 +45,8 @@ def add_arguments(parser) -> None:
                               "of the highest-priority network context)")
     harness.add_argument("--analysis-compile-database", type=Path,
                          help="compile_commands.json of the program's build")
+    harness.add_argument("--analysis-binary", type=Path,
+                         help="original executable whose recorded link closure is used for harness builds")
     harness.add_argument("--require-fuzz-introspector", action="store_true",
                          help="require Fuzz Introspector (default: allow source indexing, which is "
                               "enough for a small program)")
@@ -79,6 +82,8 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
         argv += ["--channel", channel]
     if args.analysis_compile_database:
         argv += ["--analysis-compile-database", str(args.analysis_compile_database.resolve())]
+    if args.analysis_binary:
+        argv += ["--analysis-binary", str(args.analysis_binary.resolve())]
     if not args.only_verified_entries:
         argv += ["--include-unresolved-entries"]
     if args.diff:                          # delta: Entries only where data reaches the change
@@ -90,12 +95,25 @@ def harnesscreator_argv(args, run_root: Path) -> list[str]:
             argv += ["--model", args.model_t3]
     else:
         # Tier mapping of HarnessCreator's roles: candidates = fast, verifiers = reasoning,
-        # harness generation = main coding model.
+        # harness generation = main coding model.  --model is what the input-context stages use
+        # (classifier/locator unless --context-model, seed generation and frontier, the measured
+        # harness generator and its reviewer), so it is the main tier: seeds are a T2 role in
+        # stage 2 as well (config.ROLE_TIER["seed"]).
         tiers = dict(PROVIDER_MODELS[args.provider])
         tiers.update({k: v for k, v in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)) if v})
         argv += ["--strong-model", tiers["1"], "--coding-model", tiers["2"], "--candidate-model", tiers["3"],
-                 "--model", tiers["3"]]
-        argv += ["--ollama-url", args.ollama_url] if args.provider == "ollama" else ["--codex", args.codex, "--daybreak"]
+                 "--model", tiers["2"]]
+        if args.provider == "ollama":
+            argv += ["--ollama-url", args.ollama_url]
+        else:
+            argv += ["--codex", args.codex]
+            if any(codex_daybreak_args(model) for model in tiers.values()):
+                argv.append("--daybreak")
+    entry_model = getattr(args, "model_entry", None)
+    if entry_model:
+        # Later occurrences win: the Entry roles and the context stage use this model,
+        # seeds and harness generation keep --model (tier 3).
+        argv += ["--candidate-model", entry_model, "--strong-model", entry_model, "--context-model", entry_model]
     return argv
 
 
@@ -112,6 +130,28 @@ async def generate_harness(args, run_root: Path, budget: float, emit, deadline_f
     if logs:
         env["HARNESSCREATOR_LLM_REPLAY"] = ":".join(logs)
         emit(f"[stage 1] earlier Entry answers available for reuse from {len(logs)} run(s)")
+        def completed_entry_calls(path: str) -> int:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as stream:
+                    count = 0
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        count += row.get("status") == "completed" and row.get("role") in {
+                            "entry_generator", "entry_verifier",
+                        }
+                    return count
+            except OSError:
+                return 0
+        ranked = [(completed_entry_calls(path), path) for path in logs]
+        count, best = max(ranked)
+        if count:
+            # CachingLLM can restore closed stateful Entry walks as ordered
+            # sessions. The environment-only replay covers one-shot calls.
+            argv += ["--resume-from", str(Path(best).parent.parent)]
+            emit(f"[stage 1] resuming completed Entry sessions from {Path(best).parent.parent}")
     if args.native_extra_cflags:
         env["HARNESSCREATOR_NATIVE_EXTRA_CFLAGS"] = args.native_extra_cflags
     emit(f"[stage 1] harness generation, up to {budget / 60:.0f} min")
@@ -188,8 +228,13 @@ def built_harnesses(run_dir: Path) -> list[tuple[str, str]]:
             if not directory.is_dir() or "-" not in directory.name:
                 continue
             context, _, delivery = directory.name.rpartition("-")
-            if delivery in ("stream", "datagram", "peer_stream") and any(directory.glob("attempt-*/build/hc-native-fuzzer")):
-                found.append((context, delivery))
+            if delivery not in ("stream", "datagram", "peer_stream"):
+                continue
+            try:
+                pick_attempt(run_dir, context, delivery)      # the attempt stage 2 would analyse
+            except FileNotFoundError:
+                continue
+            found.append((context, delivery))
     # Priority order, as stage 1 ranked the contexts (contexts.jsonl), not directory order: when
     # the budget runs short the highest-priority context must be the one already analysed.  On
     # LightFTP directory order put the data-connection context ahead of the control connection.
@@ -227,6 +272,9 @@ def report_stage1(run_dir: Path, emit) -> list[tuple[str, str]]:
         for row in json.loads(summary_path.read_text(encoding="utf-8")).get("harnesses", []):
             emit(f"  harness {row.get('context_id')}/{row.get('delivery')}: {row.get('status')} "
                  f"({row.get('executions_per_second')} exec/s)")
+    for context, delivery in harnesses:
+        chosen = pick_attempt(run_dir, context, delivery)
+        emit(f"  stage 2 analyses {context}/{delivery} {chosen.name}: {attempt_status(chosen) or 'status not recorded'}")
     emit(f"[stage 1] built harnesses: {harnesses or 'none'}")
     return harnesses
 

@@ -36,7 +36,11 @@ def build_index(run_dir: Path, project: Project, *, harnesscreator_src: Path, sa
     functions: dict[str, list[dict[str, Any]]] = {}
     for name, items in project.by_name.items():
         functions[name] = [{"file": fn.file, "start": fn.start_line, "end": fn.end_line,
-                            "source": fn.source, "signature": fn.signature} for fn in items]
+                            "source": fn.source, "signature": fn.signature, "function_id": fn.function_id,
+                            # compiled into the harness binary, as decided by its debug locations
+                            "active": fn.function_id in project.target_ids,
+                            **({"ambiguous": project.ambiguous_ids[fn.function_id]}
+                               if fn.function_id in project.ambiguous_ids else {})} for fn in items]
     harnesses = {}
     for harness in project.harnesses.values():
         harnesses[harness.harness_id] = {

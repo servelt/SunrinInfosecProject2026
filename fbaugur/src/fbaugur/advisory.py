@@ -87,7 +87,8 @@ def write_advisory(run_dir: Path, *, crash: dict[str, Any], validation: dict[str
     evidence = ["| Check | Result |", "|---|---|"]
     if "reproducibility" in checks:
         rep = checks["reproducibility"]
-        evidence.append(f"| Replays on the harness build | {rep['crashed']}/{rep['runs']} reproduced, "
+        evidence.append(f"| Replays on the harness build | {rep.get('same_fault_runs', rep['crashed'])}/{rep['runs']} "
+                        f"reproduced the same fault ({rep['crashed']} faulted at all), "
                         f"signature `{rep.get('signature', '')}` |")
     if "daemon" in checks:
         dm = checks["daemon"]
@@ -184,7 +185,8 @@ def write_rejection(run_dir: Path, *, crash: dict[str, Any], validation: dict[st
              f"- input: `{crash.get('input_path')}`"]
     if "reproducibility" in checks:
         rep = checks["reproducibility"]
-        lines.append(f"- harness replays: {rep['crashed']}/{rep['runs']}")
+        lines.append(f"- harness replays: {rep.get('same_fault_runs', rep['crashed'])}/{rep['runs']} the same fault "
+                     f"({rep['crashed']} faulted at all)")
     if "daemon" in checks:
         lines.append(f"- real program: {checks['daemon']['summary']}")
     if checks.get("plain_build", {}).get("configured"):

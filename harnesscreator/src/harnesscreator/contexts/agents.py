@@ -10,7 +10,7 @@ from typing import Any
 from ..agents.common import function_payload, function_ref
 from ..analysis.graph import GraphStore
 from ..llm.base import close_llm_session
-from .builder import CallGraph
+from .builder import CallGraph, entry_supports_delivery
 from .model import Seed
 
 ROLES = ("context_classifier", "context_locator", "context_peer", "seed_generator", "seed_frontier")
@@ -161,10 +161,34 @@ def _context_payload(context: dict[str, Any], delivery: str) -> dict[str, Any]:
         **({"fixed_trigger": context["peer_trigger"]} if delivery == "peer_stream" and context.get("peer_trigger") else {}),
         "driver_function": context.get("driver_function", ""),
         "interpreter_functions": context.get("interpreter_functions", []),
-        "entries": [{k: entry.get(k) for k in ("entry_function", "entry_file", "entry_line", "source_api",
-                                                "channel_kind", "delivery")}
-                    for entry in context.get("entries", []) if entry.get("delivery") == delivery],
+        "entries": [_entry_payload(entry, delivery)
+                    for entry in context.get("entries", []) if entry_supports_delivery(context, entry, delivery)],
     }
+
+
+def _entry_payload(entry: dict[str, Any], delivery: str) -> dict[str, Any]:
+    """One Entry as the seed agents see it under ``delivery``.
+
+    When the evidence left the Entry's delivery open, the delivery being
+    measured is stated as a trial, not as a recorded fact that conflicts with
+    another candidate: measured on 3proxy, a recorded "datagram" next to a
+    stream trial made the generator stop after two turns, calling the trial a
+    contradiction, without reading the TCP handlers in the same context.
+    """
+
+    row = {k: entry.get(k) for k in ("entry_function", "entry_file", "entry_line", "source_api", "channel_kind")}
+    candidates = [str(item) for item in entry.get("delivery_candidates") or []] or (
+        ["stream", "datagram"] if entry.get("transport_unresolved") else [str(entry.get("delivery", ""))])
+    if len(candidates) > 1:
+        row["delivery_status"] = (
+            f"not established ({entry.get('delivery_basis') or 'unresolved'}); possible deliveries "
+            f"{', '.join(candidates)}. This session tries {delivery}: running the original program decides "
+            f"whether it is accepted. Functions in this context that use another delivery (a datagram socket "
+            f"elsewhere, for example) do not rule {delivery} out; look for the functions and project artifacts "
+            f"that handle {delivery} input.")
+    else:
+        row["delivery_status"] = f"established: {candidates[0]}"
+    return row
 
 
 class SeedGeneratorAgent:
@@ -189,7 +213,7 @@ class SeedGeneratorAgent:
         # that joins acquisition and interpretation, then the interpreters.
         queue = []
         for function_id in ([entry.get("entry_function_id") for entry in context.get("entries", [])
-                             if entry.get("delivery") == delivery]
+                             if entry_supports_delivery(context, entry, delivery)]
                             + [context.get("driver_function_id")]
                             + list(context.get("interpreter_function_ids", []))):
             if function_id in functions and function_id not in queue:
@@ -236,10 +260,16 @@ class SeedGeneratorAgent:
                 elif wanted_artifact in artifact_paths and wanted_artifact not in trace["opened_artifacts"]:
                     current_artifact = self._read_artifact(wanted_artifact)
                     trace["opened_artifacts"].append(wanted_artifact)
-                elif response.get("done"):
+                elif response.get("done") and (collected or not queue):
                     trace["ended"] = "model_done"
                     break
                 elif queue:
+                    # done with no seed while interpreting functions remain unread: an
+                    # early stop (one driver read, measured on 3proxy) would leave the
+                    # context without any candidate, so the next interpreter is shown.
+                    if response.get("done"):
+                        trace.setdefault("done_overridden", 0)
+                        trace["done_overridden"] += 1
                     current_function = queue.pop(0)
                 else:
                     trace["ended"] = "nothing_left_to_open"

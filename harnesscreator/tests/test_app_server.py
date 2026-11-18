@@ -35,6 +35,8 @@ class AppServerParsingTest(unittest.TestCase):
         self.assertEqual(_daybreak_program_for_model("gpt-6-sol"), "daybreakBlue")
         self.assertEqual(_daybreak_program_for_model("gpt-5.6-cyber"), "daybreakRed")
         self.assertIsNone(_daybreak_program_for_model("gpt-5.6-sol"))
+        self.assertIsNone(_daybreak_program_for_model("gpt-6.1-sol"))
+        self.assertIsNone(_daybreak_program_for_model("gpt-6-astra"))
 
     def test_classifies_provider_wide_failures_across_exception_chain(self) -> None:
         try:
@@ -95,6 +97,41 @@ class AppServerParsingTest(unittest.TestCase):
 
 
 class AppServerSessionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_notice_waits_for_turn_completion(self) -> None:
+        server = CodexAppServer(cwd=Path("."))
+        server._notification_backlog.extend([
+            {"method": "error", "params": {"message": "Reconnecting... 2/5", "turnId": "turn-1"}},
+            {"method": "item/completed", "params": {
+                "turnId": "turn-1", "item": {"type": "agentMessage", "text": '{"ok":true}'},
+            }},
+            {"method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"},
+            }},
+        ])
+        self.assertEqual(await server._collect_turn("thread-1", "turn-1"), '{"ok":true}')
+
+    async def test_reconnect_notice_does_not_hide_terminal_failure(self) -> None:
+        server = CodexAppServer(cwd=Path("."))
+        server._notification_backlog.extend([
+            {"method": "error", "params": {"message": "Reconnecting... 2/5"}},
+            {"method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {
+                    "id": "turn-1", "status": "failed",
+                    "error": {"message": "provider unavailable"},
+                },
+            }},
+        ])
+        with self.assertRaisesRegex(CodexAppServerError, "provider unavailable"):
+            await server._collect_turn("thread-1", "turn-1")
+
+    async def test_non_reconnect_error_remains_failure(self) -> None:
+        server = CodexAppServer(cwd=Path("."))
+        server._notification_backlog.append(
+            {"method": "error", "params": {"message": "permission denied", "turnId": "turn-1"}}
+        )
+        with self.assertRaisesRegex(CodexAppServerError, "permission denied"):
+            await server._collect_turn("thread-1", "turn-1")
+
     async def test_failed_daybreak_turn_start_deletes_persistent_thread(self) -> None:
         class FailingServer(CodexAppServer):
             def __init__(self):
@@ -378,6 +415,28 @@ class AppServerSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server._thread_compactions["thread-1"], 1)
         self.assertEqual(server._thread_usage["thread-1"], (32_300, 258_400))
         self.assertEqual(server._threads["small_feature:e1"][0], "thread-1")
+
+    async def test_compaction_reconnect_notice_waits_for_completion(self) -> None:
+        class CompactServer(CodexAppServer):
+            async def _request(self, method, params):
+                return {}
+
+        server = CompactServer(cwd=Path("."))
+        server._notification_backlog.extend([
+            {"method": "turn/started", "params": {
+                "threadId": "thread-1", "turn": {"id": "compact-turn"},
+            }},
+            {"method": "error", "params": {
+                "turnId": "compact-turn", "message": "Reconnecting... 2/5",
+            }},
+            {"method": "turn/completed", "params": {
+                "threadId": "thread-1", "turn": {
+                    "id": "compact-turn", "status": "completed",
+                },
+            }},
+        ])
+        await server._compact_thread_once("thread-1")
+        self.assertEqual(server._thread_compactions["thread-1"], 1)
 
     async def test_token_usage_uses_last_turn_not_cumulative_total(self) -> None:
         server = CodexAppServer(cwd=Path("."))

@@ -94,13 +94,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--violation", default="")
     parser.add_argument("--direction", default="")
     parser.add_argument("--function", default="")
+    parser.add_argument("--function-id", default="")
     parser.add_argument("--crash", default="")
     parser.add_argument("--agent-run", default="")
     parser.add_argument("--log", type=Path)
     args = parser.parse_args(argv)
     toolbox = Toolbox(args.run_dir, role=args.role, worker=args.worker, harness=args.harness, sp=args.sp,
                       phi=args.phi, violation=args.violation, direction=args.direction,
-                      function=args.function, crash=args.crash, agent_run=args.agent_run)
+                      function=args.function, function_id=args.function_id, crash=args.crash,
+                      agent_run=args.agent_run)
     serve(toolbox, log=args.log)
     return 0
 

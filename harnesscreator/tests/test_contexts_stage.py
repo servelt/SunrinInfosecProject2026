@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -44,15 +45,27 @@ EDGES = [("main", "dispatch"), ("dispatch", "handle_set"), ("dispatch", "handle_
          ("dispatch", "handle_admin"), ("handle_get", "handle_hit")]
 
 
-def write_run(run: Path, *, entries=None, extra_functions=(), extra_edges=(), actions=()):
+def write_run(run: Path, *, entries=None, extra_functions=(), extra_edges=(), actions=(), program=PROGRAM):
     (run / "analysis").mkdir(parents=True)
     (run / "entries").mkdir()
     names = FUNCTIONS + list(extra_functions)
     with (run / "analysis" / "functions.jsonl").open("w") as handle:
         for index, name in enumerate(names):
+            definition = re.search(r"(?m)^[^\n]*\b" + re.escape(name) + r"\([^;\n]*\)\s*\{", program)
+            if definition:
+                start = program.count("\n", 0, definition.start()) + 1
+                opening = program.index("{", definition.start(), definition.end())
+                depth, closing = 0, opening
+                for closing in range(opening, len(program)):
+                    depth += (program[closing] == "{") - (program[closing] == "}")
+                    if depth == 0:
+                        break
+                end = program.count("\n", 0, closing) + 1
+            else:
+                start = end = index + 1
             handle.write(json.dumps({
                 "function_id": f"fn-{name}", "name": name, "qualified_name": name, "signature": f"void {name}()",
-                "language": "c_cpp", "file": "prog.c", "start_line": index + 1, "end_line": index + 1,
+                "language": "c_cpp", "file": "prog.c", "start_line": start, "end_line": end,
                 "source": f"void {name}() {{}}"}) + "\n")
     with (run / "analysis" / "edges.jsonl").open("w") as handle:
         for index, (caller, callee, *kind) in enumerate(list(EDGES) + list(extra_edges)):
@@ -261,6 +274,10 @@ class SeedWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["frontier_blocked_reasons"], {"NEEDS_STARTUP_OPTION": 1})
         self.assertEqual(summary["frontier_remaining"], 1)
         self.assertEqual(summary["stopped"], "frontier_empty")
+        # Entry reach is reported next to acceptance: every accepted seed here ran the Entry
+        # (main reads stdin), and so does the run with no input, which the summary says.
+        self.assertEqual(summary["entry_reach"]["accepted"], 4)
+        self.assertIn(summary["entry_reach"]["entry_executed"] + summary["entry_reach"]["entry_not_measurable"], (4,))
         results = {row["seed_id"]: row for row in map(json.loads, (self.run_dir / "seeds" / "results.jsonl").read_text().splitlines())}
         statuses = sorted(row["status"] for row in results.values())
         # "admin\n" only reaches the error branch of dispatch: new line, so it is kept as a seed.
@@ -317,6 +334,17 @@ class SeedWorkflowRobustnessTests(SeedWorkflowTests):
     async def test_seed_that_reaches_nothing_is_rejected_and_missing_coverage_is_an_error(self):
         self.skipTest("covered by the parent class")
 
+    async def test_context_without_a_compiled_target_asks_no_model(self):
+        # Every target behind a platform #ifdef: no input can be accepted, so no model turn is spent.
+        self.context["target_function_ids"] = ["fn-handle_optional"]
+        llm = ScriptedLLM([])
+        summary = await self.workflow(llm).run()
+        self.assertEqual(llm.calls, [])
+        self.assertEqual(summary["target_functions_in_this_build"], 0)
+        self.assertEqual(summary["stopped"], "no_target_in_this_build")
+        self.assertEqual(summary["generator"]["ended"], "no_target_in_this_build")
+        self.assertEqual(summary["corpus_seeds"], 0)
+
     async def test_uncompiled_targets_are_not_explored_and_a_failed_model_turn_does_not_end_the_stage(self):
         self.assertIn("fn-handle_optional", self.context["target_function_ids"])
         llm = ScriptedLLM([
@@ -360,7 +388,8 @@ class LineFrontierTests(unittest.IsolatedAsyncioTestCase):
         (self.build / "prog.c").write_text(COUNT_PROGRAM)
         subprocess.run(["gcc", "--coverage", "-O0", "-o", "prog", "prog.c"], cwd=self.build, check=True)
         self.run_dir = root / "run"
-        write_run(self.run_dir, extra_functions=["handle_count"], extra_edges=[("dispatch", "handle_count")])
+        write_run(self.run_dir, extra_functions=["handle_count"], extra_edges=[("dispatch", "handle_count")],
+                  program=COUNT_PROGRAM)
         write_contexts(self.run_dir, build_contexts(self.run_dir))
         self.context = json.loads((self.run_dir / "contexts" / "contexts.jsonl").read_text().splitlines()[0])
 

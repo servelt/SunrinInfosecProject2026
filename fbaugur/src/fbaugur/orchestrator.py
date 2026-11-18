@@ -18,10 +18,12 @@ wall clock, or a harness that cannot start.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
 import hashlib
 import json
+import re
 import sqlite3
 import time
 import traceback
@@ -36,11 +38,19 @@ from .index import build_index
 from .instrument import Invariant
 from .project import Project, parse_location
 from .runner import (crash_signature, daemon_replay, fault_key, find_duplicate, finding_type, gdb_violation_state,
-                     in_harness, is_finding, load_ub_baseline, program_frames, run_input)
+                     in_harness, is_finding, load_ub_baseline, program_frames, run_input,
+                     new_ub_sites, resolved, same_fault, set_source_root, write_ub_baseline)
 from .store import Store, new_id
 
 POOL_PHASES = [("core", 1), ("core", 2), ("general", 3), ("general", 4)]   # FBv2 Table 2
+NO_SP_MARKER = "NO_SUSPICIOUS_POINT"
 IDLE = 2.0
+
+
+def _lane_key(name: str) -> tuple[str, str]:
+    """`verify1:w-asan` -> ("verify", "w-asan"): the lane kind and the worker it serves."""
+    head, _, worker = name.partition(":")
+    return re.sub(r"\d+$", "", head), worker
 
 
 FINAL_STATUSES = ("confirmed", "validated", "reported", "not_vulnerability", "needs_review")
@@ -102,6 +112,7 @@ class Run:
         self.emit = emit or (lambda message: None)
         self.store = Store(self.run_dir / "state.db")
         self.project = Project(Path(cfg.hc_run), cfg.context_id, cfg.deliveries)
+        set_source_root(self.project.source_root)     # sanitizer paths are read relative to it
         self.index = build_index(self.run_dir, self.project, harnesscreator_src=harnesscreator_src,
                                  sanitizer=cfg.sanitizer)
         self.agents = AgentRunner(self.run_dir, cfg, self.store, emit=self.emit)
@@ -183,14 +194,43 @@ class Run:
             if not result.ok:
                 self.emit(f"[msan] {worker.harness_id}: no MemorySanitizer build -- {result.error.strip()[-300:]}")
                 continue
-            probe = await asyncio.to_thread(run_input, result.binary, harness.seeds[0][1], timeout=30)
-            if "can not mmap the shadow memory" in probe.stderr_tail or probe.timed_out:
+            # With no input first: a fault there comes from startup, not from any input, and every
+            # input built on this binary would hit it (measured: an uninstrumented TLS library
+            # reported use-of-uninitialized-value while the program initialized).
+            empty = await asyncio.to_thread(run_input, result.binary, b"", timeout=30)
+            if "can not mmap the shadow memory" in empty.stderr_tail or empty.timed_out:
                 self.emit(f"[msan] {worker.harness_id}: MemorySanitizer runtime does not start; worker skipped")
                 continue
+            if empty.crashed:
+                where = " | ".join(str(f.get("function")) for f in program_frames(empty.frames)[:4])
+                reason = (f"the build reports {empty.crash_type} with no input at all ({where}); "
+                          "every input would hit it, so it cannot fuzz")
+                self.store.set_meta(f"msan_skipped_{worker.harness_id}", reason)
+                self.emit(f"[msan] {worker.harness_id}: worker skipped -- {reason}")
+                continue
+            # A verified input that faults here, when no input does not, may be a real defect of the
+            # program: it becomes a candidate, and only that input is kept out of this fuzzer's seeds.
+            quarantined = self.__dict__.setdefault("_msan_quarantine", {}).setdefault(worker.harness_id, set())
+            for seed_id, blob in harness.seeds:
+                probe = await asyncio.to_thread(run_input, result.binary, blob, timeout=30)
+                if not probe.crashed:
+                    continue
+                quarantined.add(seed_id)
+                path = self.run_dir / "inputs" / "msan-seed"
+                path.mkdir(parents=True, exist_ok=True)
+                (path / f"{seed_id}.bin").write_bytes(blob)
+                self.store.insert("crashes", {
+                    "crash_id": new_id("crash"), "worker_id": f"{worker.worker_id}-msan", "source": "msan_seed",
+                    "sp_id": None, "input_path": str(path / f"{seed_id}.bin"), "status": "pending",
+                    "crash_type": probe.crash_type, "frames": probe.frames,
+                    "details": {"summary": probe.summary(), "seed_id": seed_id,
+                                "note": "a verified normal input faults under MemorySanitizer, no input does not"},
+                    "created_at": time.time(), "updated_at": time.time()})
+                self.emit(f"[msan] {worker.harness_id}: verified input {seed_id} reports {probe.crash_type}; "
+                          "recorded as a candidate and kept out of the MSan seeds")
             msan = Worker(f"{worker.worker_id}-msan", worker.harness_id, worker.delivery, "memory", result.binary)
             self.workers.append(msan)
-            note = f"; the first verified normal input already reports {probe.crash_type}" if probe.crashed else ""
-            self.emit(f"[msan] {msan.worker_id}: MemorySanitizer worker on {result.binary}{note}")
+            self.emit(f"[msan] {msan.worker_id}: MemorySanitizer worker on {result.binary}")
             entry = self.index["harnesses"].get(worker.harness_id)
             if entry is not None:                               # the PoV tool replays on it too
                 entry["msan_binary"] = str(result.binary)
@@ -230,6 +270,9 @@ class Run:
         Upstream FBv2 does the same per work item (worker/pipeline.py:377): the failure is
         recorded and the pipeline keeps going.
         """
+        key = _lane_key(name)
+        running = self.__dict__.setdefault("_running", collections.Counter())
+        running[key] += 1
         try:
             await coroutine
         except asyncio.CancelledError:
@@ -244,6 +287,59 @@ class Run:
             (self.run_dir / "logs" / "lane-errors.log").open("a", encoding="utf-8").write(
                 f"\n=== {time.strftime('%H:%M:%S')} {name}\n{detail}\n")
             self.emit(f"LANE ERROR {name}: {type(exc).__name__}: {exc} (see logs/lane-errors.log)")
+        finally:
+            running[key] -= 1
+
+    def _producing(self, worker: Worker, *kinds: str) -> bool:
+        """Is a lane of one of these kinds still running for this worker (it may still fill a queue)?"""
+        running = self.__dict__.get("_running") or {}
+        return any(running.get((kind, worker.worker_id), 0) > 0 for kind in kinds)
+
+    @contextlib.contextmanager
+    def _working(self, worker: Worker, kind: str):
+        """Mark one item in hand: what it produces is written before the mark is removed."""
+        busy = self.__dict__.setdefault("_busy", collections.Counter())
+        busy[(kind, worker.worker_id)] += 1
+        try:
+            yield
+        finally:
+            busy[(kind, worker.worker_id)] -= 1
+
+    # The lanes that feed each other: fuzzer violations -> triage -> refine -> build -> fuzzer,
+    # triage (REAL_ISSUE) -> PoV -> pov_failed -> invariant recorder -> build.  None of them may
+    # stop while another can still hand it work, and waiting on each other's mere existence would
+    # never end, so they stop together: when no source lane runs, no member holds an item, and
+    # every queue of the cycle is empty.
+    _CYCLE = ("pov", "phi-record", "phi-build", "phi-triage", "phi-refine")
+    _SOURCES = ("spgen", "delta-spgen", "verify", "fuzz")
+
+    def _recorder_queue(self, worker: Worker) -> list[dict[str, Any]]:
+        seen = self.__dict__.setdefault("_recorder_seen", set())
+        rows = self.store.rows(
+            "SELECT * FROM sps WHERE worker_id=? AND safety_reason IS NOT NULL AND safety_reason!='' "
+            "AND safety_location IS NOT NULL AND status IN ('rejected','verified','pov_failed') "
+            "ORDER BY updated_at ASC", worker.worker_id)
+        return [r for r in rows if r["sp_id"] not in seen
+                and not self.store.scalar("SELECT COUNT(*) FROM invariants WHERE sp_id=?", r["sp_id"])]
+
+    def _cycle_settled(self, worker: Worker) -> bool:
+        if not self.sp_done.is_set() or self._producing(worker, *self._SOURCES):
+            return False
+        busy = self.__dict__.get("_busy") or {}
+        if any(busy.get((kind, worker.worker_id), 0) > 0 for kind in self._CYCLE):
+            return False
+        open_items = (
+            ("SELECT COUNT(*) FROM sps WHERE worker_id=? AND status IN "
+             "('pending_verify','verifying','pending_pov','generating_pov')", worker.worker_id),
+            ("SELECT COUNT(*) FROM violations WHERE harness_id=? AND status IN ('pending','triaging')",
+             worker.harness_id),
+            ("SELECT COUNT(*) FROM invariants WHERE harness_id=? AND status IN "
+             "('needs_repair','needs_refinement','refining','repairing')", worker.harness_id))
+        if any(self.store.scalar(sql, arg) for sql, arg in open_items):
+            return False
+        if worker.sanitizer != "memory" and self._uninstalled(worker.harness_id):
+            return False
+        return not self._recorder_queue(worker)
 
     async def _agent(self, role: str, harness_id: str, message: str, *, subject: str = "",
                      extra_system: str = "", **binding: Any):
@@ -261,24 +357,13 @@ class Run:
 
     # ------------------------------------------------------------------ 1-3 preparation
     async def prepare(self) -> bool:
+        self.store.settle_pov()                       # a resumed run may hold states of older code
         self.emit(f"workers: {[(w.worker_id, w.delivery) for w in self.workers]}")
-        for worker in self.analysis_workers:
-            harness = self.harness(worker)
-            result = await asyncio.to_thread(run_input, harness.binary, harness.seeds[0][1], timeout=20)
-            if result.crashed or result.timed_out:
-                self.emit(f"harness {harness.harness_id} does not run a verified normal input: {result.summary()}")
-                return False
-        # Undefined behaviour the verified normal inputs already trigger is the program's background
-        # noise, not a finding.  Measured once here and shared through a file, because the tool
-        # servers that replay PoVs run in their own processes.
-        baseline: set[str] = set()
-        for worker in self.analysis_workers:
-            harness = self.harness(worker)
-            for _, blob in harness.seeds:
-                result = await asyncio.to_thread(run_input, harness.binary, blob, timeout=20)
-                baseline.update(result.ub_sites())
+        baseline = await self._replay_verified_inputs()
+        if baseline is None:
+            return False
         self.ub_baseline = baseline
-        (self.run_dir / "ub-baseline.json").write_text(json.dumps(sorted(baseline)), encoding="utf-8")
+        write_ub_baseline(self.run_dir, baseline)
         self.emit(f"undefined-behaviour baseline: {len(baseline)} site(s) reached by normal inputs"
                   + (f" {sorted(baseline)[:5]}" if baseline else ""))
         if self.cfg.msan:
@@ -343,6 +428,67 @@ class Run:
         if not changes:
             self.emit("[delta] the diff changes no function of this program; nothing to analyse")
         return bool(changes)
+
+    async def _replay_verified_inputs(self) -> set[str] | None:
+        # Every verified input is replayed once.  One that faults is a finding to check, not a
+        # reason to stop: the run goes on with the others (it stops only when none runs cleanly).
+        # Undefined behaviour the verified inputs trigger is used as the background noise that later
+        # replays are compared with -- but each such site is also checked once as a finding, since a
+        # verified input is one the program accepts, not one proven harmless.
+        record = self.store.get_meta("seed_candidates_recorded") is None
+        baseline: set[str] = set()
+        for worker in self.analysis_workers:
+            harness = self.harness(worker)
+            clean, site_input = 0, {}
+            for seed_id, blob in harness.seeds:
+                result = await asyncio.to_thread(run_input, harness.binary, blob, timeout=20)
+                if result.crashed or result.timed_out:
+                    if record:
+                        self._seed_candidate(worker, seed_id, blob, "seed_replay", result.crash_type or "timeout",
+                                             {"summary": result.summary()}, frames=result.frames)
+                    continue
+                clean += 1
+                for site in result.ub_sites():
+                    site_input.setdefault(site, (seed_id, blob))
+            if not clean:
+                self.emit(f"harness {harness.harness_id} runs none of its verified normal inputs cleanly")
+                return None
+            baseline.update(site_input)
+            if record:
+                for site, (seed_id, blob) in site_input.items():
+                    self._seed_candidate(worker, seed_id, blob, "seed_ub", "undefined-behavior", {"ub_site": site})
+                self._import_stage1_findings(worker, harness)
+        self.store.set_meta("seed_candidates_recorded", True)
+        return baseline
+
+    def _seed_candidate(self, worker: Worker, seed_id: str, blob: bytes, source: str, crash_type: str,
+                        details: dict[str, Any], frames: list | None = None) -> None:
+        """A finding a verified input already shows, queued for the same confirmation as any other."""
+        path = self.run_dir / "inputs" / "seed-candidates"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{seed_id}.bin").write_bytes(blob)
+        self.store.insert("crashes", {
+            "crash_id": new_id("crash"), "worker_id": worker.worker_id, "source": source, "sp_id": None,
+            "input_path": str(path / f"{seed_id}.bin"), "status": "pending", "crash_type": crash_type,
+            "frames": frames or [], "details": {**details, "seed_id": seed_id}, "created_at": time.time(),
+            "updated_at": time.time()})
+        self.emit(f"[seed] {seed_id}: {crash_type} on a verified input; queued for confirmation")
+
+    def _import_stage1_findings(self, worker: Worker, harness) -> None:
+        """Sanitizer reports stage 1 saw in program code while replaying the verified inputs."""
+        path = Path(harness.attempt_dir) / "program-findings.json"
+        try:
+            findings = json.loads(path.read_text(encoding="utf-8")).get("findings") or []
+        except (OSError, ValueError):
+            return
+        seeds = dict(harness.seeds)
+        for finding in findings:
+            seed_id = next((s for s in finding.get("seed_ids") or [] if s in seeds), None)
+            if seed_id is None:
+                continue
+            self._seed_candidate(worker, seed_id, seeds[seed_id], "stage1_report",
+                                 f"{finding.get('sanitizer', '')}: {finding.get('message', '')}"[:160],
+                                 {"stage1": {k: finding.get(k) for k in ("sanitizer", "file", "line", "message")}})
 
     async def delta_sp_agent(self, worker: Worker) -> None:
         """FBv2 DeltaSPGenerator: one agent reads the diff and analyses every changed function."""
@@ -413,30 +559,36 @@ class Run:
                 limit = self.cfg.max_function_analyses or 10 ** 6
                 for pool, names in (("core", core), ("general", general)):
                     for name in dict.fromkeys(names):
-                        if name in self.project.blocked_names:
-                            skipped += 1
-                            continue
-                        phase = (1 if pool == "core" and name not in analysed else
-                                 2 if pool == "core" else
-                                 3 if name not in analysed else 4)
-                        if name not in self.project.executed_names:
-                            phase += 4            # no runtime evidence yet: analyse after the rest
-                        existing = self.store.row(
-                            "SELECT 1 FROM pool WHERE worker_id=? AND direction_id=? AND function_name=?",
-                            worker.worker_id, direction["direction_id"], name)
-                        if existing:
-                            continue
-                        if self.store.scalar("SELECT COUNT(*) FROM pool WHERE worker_id=?",
-                                             worker.worker_id) >= limit:
-                            break
-                        self.store.insert("pool", {
-                            "worker_id": worker.worker_id, "direction_id": direction["direction_id"],
-                            "function_name": name, "pool": pool, "phase": phase, "status": "pending",
-                            "updated_at": now})
-                        analysed.add(name)
+                        # A frontier agent's judgement that a function needs another startup option
+                        # is a model's opinion (on 3proxy, given after 0 inputs tried), not a
+                        # measurement: the function is analysed last, never left out.
+                        late = 8 if name in self.project.blocked_names else 0
+                        skipped += bool(late)
+                        # One pool item per compiled definition: a name can stand for several
+                        # (file-static twins), and one never compiled (#ifdef) is not analysed.
+                        for function_id in self.project.active_ids(name):
+                            phase = (1 if pool == "core" and function_id not in analysed else
+                                     2 if pool == "core" else
+                                     3 if function_id not in analysed else 4)
+                            if name not in self.project.executed_names:
+                                phase += 4            # no runtime evidence yet: analyse after the rest
+                            phase += late
+                            existing = self.store.row(
+                                "SELECT 1 FROM pool WHERE worker_id=? AND direction_id=? AND function_id=?",
+                                worker.worker_id, direction["direction_id"], function_id)
+                            if existing:
+                                continue
+                            if self.store.scalar("SELECT COUNT(*) FROM pool WHERE worker_id=?",
+                                                 worker.worker_id) >= limit:
+                                break
+                            self.store.insert("pool", {
+                                "worker_id": worker.worker_id, "direction_id": direction["direction_id"],
+                                "function_name": name, "function_id": function_id, "pool": pool,
+                                "phase": phase, "status": "pending", "updated_at": now})
+                            analysed.add(function_id)
         if skipped:
-            self.emit(f"pool: left out {skipped} function(s) measured to need another startup option "
-                      f"or channel")
+            self.emit(f"pool: {skipped} function(s) a frontier agent judged to need another startup option "
+                      f"or channel are queued last")
 
     # ------------------------------------------------------------------ candidate lane
     async def sp_generator_agent(self, worker: Worker, slot: int) -> None:
@@ -452,7 +604,7 @@ class Run:
                 await asyncio.sleep(IDLE)
                 continue
             name = item["function_name"]
-            function = self.project.function(name)
+            function = self.project.function(name, item.get("function_id") or "")
             if function is None or not function.source:
                 self.store.update("pool", "rowid", item["rowid"], {"status": "skipped",
                                                                    "error": "no source", "updated_at": time.time()})
@@ -467,13 +619,9 @@ class Run:
                        f"Lines: {function.start_line}-{function.end_line}\n```c\n{numbered}\n```\n\n"
                        f"## Callers\n{callers or '(none recorded)'}\n\n## Callees\n{callees or '(none recorded)'}\n\n"
                        "If you find issues, call create_suspicious_point for each. If the function is safe, "
-                       "say briefly why. Be concise.")
+                       f"say briefly why and end your reply with the line {NO_SP_MARKER}. Be concise.")
             try:
-                result = await self._agent("sp_generator", worker.harness_id, message, subject=name,
-                                           worker=worker.worker_id, direction=item["direction_id"],
-                                           function=name)
-                status = "analysed" if result and result.ok else "failed"
-                error = result.error[:500] if result and result.error else None
+                status, error = await self._sp_generation_turn(worker, item, name, message)
             except asyncio.CancelledError:
                 self.store.update("pool", "rowid", item["rowid"],
                                   {"status": "pending", "updated_at": time.time()})
@@ -481,8 +629,53 @@ class Run:
             except Exception as exc:
                 status, error = "failed", f"{type(exc).__name__}: {exc}"
                 self.emit(f"[sp_generator] {name}: {error}")
+            attempts = int(item.get("attempts") or 0) + 1
+            if status == "failed" and attempts < self.cfg.sp_generation_attempts:
+                # A transient error or a refused turn must not end this function's analysis: it goes
+                # back to the queue, behind the work not yet tried (claim orders by phase, then rowid).
+                status = "pending"
+                self.store.update("pool", "rowid", item["rowid"], {"phase": int(item.get("phase") or 0) + 10})
+                self.emit(f"[sp_generator] {name}: attempt {attempts} failed ({(error or '')[:120]}); "
+                          f"retrying later")
             self.store.update("pool", "rowid", item["rowid"],
-                              {"status": status, "error": error, "updated_at": time.time()})
+                              {"status": status, "error": error, "attempts": attempts, "updated_at": time.time()})
+
+    async def _sp_generation_turn(self, worker: Worker, item: dict, name: str,
+                                  message: str) -> tuple[str, str | None]:
+        """One analysis of a pool function; ("analysed" | "failed", error).
+
+        A turn counts as analysed only with an outcome on record: a create_suspicious_point call, or
+        the function declared safe with NO_SP_MARKER.  A reply that does neither (seen: the model
+        described a stack overflow, said it was reporting it, and ended without the call) gets one
+        follow-up turn that carries that reply; if that one also records nothing, the attempt fails
+        and the pool retries it like any other failed turn.
+        """
+        binding = dict(worker=worker.worker_id, direction=item["direction_id"],
+                       function=name, function_id=item.get("function_id") or "")
+        result = await self._agent("sp_generator", worker.harness_id, message, subject=name, **binding)
+        for followup in (True, False):
+            if result is None:
+                return "failed", "no result (terminal model error)"
+            if not result.ok:
+                return "failed", (result.error or result.status)[:500]
+            recorded = self.store.scalar("SELECT COUNT(*) FROM sps WHERE origin_ref=?", result.run_id)
+            if recorded or NO_SP_MARKER in (result.text or ""):
+                return "analysed", None
+            if not followup:
+                return "failed", "the turn ended without recording a suspicious point or declaring the function safe"
+            self.emit(f"[sp_generator] {name}: reply recorded no suspicious point and did not declare the "
+                      f"function safe; asking once more")
+            reply = (result.text or "(empty reply)").strip()[:4000]
+            result = await self._agent(
+                "sp_generator", worker.harness_id,
+                message + "\n\n## Your previous reply\nAn earlier analysis of this function ended with the reply "
+                "below. It called create_suspicious_point zero times and did not end with "
+                f"{NO_SP_MARKER}, so nothing was recorded.\n\n> " + reply.replace("\n", "\n> ") +
+                "\n\nRecord each issue that reply describes with create_suspicious_point now -- with a low score "
+                "if you are unsure; the verifier, not this step, decides whether it is real.  Only if that reply "
+                f"described no issue at all, end your reply with the line {NO_SP_MARKER}.",
+                subject=name, **binding)
+        return "failed", "unreachable"
 
     async def verifier_agent(self, worker: Worker, slot: int) -> None:
         while not self.out_of_time():
@@ -505,15 +698,22 @@ class Run:
             result = await self._agent("sp_verifier", worker.harness_id, message, subject=sp["sp_id"],
                                        worker=worker.worker_id, sp=sp["sp_id"])
             row = self.store.row("SELECT * FROM sps WHERE sp_id=?", sp["sp_id"]) or sp
-            score = row.get("score") or 0.0
-            important = bool(row.get("is_important"))
-            if result is None or not result.ok:
-                # An unverified candidate is kept: FBv2 only drops a candidate on a 100% certain FP.
+            # Only an explicit is_important from update_suspicious_point is a verdict (it stamps
+            # verdict_at).  A turn that ended normally without calling the tool, or called it with
+            # only a score or notes, left none: the column default is_important=0 is not a rejection.
+            verdict = (row.get("verdict_at") or 0) > (sp.get("updated_at") or 0)
+            if result is None or not result.ok or not verdict:
+                # An unverified candidate is kept: FBv2 only drops a candidate on a 100% certain FP,
+                # and a turn that recorded no verdict proved nothing about it.
                 self.store.update("sps", "sp_id", sp["sp_id"],
-                                  {"status": "pending_pov" if score >= self.cfg.pov_min_score else "verified",
-                                   "claimed_by": None, "updated_at": time.time()})
+                                  {"status": "pending_pov", "claimed_by": None, "updated_at": time.time()})
                 continue
-            if score >= self.cfg.pov_min_score and important:
+            # The verifier's verdict decides, not a score cut: its prompt passes every candidate it
+            # cannot prove safe with is_important=True ("0.4-0.5: uncertain but possible -> PASS TO
+            # POV") and marks a false positive with is_important=False.  A score threshold here
+            # dropped those uncertain candidates before any PoV was tried.  The score still orders
+            # the PoV queue (claim_sp: is_important, then score).
+            if row.get("is_important"):
                 status = "pending_pov"
             else:
                 status = "rejected"
@@ -534,43 +734,74 @@ class Run:
                               fuzzer=worker.harness_id, fuzzer_source="(call get_fuzzer_info)"),
                           subject=f"fp:{sp['sp_id']}", worker=worker.worker_id)
 
+    def pov_claim_filter(self) -> dict[str, Any]:
+        """Which pending_pov candidates a PoV agent may take: all of them.
+
+        Every SP in pending_pov was admitted by the verifier (or kept for lack of a verdict).
+        A score floor here left admitted SPs below it unclaimed while the lane's exit test still
+        counted them, so the lane waited for them until the scan's deadline.
+        """
+        return {}
+
     async def pov_agent(self, worker: Worker, slot: int) -> None:
         while not self.out_of_time():
             sp = self.store.claim_sp(from_status="pending_pov", to_status="generating_pov",
-                                     worker_id=worker.worker_id, agent=f"pov-{slot}",
-                                     min_score=self.cfg.pov_min_score)
+                                     worker_id=worker.worker_id, agent=f"pov-{slot}", **self.pov_claim_filter())
             if sp is None:
-                if self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying','pending_pov') "
-                        "AND worker_id=?", worker.worker_id):
+                # Verification and triage (REAL_ISSUE) both fill pending_pov.
+                if self._cycle_settled(worker):
                     return
                 await asyncio.sleep(IDLE)
                 continue
-            witness = ""
-            if sp.get("witness_path") and Path(sp["witness_path"]).is_file():
-                data = Path(sp["witness_path"]).read_bytes()[:2048]
-                witness = ("\n## A fuzzer input that already reached the inconsistent state\n"
-                           f"{len(data)} bytes, hex:\n```\n{data.hex()}\n```\n"
-                           "Start from these bytes and extend them so the state reaches the consumer.\n")
-            message = (f"Generate a PoV for this suspicious point.\n\n```json\n"
-                       f"{json.dumps({k: sp.get(k) for k in ('sp_id','function_name','vuln_type','description','pov_guidance','verification_notes')}, ensure_ascii=False, indent=2)}\n```\n"
-                       + witness + "\nRead the harness source first, then iterate with create_pov.")
-            result = await self._agent("pov", worker.harness_id, message, subject=sp["sp_id"],
-                                       worker=worker.worker_id, sp=sp["sp_id"])
-            crashed = self.store.scalar("SELECT COUNT(*) FROM povs WHERE sp_id=? AND crashed=1", sp["sp_id"])
-            if crashed:
-                self.store.update("sps", "sp_id", sp["sp_id"],
-                                  {"status": "pov_generated", "is_real": 1, "updated_at": time.time()})
-                continue
-            self.store.update("sps", "sp_id", sp["sp_id"],
-                              {"status": "pov_failed", "claimed_by": None, "updated_at": time.time()})
-            if not self.out_of_time() and self.cfg.sp_fuzz_seconds:
-                fuzzer = self.fuzzers.get(worker.harness_id)
-                await fuzz_candidate(self.store, run_dir=self.run_dir, worker=worker.worker_id,
-                                     harness=worker.harness_id, binary=self.harness(worker).binary,
-                                     sp_id=sp["sp_id"], seconds=self.cfg.sp_fuzz_seconds,
-                                     global_corpus=fuzzer.corpus if fuzzer else self.run_dir / "work",
-                                     emit=self.emit)
+            with self._working(worker, "pov"):
+                await self._pov_one(worker, sp)
+
+    async def _pov_one(self, worker: Worker, sp: dict[str, Any]) -> None:
+        witness = ""
+        if sp.get("witness_path") and Path(sp["witness_path"]).is_file():
+            data = Path(sp["witness_path"]).read_bytes()[:2048]
+            witness = ("\n## A fuzzer input that already reached the inconsistent state\n"
+                       f"{len(data)} bytes, hex:\n```\n{data.hex()}\n```\n"
+                       "Start from these bytes and extend them so the state reaches the consumer.\n")
+        message = (f"Generate a PoV for this suspicious point.\n\n```json\n"
+                   f"{json.dumps({k: sp.get(k) for k in ('sp_id','function_name','vuln_type','description','pov_guidance','verification_notes')}, ensure_ascii=False, indent=2)}\n```\n"
+                   + witness + "\nRead the harness source first, then iterate with create_pov.")
+        tried_before = self.store.scalar("SELECT COUNT(*) FROM povs WHERE sp_id=?", sp["sp_id"]) or 0
+        result = await self._agent("pov", worker.harness_id, message, subject=sp["sp_id"],
+                                   worker=worker.worker_id, sp=sp["sp_id"])
+        tried = (self.store.scalar("SELECT COUNT(*) FROM povs WHERE sp_id=?", sp["sp_id"]) or 0) - tried_before
+        crashed = self.store.scalar("SELECT COUNT(*) FROM povs WHERE sp_id=? AND crashed=1", sp["sp_id"])
+        if crashed:
+            # A crash in the point's function on the PoV's own replay; the crash confirmation lane
+            # reproduces it in a fresh process and settles the point (Store.settle_pov).
+            self.store.update("sps", "sp_id", sp["sp_id"], {"status": "pov_unconfirmed", "updated_at": time.time()})
+            return
+        if tried == 0:
+            # No input was run: a model error, a refused or empty turn.  That is not a PoV that
+            # failed to reproduce; it is tried again, and reported as not attempted if it never is.
+            errors = self.__dict__.setdefault("_pov_errors", collections.Counter())
+            errors[sp["sp_id"]] += 1
+            why = (result.error if result is not None and getattr(result, "error", None) else
+                   "the model ran no PoV input" if result is not None else "no model result")
+            again = errors[sp["sp_id"]] < self.cfg.pov_attempts_without_input
+            self.store.update("sps", "sp_id", sp["sp_id"], {
+                "status": "pending_pov" if again else "pov_not_attempted", "claimed_by": None,
+                "verification_notes": ((sp.get("verification_notes") or "") +
+                                       f"\n[PoV turn {errors[sp['sp_id']]} ran no input: {str(why)[:200]}]"),
+                "updated_at": time.time()})
+            self.emit(f"[pov] {sp['sp_id']}: no PoV input was run ({str(why)[:120]})"
+                      + ("; trying again" if again else "; reported as not attempted"))
+            return
+        # Inputs were run and none crashed in the point's function: tried, not reproduced.
+        self.store.update("sps", "sp_id", sp["sp_id"],
+                          {"status": "pov_failed", "claimed_by": None, "updated_at": time.time()})
+        if not self.out_of_time() and self.cfg.sp_fuzz_seconds:
+            fuzzer = self.fuzzers.get(worker.harness_id)
+            await fuzz_candidate(self.store, run_dir=self.run_dir, worker=worker.worker_id,
+                                 harness=worker.harness_id, binary=self.harness(worker).binary,
+                                 sp_id=sp["sp_id"], seconds=self.cfg.sp_fuzz_seconds,
+                                 global_corpus=fuzzer.corpus if fuzzer else self.run_dir / "work",
+                                 emit=self.emit)
 
     # ------------------------------------------------------------------ invariant lane
     def _builder(self, harness_id: str):
@@ -586,19 +817,22 @@ class Run:
                 compile_database=self.project.compile_database)
         return self.builders[harness_id]
 
+    def _safety_sources_open(self, worker: Worker) -> bool:
+        """Can an SP of this worker still gain a safety verdict the invariant lane would take?
+
+        Rejected SPs come from verification, pov_failed ones only after PoV: both stages must be
+        finished before the recorder (and the build that compiles what it records) may stop.
+        """
+        return bool(self.store.scalar(
+            "SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying','pending_pov','generating_pov') "
+            "AND worker_id=?", worker.worker_id))
+
     async def invariant_recorder(self, worker: Worker) -> None:
-        seen: set[str] = set()
+        seen = self.__dict__.setdefault("_recorder_seen", set())
         while not self.out_of_time():
-            rows = self.store.rows(
-                "SELECT * FROM sps WHERE worker_id=? AND safety_reason IS NOT NULL AND safety_reason!='' "
-                "AND safety_location IS NOT NULL AND status IN ('rejected','verified','pov_failed') "
-                "ORDER BY updated_at ASC", worker.worker_id)
-            pending = [r for r in rows if r["sp_id"] not in seen
-                       and not self.store.scalar("SELECT COUNT(*) FROM invariants WHERE sp_id=?", r["sp_id"])]
+            pending = self._recorder_queue(worker)
             if not pending:
-                if self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying') AND worker_id=?",
-                        worker.worker_id):
+                if self._cycle_settled(worker):
                     return
                 await asyncio.sleep(IDLE * 2)
                 continue
@@ -612,8 +846,18 @@ class Run:
                        f"## Where that relation must hold\n{sp['safety_location']}\n")
             if location:
                 message += f"\n## Source around that line\n```c\n{self._window(location)}\n```\n"
-            await self._agent("invariant_recorder", worker.harness_id, message, subject=sp["sp_id"],
-                              worker=worker.worker_id, sp=sp["sp_id"])
+            with self._working(worker, "phi-record"):
+                result = await self._agent("invariant_recorder", worker.harness_id, message, subject=sp["sp_id"],
+                                           worker=worker.worker_id, sp=sp["sp_id"])
+            if (result is None or not result.ok) and not self.store.scalar(
+                    "SELECT COUNT(*) FROM invariants WHERE sp_id=?", sp["sp_id"]):
+                # The model failed before recording anything: the candidate is not used up.
+                errors = self.__dict__.setdefault("_recorder_errors", collections.Counter())
+                errors[sp["sp_id"]] += 1
+                if errors[sp["sp_id"]] < self.cfg.recorder_attempts:
+                    seen.discard(sp["sp_id"])
+                else:
+                    self.store.event("recorder_failed", f"{sp['sp_id']}: {errors[sp['sp_id']]} failed turns")
 
     def _window(self, location: tuple[str, int], before: int = 20, after: int = 8) -> str:
         path = self.project.source_root / location[0]
@@ -624,19 +868,48 @@ class Run:
         return "\n".join(f"{i:6d} {'>' if i == location[1] else ' '} {lines[i - 1]}"
                          for i in range(start, end + 1))
 
+    _ACTIVE_INVARIANTS = "SELECT phi_num FROM invariants WHERE status IN ('pending_build','built','lead') ORDER BY phi_num"
+
+    def _latest_build_phis(self, harness_id: str, statuses: tuple[str, ...]) -> set[int] | None:
+        marks = ",".join("?" for _ in statuses)
+        row = self.store.row(f"SELECT phis FROM builds WHERE harness_id=? AND status IN ({marks}) "
+                             "ORDER BY version DESC LIMIT 1", harness_id, *statuses)
+        return None if row is None else {int(n) for n in (row.get("phis") or [])}
+
+    def _uninstalled(self, harness_id: str) -> list[int]:
+        """Active invariants this harness's binary does not carry yet.
+
+        An invariant's own status says whether it compiles and what triage made of it; which
+        binaries carry it is a separate fact, per harness, read from the builds each harness ran.
+        A build of exactly the same set that already failed (or is running) is not repeated."""
+        active = [r["phi_num"] for r in self.store.rows(self._ACTIVE_INVARIANTS)]
+        missing = [n for n in active if n not in (self._latest_build_phis(harness_id, ("ok",)) or set())]
+        if not missing:
+            return []
+        last = self.store.row("SELECT phis, status FROM builds WHERE harness_id=? ORDER BY version DESC LIMIT 1",
+                              harness_id)
+        if last and last["status"] in ("failed", "building") and \
+                {int(n) for n in (last.get("phis") or [])} == set(active):
+            return []
+        return missing
+
+    def phis_in_binary(self, harness_id: str) -> dict[int, int]:
+        """Every assertion compiled into this harness's current binary, whoever recorded it."""
+        return {n: n for n in sorted(self._latest_build_phis(harness_id, ("ok",)) or ())}
+
     async def build_coordinator(self, worker: Worker) -> None:
         """Rebuild P' when invariants are waiting, batching them (one build is ~30 s)."""
         while not self.out_of_time():
-            pending = self.store.rows("SELECT * FROM invariants WHERE status='pending_build'")
+            pending = self._uninstalled(worker.harness_id)
             if not pending or time.time() - self._last_build < self.cfg.rebuild_min_interval_seconds:
-                if not pending and self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM sps WHERE status IN ('pending_verify','verifying') "
-                        "AND worker_id=?", worker.worker_id):
+                # The recorder and refine/repair both put invariants into pending_build.
+                if not pending and self._cycle_settled(worker):
                     return
                 await asyncio.sleep(IDLE * 2)
                 continue
-            async with self._build_lock:
-                await self._rebuild(worker)
+            with self._working(worker, "phi-build"):
+                async with self._build_lock:
+                    await self._rebuild(worker)
 
     async def _rebuild(self, worker: Worker) -> None:
         harness_id = worker.harness_id
@@ -687,6 +960,8 @@ class Run:
         self.store.conn.execute("UPDATE builds SET status=?, binary=?, ended_at=? WHERE harness_id=? AND version=?",
                                 ("ok", str(result.binary), time.time(), harness_id, version))
         for row in active:
+            # "built": it compiles.  Which binaries carry it is in builds.phis, per harness, so
+            # another harness still builds it (Code Augur: every harness tests every invariant).
             self.store.update("invariants", "phi_num", row["phi_num"],
                               {"status": "lead" if row["status"] == "lead" else "built",
                                "build_version": version, "updated_at": time.time()})
@@ -881,7 +1156,11 @@ class Run:
                 # input (for memcached: the proxy and the automovers need startup options this
                 # harness does not pass). A probe miss alone keeps the invariant in the build.
                 closed = invariant.file in self.project.closed_files
-                if closed and len(probed) >= len(self.workers):
+                # Every harness that measures reach must have probed it.  Probes run on the
+                # invariant builds, which only the ASan workers have; counting workers would let one
+                # MSan worker keep the denominator out of reach forever.
+                probing = {w.harness_id for w in self.analysis_workers_with_invariants()}
+                if closed and probing <= probed:
                     history.append({"event": "unreached", "probed_by": sorted(probed),
                                     "probe_inputs": len(probes),
                                     "reason": "no function of this file is executed by a normal input",
@@ -904,13 +1183,12 @@ class Run:
                                          set_status="triaging")
             if violation is None:
                 await asyncio.sleep(IDLE * 2)
-                if self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM invariants WHERE harness_id=? AND status IN "
-                        "('pending_build','needs_repair','needs_refinement')", worker.harness_id):
-                    if not self.store.scalar("SELECT COUNT(*) FROM pool WHERE status IN ('pending','analysing')"):
-                        return
+                # Violations come from this worker's fuzzer, which runs while builds add invariants.
+                if self._cycle_settled(worker):
+                    return
                 continue
-            await self._triage_one(worker, violation)
+            with self._working(worker, "phi-triage"):
+                await self._triage_one(worker, violation)
 
     async def _triage_one(self, worker: Worker, violation: dict[str, Any]) -> None:
         invariant = self.store.row("SELECT * FROM invariants WHERE phi_num=?", violation["phi_num"])
@@ -943,68 +1221,98 @@ class Run:
                                    phi=invariant["phi_num"], violation=violation["violation_id"])
         row = self.store.row("SELECT verdict FROM violations WHERE violation_id=?", violation["violation_id"])
         if not row or not row.get("verdict"):
+            # No verdict on record: a model error or a turn that never called triage_verdict.  That
+            # is not the model saying UNDECIDED (that one arrives through the tool): the violation
+            # goes back to the queue, and after the configured attempts it is kept apart as
+            # triage_failed, with the input and the run without assertions, not as a decision.
+            used = int(violation.get("triage_attempts") or 0) + 1
+            reason = (f"no verdict: {(result.error or result.status) if result else 'no result (terminal model error)'}"
+                      f"; without assertions: {original}")[:2000]
             self.store.update("violations", "violation_id", violation["violation_id"],
-                              {"status": "undecided", "verdict": "UNDECIDED",
-                               "notes": (result.error if result else "no verdict"), "updated_at": time.time()})
-            self.store.update("invariants", "phi_num", invariant["phi_num"],
-                              {"status": "built", "updated_at": time.time()})
+                              {"status": "pending" if used < self.cfg.triage_attempts else "triage_failed",
+                               "triage_attempts": used, "notes": reason, "updated_at": time.time()})
+            if used >= self.cfg.triage_attempts:
+                self.store.update("invariants", "phi_num", invariant["phi_num"],
+                                  {"status": "built", "updated_at": time.time()})
 
     async def refine_agent(self, worker: Worker) -> None:
         while not self.out_of_time():
-            invariant = self.store.claim("invariants", "phi_num",
-                                         where="status='needs_refinement' AND harness_id=?",
-                                         args=(worker.harness_id,), set_status="refining",
-                                         order="updated_at ASC")
-            repair = None if invariant else self.store.claim(
-                "invariants", "phi_num", where="status='needs_repair' AND harness_id=?",
-                args=(worker.harness_id,), set_status="repairing", order="updated_at ASC")
-            target = invariant or repair
+            target = self._claim_refinement(worker)
             if target is None:
                 await asyncio.sleep(IDLE * 2)
-                if self.sp_done.is_set() and not self.store.scalar(
-                        "SELECT COUNT(*) FROM pool WHERE status IN ('pending','analysing')"):
+                # Builds produce needs_repair, triage produces needs_refinement.
+                if self._cycle_settled(worker):
                     return
                 continue
-            if invariant is not None:
-                if (target.get("refinements") or 0) >= self.cfg.max_refinements:
-                    self.store.update("invariants", "phi_num", target["phi_num"],
-                                      {"status": "withdrawn", "updated_at": time.time()})
-                    continue
-                violation = self.store.row("SELECT * FROM violations WHERE phi_num=? AND verdict='TOO_STRONG' "
-                                           "ORDER BY updated_at DESC LIMIT 1", target["phi_num"])
-                message = (f"Refine invariant phi {target['phi_num']}.\n\n"
-                           f"- location: {target['file']}:{target['line']}\n"
-                           f"- falsified expression: `{target['expression']}`\n"
-                           f"- security property: {target['security_property']}\n\n"
-                           f"## Why triage called it too strong\n{(violation or {}).get('notes', '')}\n\n"
-                           f"## Source around the assertion\n```c\n"
-                           f"{self._window((target['file'], target['line']))}\n```\n")
-                await self._agent("refine", worker.harness_id, message, subject=f"phi{target['phi_num']}",
-                                  worker=worker.worker_id, phi=target["phi_num"],
-                                  violation=(violation or {}).get("violation_id", ""))
-            else:
-                message = (f"Invariant phi {target['phi_num']} does not compile.\n\n"
-                           f"- location: {target['file']}:{target['line']}\n"
-                           f"- expression: `{target['expression']}`\n\n"
-                           f"## Compiler output\n```\n{(target.get('last_error') or '')[-3000:]}\n```\n\n"
-                           f"## Source around the line\n```c\n"
-                           f"{self._window((target['file'], target['line']))}\n```\n")
-                await self._agent("invariant_repair", worker.harness_id, message,
-                                  subject=f"phi{target['phi_num']}", worker=worker.worker_id,
-                                  phi=target["phi_num"])
-            still = self.store.scalar("SELECT status FROM invariants WHERE phi_num=?", target["phi_num"])
-            if still in ("refining", "repairing"):
+            with self._working(worker, "phi-refine"):
+                await self._refine_one(worker, target)
+
+    def _claim_refinement(self, worker: Worker) -> dict[str, Any] | None:
+        invariant = self.store.claim("invariants", "phi_num",
+                                     where="status='needs_refinement' AND harness_id=?",
+                                     args=(worker.harness_id,), set_status="refining",
+                                     order="updated_at ASC")
+        return invariant or self.store.claim(
+            "invariants", "phi_num", where="status='needs_repair' AND harness_id=?",
+            args=(worker.harness_id,), set_status="repairing", order="updated_at ASC")
+
+    async def _refine_one(self, worker: Worker, target: dict[str, Any]) -> None:
+        invariant = target if target.get("status") == "refining" else None
+        if invariant is not None:
+            if (target.get("refinements") or 0) >= self.cfg.max_refinements:
                 self.store.update("invariants", "phi_num", target["phi_num"],
                                   {"status": "withdrawn", "updated_at": time.time()})
+                return
+            violation = self.store.row("SELECT * FROM violations WHERE phi_num=? AND verdict='TOO_STRONG' "
+                                       "ORDER BY updated_at DESC LIMIT 1", target["phi_num"])
+            message = (f"Refine invariant phi {target['phi_num']}.\n\n"
+                       f"- location: {target['file']}:{target['line']}\n"
+                       f"- falsified expression: `{target['expression']}`\n"
+                       f"- security property: {target['security_property']}\n\n"
+                       f"## Why triage called it too strong\n{(violation or {}).get('notes', '')}\n\n"
+                       f"## Source around the assertion\n```c\n"
+                       f"{self._window((target['file'], target['line']))}\n```\n")
+            result = await self._agent("refine", worker.harness_id, message, subject=f"phi{target['phi_num']}",
+                                       worker=worker.worker_id, phi=target["phi_num"],
+                                       violation=(violation or {}).get("violation_id", ""))
+        else:
+            message = (f"Invariant phi {target['phi_num']} does not compile.\n\n"
+                       f"- location: {target['file']}:{target['line']}\n"
+                       f"- expression: `{target['expression']}`\n\n"
+                       f"## Compiler output\n```\n{(target.get('last_error') or '')[-3000:]}\n```\n\n"
+                       f"## Source around the line\n```c\n"
+                       f"{self._window((target['file'], target['line']))}\n```\n")
+            result = await self._agent("invariant_repair", worker.harness_id, message,
+                                       subject=f"phi{target['phi_num']}", worker=worker.worker_id,
+                                       phi=target["phi_num"])
+        still = self.store.scalar("SELECT status FROM invariants WHERE phi_num=?", target["phi_num"])
+        if still in ("refining", "repairing") and (result is None or not result.ok):
+            # A model error is not a decision to give the invariant up: back to its queue, counted
+            # against the same limit a real attempt uses (withdrawn there, with the reason).
+            column, queue, limit = (("refinements", "needs_refinement", self.cfg.max_refinements)
+                                    if still == "refining" else ("repairs", "needs_repair", self.cfg.max_repairs))
+            used = int(target.get(column) or 0) + 1
+            self.store.update("invariants", "phi_num", target["phi_num"], {
+                column: used, "status": queue if used < limit else "withdrawn",
+                "last_error": f"model turn failed: {getattr(result, 'error', None) or 'no result'}"[:2000],
+                "updated_at": time.time()})
+            return
+        if still in ("refining", "repairing"):
+            self.store.update("invariants", "phi_num", target["phi_num"],
+                              {"status": "withdrawn", "updated_at": time.time()})
 
     # ------------------------------------------------------------------ fuzzing lane
     async def fuzzing_lane(self, worker: Worker) -> None:
         harness = self.harness(worker)
         msan = worker.sanitizer == "memory"
         # A separate label keeps the MSan fuzzer's corpus, artifacts and log apart from the ASan one.
+        seeds = harness.seeds
+        if msan:
+            held = (self.__dict__.get("_msan_quarantine") or {}).get(worker.harness_id, set())
+            seeds = [(seed_id, blob) for seed_id, blob in seeds if seed_id not in held]
         fuzzer = GlobalFuzzer(self.store, run_dir=self.run_dir, worker=worker.worker_id,
                               harness=f"{worker.harness_id}-msan" if msan else worker.harness_id,
-                              binary=self.binary_for(worker), seeds=harness.seeds, emit=self.emit)
+                              binary=self.binary_for(worker), seeds=seeds, emit=self.emit)
         self.fuzzers[worker.worker_id if msan else worker.harness_id] = fuzzer
         if msan:
             fuzzer.share_from = self.run_dir / "work" / worker.harness_id / "corpus"
@@ -1013,9 +1321,7 @@ class Run:
         await fuzzer.start()
         try:
             while not self.out_of_time():
-                phis = {r["phi_num"]: r["phi_num"] for r in self.store.rows(
-                    "SELECT phi_num FROM invariants WHERE harness_id=? AND build_version IS NOT NULL",
-                    worker.harness_id)}
+                phis = {} if msan else self.phis_in_binary(worker.harness_id)
                 await fuzzer.poll(phis=phis or None)
                 await asyncio.sleep(5)
         finally:
@@ -1057,6 +1363,13 @@ class Run:
             await self._confirm(crash)
 
     async def _confirm(self, crash: dict[str, Any]) -> None:
+        try:
+            await self._confirm_crash(crash)
+        finally:
+            if crash.get("sp_id"):
+                self.store.settle_pov(crash["sp_id"])
+
+    async def _confirm_crash(self, crash: dict[str, Any]) -> None:
         worker = next((w for w in self.workers if w.worker_id == crash["worker_id"]), self.workers[0])
         harness = self.harness(worker)
         data = Path(crash["input_path"]).read_bytes()
@@ -1067,7 +1380,10 @@ class Run:
         baseline = getattr(self, "ub_baseline", None)
         if baseline is None:
             baseline = self.ub_baseline = load_ub_baseline(self.run_dir)
-        if not is_finding(replay, baseline):
+        ub_site = (crash.get("details") or {}).get("ub_site") or ""
+        # A candidate for one UB site is reproduced only by that site, not by another finding.
+        reproduced = (ub_site in replay.ub_sites()) if ub_site else is_finding(replay, baseline)
+        if not reproduced:
             self.store.update("crashes", "crash_id", crash["crash_id"],
                               {"status": "not_reproduced", "details": details, "updated_at": time.time()})
             self.emit(f"[crash] {crash['crash_id']} did not reproduce without assertions")
@@ -1097,16 +1413,29 @@ class Run:
             self.emit(f"[crash] {crash['crash_id']}: {replay.crash_type} with no program frame in "
                       f"{attempts} replays; not counted as a distinct finding")
             return
-        signature = crash_signature(replay, baseline)
+        signature = ("UB " + ub_site) if ub_site else crash_signature(replay, baseline)
         if self.delta:
             from .delta import delta_relation
             details["delta_relation"] = delta_relation(program_frames(replay.frames), self.delta_changes)
-        key = fault_key(replay, baseline)
+        key = f"undefined-behavior@{ub_site}" if ub_site else fault_key(replay, baseline)
         details["fault_key"] = key
         finals = self.store.rows("SELECT crash_id, signature, details FROM crashes WHERE crash_id!=? AND status IN "
                                  "('confirmed','validated','reported','not_vulnerability','needs_review')",
                                  crash["crash_id"])
         earlier, how = find_duplicate(signature, key, finals)
+        if not earlier and not resolved(signature):
+            # Not merged (its location is unknown), but the very same unlocated stack was already
+            # checked: kept as its own row for later symbolization, not validated again.
+            same = next((row for row in finals if row.get("signature") == signature), None)
+            if same is not None:
+                details["duplicate_kind"] = "identical signature with an unknown location (tentative)"
+                self.store.update("crashes", "crash_id", crash["crash_id"],
+                                  {"status": "possible_duplicate", "duplicate_of": same["crash_id"],
+                                   "signature": signature, "crash_type": finding_type(replay, baseline),
+                                   "frames": replay.frames, "details": details, "updated_at": time.time()})
+                self.emit(f"[crash] {crash['crash_id']}: possibly {same['crash_id']} again ({signature}); "
+                          "location unknown, kept but not validated again")
+                return
         if not earlier and self.prior:
             earlier, how = find_duplicate(signature, key, self.prior)
             if earlier:
@@ -1134,7 +1463,7 @@ class Run:
                 self.emit(f"[crash] {crash['crash_id']}: same fault site as {earlier['crash_id']} "
                           f"({key}) by another path: {signature}")
             return
-        values = {"status": "confirmed", "signature": signature, "crash_type": finding_type(replay, baseline),
+        values = {"status": "confirmed", "signature": signature, "crash_type": (crash.get("crash_type") if ub_site else finding_type(replay, baseline)),
                   "frames": replay.frames, "details": details, "updated_at": time.time()}
         self.store.update("crashes", "crash_id", crash["crash_id"], values)
         scope = ""
@@ -1146,7 +1475,8 @@ class Run:
         self.emit(f"[crash] CONFIRMED {crash['crash_id']}: {finding_type(replay, baseline)} at {signature}{scope}")
         if self.validation_closed():
             return
-        await self._validate_and_report(crash["crash_id"], worker, data, replay, signature, baseline)
+        await self._validate_and_report(crash["crash_id"], worker, data, replay, signature, baseline,
+                                        ub_site=ub_site)
 
     async def _measure_plain_build(self, worker: Worker, data: bytes) -> dict[str, Any]:
         """The finding's effect in the program built without sanitizers, for the validator to score.
@@ -1198,7 +1528,7 @@ class Run:
         return out
 
     async def _validate_and_report(self, crash_id: str, worker: Worker, data: bytes, replay, signature: str,
-                                   baseline: set[str]) -> None:
+                                   baseline: set[str], ub_site: str = "") -> None:
         """Is this confirmed finding a vulnerability?  If so, write it as a GitHub advisory.
 
         Not part of FuzzingBrain V2, which reports every reproduced crash.  Measured checks come
@@ -1212,13 +1542,19 @@ class Run:
         from .advisory import write_rejection
         harness = self.harness(worker)
         checks: dict[str, Any] = {}
-        runs, crashed, others = max(1, self.cfg.validation_replays), 0, set()
+        runs, crashed, same_runs, unsure_runs, others = max(1, self.cfg.validation_replays), 0, 0, 0, set()
         for _ in range(runs):
             again = await asyncio.to_thread(run_input, self.binary_for(worker), data, timeout=30)
-            if is_finding(again, baseline):
+            if is_finding(again, baseline) or (ub_site and ub_site in again.ub_sites()):
                 crashed += 1
-                others.add(crash_signature(again, baseline))
-        checks["reproducibility"] = {"runs": runs, "crashed": crashed, "signature": signature,
+                verdict = same_fault(again, replay, baseline, site=ub_site)
+                same_runs += verdict is True
+                unsure_runs += verdict is None
+                if verdict is not True:
+                    others.add(crash_signature(again, baseline))
+        # A replay that faults elsewhere proves nothing about this finding: the same defect is counted.
+        checks["reproducibility"] = {"runs": runs, "crashed": crashed, "same_fault_runs": same_runs,
+                                     "undetermined_runs": unsure_runs, "signature": signature,
                                      "other_signatures": sorted(others - {signature})}
         command = self.cfg.daemon_msan_command if worker.sanitizer == "memory" else self.cfg.daemon_command
         if command:
@@ -1226,31 +1562,67 @@ class Run:
             # Repeated, and the count recorded separately from the harness replays: the advisory
             # writer once reported "5 of 5 runs against the real daemon" after one daemon replay
             # and five harness replays.  Each number now says which program produced it.
-            daemon_runs, daemon_hits, started, first = 3, 0, 0, None
+            daemon_runs, started, receipts = 3, 0, []
             for _ in range(daemon_runs):
                 dr = await asyncio.to_thread(daemon_replay, command, data, port=port, delivery=worker.delivery, trigger=harness.trigger,
                                              cwd=self.cfg.daemon_cwd or None)
                 if not dr.started:
                     continue
                 started += 1
-                if is_finding(dr.result, baseline):
-                    daemon_hits += 1
-                    first = first or dr
+                found = dr.result is not None and (is_finding(dr.result, baseline)
+                                                   or bool(ub_site and ub_site in dr.result.ub_sites()))
+                receipts.append({
+                    "sent": dr.sent, "input_bytes": len(data), "closed_mid_input": dr.closed_mid_input,
+                    "finding": found,
+                    # A fault with nothing delivered was not caused by this input.
+                    "input_delivered": dr.sent > 0,
+                    "same_fault": same_fault(dr.result, replay, baseline, site=ub_site) if found else False,
+                    "type": finding_type(dr.result, baseline) if found else None,
+                    "signature": crash_signature(dr.result, baseline) if found else "",
+                    "result": dr.result if found else None})
             if not started:
                 checks["daemon"] = {"configured": True, "started": False, "reproduced": None,
                                     "summary": f"could not be started: {dr.note}"}
             else:
-                found = first is not None
-                theirs = crash_signature(first.result, baseline) if found else ""
-                same = found and [f["function"] for f in program_frames(first.result.frames)[:2]] == \
-                    [f["function"] for f in program_frames(replay.frames)[:2]]
-                kind = finding_type(first.result, baseline) if found else None
+                same = [r for r in receipts if r["finding"] and r["input_delivered"] and r["same_fault"] is True]
+                unsure = [r for r in receipts if r["finding"] and r["input_delivered"] and r["same_fault"] is None]
+                other = [r for r in receipts if r["finding"] and r["input_delivered"] and r["same_fault"] is False]
+                undelivered = [r for r in receipts if r["finding"] and not r["input_delivered"]]
+                partial = [r for r in receipts if r["closed_mid_input"]]
                 checks["daemon"] = {
-                    "configured": True, "started": started, "runs": daemon_runs, "reproduced_runs": daemon_hits,
-                    "reproduced": found, "same_fault": same, "type": kind, "signature": theirs,
-                    "summary": (f"reproduced in {daemon_hits} of {started} runs of the real program: {kind} at "
-                                f"`{theirs}`" + ("" if same else " (a different fault than the harness showed)")
-                                if found else f"not reproduced in {started} runs of the real program")}
+                    "configured": True, "started": started, "runs": daemon_runs,
+                    "reproduced_runs": len(same), "reproduced": bool(same),
+                    "same_fault": True if same else (None if unsure else False),
+                    "undetermined_runs": len(unsure), "other_fault_runs": len(other),
+                    "faults_without_input": len(undelivered),
+                    "closed_mid_input": [r["closed_mid_input"] for r in partial],
+                    "receipts": [{k: v for k, v in r.items() if k != "result"} for r in receipts],
+                    "type": (same or unsure or other or [{}])[0].get("type"),
+                    "signature": (same or unsure or other or [{}])[0].get("signature", ""),
+                    "summary": (f"the same fault reproduced in {len(same)} of {started} runs of the real program"
+                                if same else
+                                f"the real program faulted in {len(unsure)} of {started} runs, but whether it is "
+                                "the same fault cannot be told from the reported locations" if unsure else
+                                f"the real program showed a different fault in {len(other)} of {started} runs"
+                                if other else f"not reproduced in {started} runs of the real program")
+                               + (f"; {len(undelivered)} fault(s) happened before any input byte was sent"
+                                  if undelivered else "")
+                               + (f"; the program closed the connection mid-input in {len(partial)} run(s)"
+                                  if partial else "")}
+                # A different defect found on the real program is kept as its own candidate.
+                for r in other[:1]:
+                    found_id = new_id("crash")
+                    self.store.insert("crashes", {
+                        "crash_id": found_id, "worker_id": worker.worker_id, "source": "real_program",
+                        "sp_id": None, "input_path": (self.store.row("SELECT input_path FROM crashes WHERE crash_id=?",
+                                                                      crash_id) or {}).get("input_path"),
+                        "status": "needs_review", "crash_type": r["type"], "signature": r["signature"],
+                        "frames": r["result"].frames,
+                        "details": {"found_while_validating": crash_id,
+                                    "note": "faulted on the real program with this input; a different defect "
+                                            "than the harness finding, not yet confirmed on its own"},
+                        "created_at": time.time(), "updated_at": time.time()})
+                    checks["daemon"]["other_fault_recorded_as"] = found_id
         else:
             checks["daemon"] = {"configured": False, "reproduced": None,
                                 "summary": "not run: no real-program command was given (--daemon-command)"}
@@ -1286,10 +1658,15 @@ class Run:
             # One independent reproduction is required.  The real program counts on its own: a
             # harness that returns before the program finishes can miss a fault on a single replay
             # (measured: an older LightFTP harness missed the CVE 5 times in 5), the server cannot.
-            if crashed == 0 and not daemon.get("reproduced"):
-                lowered.append(f"0 of {runs} harness replays reproduced it and the real program did not either")
+            if same_runs == 0 and not daemon.get("reproduced"):
+                lowered.append(f"0 of {runs} harness replays reproduced the same fault and the real program did "
+                               "not either")
             if daemon.get("configured") and daemon.get("started") and not daemon.get("reproduced"):
-                lowered.append("the real program, started as a server, did not reproduce it")
+                lowered.append("the real program, started as a server, did not reproduce the same fault"
+                               + (" (it faulted, but the reported locations cannot tell whether it is the same "
+                                  "defect)" if daemon.get("undetermined_runs") else "")
+                               + (" (it showed a different defect, recorded separately)"
+                                  if daemon.get("other_fault_runs") else ""))
             if daemon.get("configured") and not daemon.get("started"):
                 lowered.append("the real program could not be started to confirm it")
             if validation.get("cvss_score") == 0:
@@ -1359,7 +1736,10 @@ class Run:
             spawn(f"phi-triage:{worker.worker_id}", self.triage_agent(worker))
             spawn(f"phi-refine:{worker.worker_id}", self.refine_agent(worker))
         spawn("confirm", self.confirmation_lane())
-        analysis = [t for t in tasks if not t.get_name().startswith(("fuzz:", "confirm"))]
+        # The SP analysis lanes finish on their own.  The others consume queues that the fuzzers
+        # keep filling (violations -> triage -> refine/build, triage -> PoV -> invariant recorder)
+        # and stop when their producers have stopped: with the fuzzers, at the deadline.
+        analysis = [t for t in tasks if _lane_key(t.get_name())[0] in ("spgen", "delta-spgen", "verify")]
         try:
             # Waited in short steps so that a changed time limit is seen.
             while not self.out_of_time() and any(not t.done() for t in analysis):
@@ -1393,14 +1773,14 @@ class Run:
         return self.summary(started)
 
     async def final_drain(self) -> None:
-        """Confirm and validate the crashes left when the lanes stopped.
+        """Settle what the lanes left when they stopped, within final_drain_minutes.
 
-        The confirmation lane ends as soon as it finds no pending crash after the deadline, but the
-        fuzzers are stopped at that same moment and their crash watchers still record what they
-        caught on the way down.  On tinyproxy a heap-buffer-overflow recorded at 13:08:07, three
-        seconds after the deadline, stayed "pending" and was never looked at.  Cancelling the lanes
-        can also cut a confirmation or a validation in half.  Both are picked up here, with the
-        fuzzers already stopped, inside final_drain_minutes.
+        The fuzzers stop at the deadline and their watchers still record what they caught on the
+        way down; cancelling the lanes can also cut a triage, a PoV or a confirmation in half.  On
+        tinyproxy a heap-buffer-overflow recorded three seconds after the deadline stayed
+        "pending" and was never looked at.  With the fuzzers stopped, the queues only shrink, so
+        one bounded pass order settles them: violations (triage) -> refinements and repairs ->
+        invariant builds -> PoV for every pending point (triage adds some) -> crash confirmation.
         """
         unvalidated = [row["crash_id"] for row in self.store.rows(
             "SELECT crash_id, details FROM crashes WHERE status='confirmed'")
@@ -1408,34 +1788,107 @@ class Run:
         for crash_id in unvalidated:
             self.store.update("crashes", "crash_id", crash_id, {"status": "pending", "updated_at": time.time()})
         self.store.conn.execute("UPDATE crashes SET status='pending' WHERE status='confirming'")
-        waiting = self.store.scalar("SELECT COUNT(*) FROM crashes WHERE status='pending'") or 0
-        if not waiting:
+        # Items a cancelled lane held go back to their queue.
+        self.store.conn.execute("UPDATE violations SET status='pending' WHERE status='triaging'")
+        self.store.conn.execute("UPDATE sps SET status='pending_pov' WHERE status='generating_pov'")
+        self.store.conn.execute("UPDATE invariants SET status='needs_refinement' WHERE status='refining'")
+        self.store.conn.execute("UPDATE invariants SET status='needs_repair' WHERE status='repairing'")
+        waiting = {
+            "violations": self.store.scalar("SELECT COUNT(*) FROM violations WHERE status='pending'") or 0,
+            "refinements": self.store.scalar("SELECT COUNT(*) FROM invariants WHERE status IN "
+                                             "('needs_refinement','needs_repair')") or 0,
+            "builds": sum(len(self._uninstalled(w.harness_id)) for w in self.analysis_workers_with_invariants()),
+            "pov": self.store.scalar("SELECT COUNT(*) FROM sps WHERE status='pending_pov'") or 0,
+            "crashes": self.store.scalar("SELECT COUNT(*) FROM crashes WHERE status='pending'") or 0}
+        if not any(waiting.values()):
             return
         limit = max(0.0, self.cfg.final_drain_minutes) * 60
-        self.emit(f"final drain: {waiting} crash(es) left when the lanes stopped; up to {limit / 60:.0f} min to "
-                  f"confirm and validate them")
+        self.emit(f"final drain: left when the lanes stopped {waiting}; up to {limit / 60:.0f} min to settle")
         self.draining = True
         end = time.time() + limit
+
+        async def bounded(coroutine) -> bool:
+            try:
+                await asyncio.wait_for(coroutine, timeout=max(1.0, end - time.time()))
+                return True
+            except asyncio.TimeoutError:
+                return False
+
         try:
-            while time.time() < end:
-                crash = self.store.claim("crashes", "crash_id", where="status='pending'", args=(),
-                                         set_status="confirming")
-                if crash is None:
-                    break
-                try:
-                    await asyncio.wait_for(self._confirm(crash), timeout=max(1.0, end - time.time()))
-                except asyncio.TimeoutError:
-                    self.store.update("crashes", "crash_id", crash["crash_id"],
-                                      {"status": "pending", "updated_at": time.time()})
+            for _ in range(self.cfg.final_drain_passes):
+                progress = False
+                for worker in self.analysis_workers_with_invariants():
+                    while time.time() < end and (violation := self.store.claim(
+                            "violations", "violation_id", where="status='pending' AND harness_id=?",
+                            args=(worker.harness_id,), set_status="triaging")):
+                        progress = True
+                        if not await bounded(self._triage_one(worker, violation)):
+                            self.store.update("violations", "violation_id", violation["violation_id"],
+                                              {"status": "pending", "updated_at": time.time()})
+                    while time.time() < end and (target := self._claim_refinement(worker)):
+                        progress = True
+                        await bounded(self._refine_one(worker, target))
+                    if time.time() < end and self._uninstalled(worker.harness_id):
+                        progress = True
+                        async with self._build_lock:
+                            await bounded(self._rebuild(worker))
+                for worker in self.workers:
+                    while time.time() < end and (sp := self.store.claim_sp(
+                            from_status="pending_pov", to_status="generating_pov", worker_id=worker.worker_id,
+                            agent="final-drain", **self.pov_claim_filter())):
+                        progress = True
+                        if not await bounded(self._pov_one(worker, sp)):
+                            self.store.update("sps", "sp_id", sp["sp_id"],
+                                              {"status": "pending_pov", "updated_at": time.time()})
+                while time.time() < end and (crash := self.store.claim(
+                        "crashes", "crash_id", where="status='pending'", args=(), set_status="confirming")):
+                    progress = True
+                    if not await bounded(self._confirm(crash)):
+                        self.store.update("crashes", "crash_id", crash["crash_id"],
+                                          {"status": "pending", "updated_at": time.time()})
+                if not progress or time.time() >= end:
                     break
         finally:
             self.draining = False
-        left = self.store.scalar("SELECT COUNT(*) FROM crashes WHERE status='pending'") or 0
-        if left:
-            self.emit(f"final drain: {left} crash(es) still unconfirmed after {limit / 60:.0f} min; "
-                      f"they stay 'pending' in state.db")
+        left = {
+            "violations": self.store.scalar("SELECT COUNT(*) FROM violations WHERE status='pending'") or 0,
+            "pov": self.store.scalar("SELECT COUNT(*) FROM sps WHERE status='pending_pov'") or 0,
+            "builds": sum(len(self._uninstalled(w.harness_id)) for w in self.analysis_workers_with_invariants()),
+            "crashes": self.store.scalar("SELECT COUNT(*) FROM crashes WHERE status='pending'") or 0}
+        if any(left.values()):
+            self.emit(f"final drain: still open after {limit / 60:.0f} min {left}; they stay in state.db")
+
+    def analysis_workers_with_invariants(self) -> list[Worker]:
+        """Workers whose lanes record, build and triage invariants (the MSan worker has none)."""
+        return [w for w in self.workers if w.sanitizer != "memory"]
+
+    def _not_analysed(self) -> dict[str, Any]:
+        """SP analysis coverage of the compiled target definitions, by what happened to each.
+
+        The denominator is every active target definition, so one Direction never naming a
+        function shows up as never_queued instead of disappearing from a count of failures."""
+        active = set(getattr(self.project, "target_ids", []) or [])
+        rows = self.store.rows("SELECT function_name, function_id, status, attempts, error FROM pool")
+        best: dict[str, str] = {}
+        order = {"analysed": 0, "analysing": 1, "pending": 2, "failed": 3, "skipped": 4}
+        for row in rows:
+            fid = row["function_id"] or row["function_name"]
+            if fid not in best or order.get(row["status"], 9) < order.get(best[fid], 9):
+                best[fid] = row["status"]
+        counts = collections.Counter(best.values())
+        never = sorted(active - set(best))
+        failed = [r for r in rows if r["status"] == "failed" and best.get(r["function_id"] or r["function_name"]) == "failed"]
+        name = lambda fid: (self.project.functions[fid].name if fid in getattr(self.project, "functions", {}) else fid)
+        return {"active_targets": len(active), "queued": len(best), "analysed": counts.get("analysed", 0),
+                "failed": counts.get("failed", 0), "pending": counts.get("pending", 0) + counts.get("analysing", 0),
+                "skipped": counts.get("skipped", 0), "never_queued": len(never),
+                "count": counts.get("failed", 0) + len(never) + counts.get("pending", 0) + counts.get("skipped", 0),
+                "never_queued_functions": [{"name": name(fid), "function_id": fid} for fid in never[:200]],
+                "failed_functions": [{"name": r["function_name"], "function_id": r["function_id"],
+                                      "attempts": r["attempts"], "last_error": (r["error"] or "")[:200]} for r in failed]}
 
     def summary(self, started: float) -> dict[str, Any]:
+        self.store.settle_pov()                       # stored runs too: a first replay is not a proof
         counts = lambda sql: {row["k"]: row["n"] for row in self.store.rows(sql)}
         data = {
             "run_dir": str(self.run_dir),
@@ -1445,6 +1898,8 @@ class Run:
             "workers": [w.worker_id for w in self.workers],
             "directions": self.store.scalar("SELECT COUNT(*) FROM directions"),
             "functions": counts("SELECT status AS k, COUNT(*) AS n FROM pool GROUP BY status"),
+            # A function whose SP analysis failed every attempt is not "safe" and not analysed.
+            "functions_not_analysed": self._not_analysed(),
             "suspicious_points": counts("SELECT status AS k, COUNT(*) AS n FROM sps GROUP BY status"),
             "sp_origins": counts("SELECT origin AS k, COUNT(*) AS n FROM sps GROUP BY origin"),
             "invariants": counts("SELECT status AS k, COUNT(*) AS n FROM invariants GROUP BY status"),
@@ -1452,7 +1907,7 @@ class Run:
                 "SELECT COUNT(*) FROM invariants WHERE reached=1"),
             "invariants_never_reached": self.store.scalar(
                 "SELECT COUNT(*) FROM invariants WHERE reached=0 AND probed_by IS NOT NULL"),
-            "violations": counts("SELECT verdict AS k, COUNT(*) AS n FROM violations GROUP BY verdict"),
+            "violations": counts("SELECT COALESCE(verdict, status) AS k, COUNT(*) AS n FROM violations GROUP BY k"),
             "crashes": counts("SELECT status AS k, COUNT(*) AS n FROM crashes GROUP BY status"),
             "builds": counts("SELECT status AS k, COUNT(*) AS n FROM builds GROUP BY status"),
             "povs": self.store.scalar("SELECT COUNT(*) FROM povs"),

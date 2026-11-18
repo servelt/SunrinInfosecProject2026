@@ -24,6 +24,36 @@ BASE = Path(__file__).parent / 'fixtures' / 'c_ast_semantics'
 
 @unittest.skipUnless(shutil.which('clang'), 'Clang AST required')
 class ClangCSourceTests(unittest.TestCase):
+    def test_global_struct_callback_is_possible_edge_across_translation_units(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'api.h').write_text(
+                'struct ops { int (*read)(int); int (*write)(int); };\n'
+                'extern struct ops io;\n'
+            )
+            (root / 'registration.c').write_text(
+                '#include "api.h"\n'
+                'int receive(int n) { return n + 1; }\n'
+                'int transmit(int n) { return n - 1; }\n'
+                'struct ops io = { receive, transmit };\n'
+            )
+            (root / 'dispatch.c').write_text(
+                '#include "api.h"\n'
+                'int dispatch(int n, struct ops *other) {\n'
+                '    if (n) return other->read(n);\n'
+                '    return io.read(n);\n'
+                '}\n'
+            )
+            bundle = StaticAnalyzer(root).index()
+            by_name = {f.name: f for f in bundle.functions.values()}
+            edges = [edge for edge in bundle.edges
+                     if edge.caller_id == by_name['dispatch'].function_id
+                     and edge.kind == 'indirect_possible']
+            self.assertEqual([(edge.callee_id, edge.line) for edge in edges],
+                             [(by_name['receive'].function_id, 4)])
+            self.assertFalse(any(edge.callee_id == by_name['transmit'].function_id
+                                 for edge in edges))
+
     def test_uninitialized_file_static_state_declaration_is_available(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

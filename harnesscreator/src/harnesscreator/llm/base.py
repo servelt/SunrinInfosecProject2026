@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 import hashlib
 import json
+import re
 import time
 from typing import Any, Callable, Protocol
 from pathlib import Path
@@ -191,6 +192,15 @@ def _replay_key(role: str, model: Any, instructions: str, input_sha256: str) -> 
     return hashlib.sha256(json.dumps([role, model, instructions, input_sha256]).encode()).hexdigest()
 
 
+def _entry_replay_hash(payload: dict[str, Any]) -> str:
+    """Hash source evidence without Clang's process-local declaration addresses."""
+    canonical = json.dumps(
+        _canonical_call_value(payload), ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def _load_replay() -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[str, dict[str, Any]]]]]:
     """Completed Entry answers of earlier runs (HARNESSCREATOR_LLM_REPLAY: llm.jsonl paths, ':'-separated).
 
@@ -228,8 +238,13 @@ def _load_replay() -> tuple[dict[str, dict[str, Any]], dict[str, list[tuple[str,
                     if key_s:
                         turns[key_s] = [("", {})]    # a failed turn: this conversation is not replayable
                     continue
+                payload = row.get("payload")
+                input_hash = (
+                    _entry_replay_hash(payload) if isinstance(payload, dict)
+                    else row.get("input_sha256", "")
+                )
                 key = _replay_key(row["role"], row.get("model"), row.get("instructions", ""),
-                                  row.get("input_sha256", ""))
+                                  input_hash)
                 if key_s:
                     turns.setdefault(key_s, []).append((key, row["response"]))
                 else:
@@ -279,7 +294,11 @@ class RecordingLLM:
         effort_resolver = getattr(self.delegate, "effort_for_role", None)
         effort = effort_resolver(role) if callable(effort_resolver) else getattr(self.delegate, "effort", None)
         record["reasoning_effort"] = effort
-        key = _replay_key(role, record.get("model"), instructions, record["input_sha256"])
+        replay_hash = (
+            _entry_replay_hash(payload) if role in _REPLAY_ROLES
+            else record["input_sha256"]
+        )
+        key = _replay_key(role, record.get("model"), instructions, replay_hash)
         # Only stateless questions are replayed.  A conversational call (session_key) depends on the
         # turns before it; replaying some turns and asking the rest live left the model without the
         # replayed context, so conversations are always asked again.
@@ -988,15 +1007,27 @@ _ORDER_INSENSITIVE_CALL_FIELDS = {
     "providers",
 }
 
+_VOLATILE_CLANG_ID_FIELDS = {
+    "direct_argument_declaration_ids",
+    "direct_argument_addressed_scalar_declaration_ids",
+    "field_declaration_id",
+    "receiver_declaration_id",
+}
 
-def _canonical_call_value(value: Any, parent_key: str | None = None) -> Any:
+
+def _canonical_call_value(
+    value: Any, parent_key: str | None = None,
+    ast_ids: dict[str, int] | None = None,
+) -> Any:
+    if ast_ids is None:
+        ast_ids = {}
     if isinstance(value, dict):
         return {
-            key: _canonical_call_value(child, str(key))
-            for key, child in value.items()
+            key: _canonical_call_value(value[key], str(key), ast_ids)
+            for key in sorted(value)
         }
     if isinstance(value, list):
-        normalized = [_canonical_call_value(child) for child in value]
+        normalized = [_canonical_call_value(child, parent_key, ast_ids) for child in value]
         if parent_key in _ORDER_INSENSITIVE_CALL_FIELDS:
             return sorted(
                 normalized,
@@ -1008,4 +1039,7 @@ def _canonical_call_value(value: Any, parent_key: str | None = None) -> Any:
                 ),
             )
         return normalized
+    if (parent_key in _VOLATILE_CLANG_ID_FIELDS and isinstance(value, str)
+            and re.fullmatch(r"0x[0-9a-fA-F]+", value)):
+        return f"@clang_decl:{ast_ids.setdefault(value, len(ast_ids))}"
     return value

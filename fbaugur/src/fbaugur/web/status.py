@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 from . import labels
+from ..store import settled_pov_status
 
 HC_AGENTS = ("eg", "ev", "cg", "ig", "hg", "hv")
 VR_AGENTS = ("tm", "dr", "spg", "spv", "pov", "inv", "fz", "ct", "val", "adv")
@@ -135,11 +136,21 @@ def strip_ts(line: str) -> str:
 
 
 def pipeline_dir_of(lines: list[str]) -> Path | None:
-    for line in lines[:20]:
+    # Resuming a session appends a new pipeline to the same log.  The latest
+    # attempt owns the current stage and deadline shown in the UI.
+    for line in reversed(lines):
         m = re.search(r"pipeline directory: (\S+)", line)
         if m:
             return Path(m.group(1))
     return None
+
+
+def current_attempt_lines(lines: list[str]) -> list[str]:
+    """Return log lines belonging to the most recent pipeline attempt."""
+    for index in range(len(lines) - 1, -1, -1):
+        if "pipeline directory: " in lines[index]:
+            return lines[index:]
+    return lines
 
 
 def hc_run_of(lines: list[str], pipeline_dir: Path | None) -> Path | None:
@@ -150,15 +161,15 @@ def hc_run_of(lines: list[str], pipeline_dir: Path | None) -> Path | None:
     showed Entry Generator as not started after it had finished.  The pipeline's own lines are
     not cut, and the run directory is always under <pipeline>/harness.
     """
-    for line in lines:
-        m = re.search(r"\[stage 1\] skipped; reusing (\S+)", line)
-        if m and Path(m.group(1)).is_dir():
-            return Path(m.group(1))
     if pipeline_dir and (pipeline_dir / "harness").is_dir():
         runs = sorted(p for p in (pipeline_dir / "harness").iterdir() if (p / "project.json").is_file())
         if runs:
             return runs[-1]
-    for line in lines:
+    for line in reversed(lines):
+        m = re.search(r"\[stage 1\] skipped; reusing (\S+)", line)
+        if m and Path(m.group(1)).is_dir():
+            return Path(m.group(1))
+    for line in reversed(lines):
         m = re.search(r"started; artifacts=(\S+)", line)
         if m and (Path(m.group(1)) / "project.json").is_file():
             return Path(m.group(1))
@@ -268,6 +279,13 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
         st["hg"], st["hv"] = ("done", "run") if built else ("run", "wait")
     elif st["hg"] == "done" and any("context-harness:" in l and ": BUILT" in l for l in lines):
         st["hv"] = "done"
+    if hc and not finished and st["hg"] == "done":
+        # One context can finish unsuccessfully while later contexts are still
+        # generating inputs.  That is not completion of Harness Generator.
+        built_so_far = any(_json(path.read_text(encoding="utf-8", errors="replace")).get("built")
+                           for path in hc.glob("context-harnesses/*/status.json"))
+        if not built_so_far:
+            st["hg"] = st["hv"] = "wait"
     if finished:
         st = {k: ("done" if v != "fail" else v) for k, v in st.items()}
     if not alive:
@@ -386,8 +404,17 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
         cg_rows.append(row(label.get("name") or c.get("driver_function") or cid,
                            label.get("description") or "설명 만드는 중…", state, tag))
     cg_rows.sort(key=lambda r: {"채택": 0, "미해결": 1, "드롭": 2}[r["c"]])
-    details["cg"] = {"summary": f"문맥 {len(contexts)}개 · 채택 {sum(1 for r in cg_rows if r['c'] == '채택')}" if contexts else "",
-                     "layout": "groups", "now": "Entry를 입력 흐름별로 묶는 중", "rows": cg_rows}
+    classified = [line for line in lines if "[CLASSIFY]" in line]
+    peers = [line for line in lines if "[PEERS]" in line]
+    located = [line for line in lines if "[LOCATE]" in line]
+    latest_context_step = next((line for line in reversed(lines)
+                                if any(tag in line for tag in ("[CLASSIFY]", "[PEERS]", "[LOCATE]"))), "")
+    latest_context_step = re.sub(r"^.*?\[(?:CLASSIFY|PEERS|LOCATE)\] ", "", latest_context_step)
+    cg_progress = (f"통로 분류 {len(classified)}건 · 연결 상대 {len(peers)}건 · "
+                   f"해석 함수 {len(located)}건")
+    details["cg"] = {"summary": f"문맥 {len(contexts)}개 · 채택 {sum(1 for r in cg_rows if r['c'] == '채택')}" if contexts else cg_progress,
+                     "layout": "groups", "now": cg_progress + (f" · 최근 {latest_context_step[:100]}" if latest_context_step else ""),
+                     "rows": cg_rows}
     # Input Generator
     seeds = _rows(hc / "seeds" / "results.jsonl")
     purpose = {c["seed_id"]: c for c in _rows(hc / "seeds" / "candidates.jsonl")}
@@ -456,6 +483,7 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
                      "bytes": now_bytes, "layout": "sections", "sections": sections, "rows": []}
     # Harness Generator / Verifier
     hrows, vrows = [], []
+    generated_count = blocked_count = 0
     for status_file in sorted(hc.glob("context-harnesses/*/status.json")):
         data = _json(status_file.read_text(encoding="utf-8", errors="replace"))
         attempts = data.get("attempts") or []
@@ -463,9 +491,20 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
         name = status_file.parent.name
         hl = lab.get(labels.harness_key(name, len(attempts)), {})
         title = hl.get("name") or (lab.get(labels.ctx_key(name.rsplit("-", 1)[0]), {}).get("name", "") + " 하네스").strip() or name
-        hrows.append(row(title, hl.get("description") or "설명 만드는 중…",
-                         f"시도 {len(attempts)}회 · {last.get('executions_per_second', '—')} exec/s", "ok" if last.get("built") else "warn"))
         verdict = str(data.get("status") or data.get("verdict") or last.get("status") or "")
+        generated_count += bool(data.get("generated") or attempts)
+        if verdict == "GENERATION_BLOCKED" and not attempts:
+            blocked_count += 1
+            reason = str(data.get("reason") or "생성 조건 미충족")
+            if reason == "the context has no Entry with this delivery":
+                reason = "이 입력 방식과 일치하는 Entry가 없음"
+            elif reason == "no verified seed exists for this context and delivery":
+                reason = "검증된 시드가 없음"
+            hrows.append(row(title, reason, "생성 전 차단 · 시도 0회", "no"))
+        else:
+            hrows.append(row(title, hl.get("description") or "설명 만드는 중…",
+                             f"시도 {len(attempts)}회 · {last.get('executions_per_second', '—')} exec/s",
+                             "ok" if last.get("built") else "warn"))
         # Stage 2 fuzzes every context whose harness binary was built (pipeline.built_harnesses),
         # whatever the verifier's status, so "built" is what adoption means here.
         built_any = any(a.get("built") for a in attempts)
@@ -479,9 +518,13 @@ def stage1(lines: list[str], hc: Path | None, alive: bool) -> dict[str, Any]:
                    "RUN_FAILED": "하네스 실행 자체가 실패"}.get(verdict, "")
             detail = (last.get("reason") or "").strip().splitlines()[0][:80] if last.get("reason") else ""
             vrows.append(row(title, f"시도 {len(attempts)}회 모두 실패 · " + (why or detail or verdict), "드롭", "no"))
-    running_ctx = next((re.search(r"(ctx-[0-9a-f]+)", l).group(1) for l in reversed(lines) if "[WORKFLOW] 3." in l and "started" in l), "")
-    details["hg"] = {"summary": f"하네스 {len(hrows)}개" if hrows else "", "layout": "groups", "now": f"'{lab.get(labels.ctx_key(running_ctx), {}).get('name') or running_ctx}' 문맥의 하네스를 만드는 중", "rows": hrows}
-    details["hv"] = {"summary": f"채택 {sum(1 for r in vrows if r['c'] == '채택')} · 드롭 {sum(1 for r in vrows if r['c'] == '드롭')}" if vrows else "", "layout": "groups", "now": f"'{lab.get(labels.ctx_key(running_ctx), {}).get('name') or running_ctx}' 하네스를 원본과 비교 중", "rows": vrows}
+    latest_harness_event = next((l for l in reversed(lines) if "[WORKFLOW] 3." in l and "harness for " in l), "")
+    harness_active = "started" in latest_harness_event
+    running_ctx_match = re.search(r"(ctx-[0-9a-f]+)", latest_harness_event)
+    running_ctx = running_ctx_match.group(1) if running_ctx_match else ""
+    running_name = lab.get(labels.ctx_key(running_ctx), {}).get("name") or running_ctx
+    details["hg"] = {"summary": f"생성 {generated_count}개 · 생성 전 차단 {blocked_count}개" if hrows else "", "layout": "groups", "now": f"'{running_name}' 문맥의 하네스를 만드는 중" if harness_active else "다음 하네스 생성 대기", "rows": hrows}
+    details["hv"] = {"summary": f"채택 {sum(1 for r in vrows if r['c'] == '채택')} · 드롭 {sum(1 for r in vrows if r['c'] == '드롭')}" if vrows else "", "layout": "groups", "now": f"'{running_name}' 하네스를 원본과 비교 중" if harness_active else "하네스 검증 대기", "rows": vrows}
     return {"status": st, "details": details}
 
 
@@ -508,7 +551,14 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
         sps = [s for s in all_sps if not s.get("merged_into")]
         merged_count = len(all_sps) - len(sps)
         invs = _q(conn, "SELECT phi_num, file, line, expression, security_property, rationale, status, last_error FROM invariants ORDER BY phi_num")
-        crashes = _q(conn, "SELECT crash_id, status, crash_type, signature, details, report_path FROM crashes")
+        crashes = _q(conn, "SELECT crash_id, sp_id, status, crash_type, signature, details, report_path FROM crashes")
+        # A PoV is shown by what the crash checks made of it, also for runs stored by older code.
+        by_sp: dict[str, list[str]] = {}
+        for c in crashes:
+            if c.get("sp_id"):
+                by_sp.setdefault(c["sp_id"], []).append(c["status"])
+        for s in sps:
+            s["status"] = settled_pov_status(s["status"], by_sp.get(s["sp_id"], []))
         pool_open = _q(conn, "SELECT COUNT(*) AS n FROM pool WHERE status IN ('pending','analysing')")
         building = _q(conn, "SELECT version FROM builds WHERE status='building'")
         builds = _q(conn, "SELECT version, status FROM builds ORDER BY version")
@@ -584,10 +634,20 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
                                   + [row(sp_label(s).get("name") or s["vuln_type"][:50],
                                          sp_label(s).get("reason") or "이유 정리 중…", "드롭", "no") for s in rejected[::-1]]}
         povs = [s for s in sps if s["status"].startswith("pov_")]
-        details["pov"] = {"summary": f"크래시 입력 {sum(1 for s in povs if s['status'] == 'pov_generated')} · 실패 {sum(1 for s in povs if s['status'] == 'pov_failed')}",
+        pov_label = {"pov_confirmed": ("확인된 크래시", "ok"), "pov_unconfirmed": ("확인 대기", ""),
+                     "pov_not_reproduced": ("재현 안 됨", "no"), "pov_harness_fault": ("하네스 결함", "no"),
+                     "pov_unattributed": ("귀속 불가", "no"), "pov_failed": ("실패", "no"),
+                     "pov_not_attempted": ("시도 못함", "")}
+        count = lambda state: sum(1 for s in povs if s["status"] == state)
+        details["pov"] = {"summary": f"확인된 크래시 {count('pov_confirmed')} · 확인 대기 {count('pov_unconfirmed')}"
+                                     + "".join(f" · {pov_label[k][0]} {count(k)}" for k in
+                                               ("pov_not_reproduced", "pov_harness_fault", "pov_unattributed",
+                                                "pov_not_attempted")
+                                               if count(k))
+                                     + f" · 실패 {count('pov_failed')}",
                           "now": f"시험 중 · {subject('pov')}",
-                          "rows": [row(s["function_name"], s["vuln_type"][:60], "성공" if s["status"] == "pov_generated" else "실패",
-                                       "ok" if s["status"] == "pov_generated" else "no") for s in povs[-6:][::-1]]}
+                          "rows": [row(s["function_name"], s["vuln_type"][:60], *pov_label.get(s["status"], ("실패", "no")))
+                                   for s in povs[-6:][::-1]]}
         active = [i for i in invs if i["status"] in ("built", "pending_build", "lead")]
         withdrawn = [i for i in invs if i["status"].startswith("withdrawn")]
         blocked = [i for i in invs if i["status"] == "build_blocked"]
@@ -693,11 +753,12 @@ def session_status(session: dict[str, Any]) -> dict[str, Any]:
 def _session_status(session: dict[str, Any]) -> dict[str, Any]:
     labels.CURRENT.set(session.get("provider") or "claude")
     lines = read_log(Path(session["log"])) if session.get("log") else []
-    pipeline_dir = Path(session["pipeline_dir"]) if session.get("pipeline_dir") else pipeline_dir_of(lines)
+    pipeline_dir = pipeline_dir_of(lines) or (Path(session["pipeline_dir"]) if session.get("pipeline_dir") else None)
+    attempt_lines = current_attempt_lines(lines)
     alive = pid_alive(session.get("pid")) if session.get("pid") else \
         bool(session.get("log")) and Path(session["log"]).is_file() and time.time() - Path(session["log"]).stat().st_mtime < 120
-    hc = hc_run_of(lines, pipeline_dir)
-    scans = scan_dirs_of(lines, pipeline_dir)
+    hc = hc_run_of(attempt_lines, pipeline_dir)
+    scans = scan_dirs_of(attempt_lines, pipeline_dir)
     progress, label, prep_done = prep_progress(lines, session)
     state = session.get("state", "")
     if state == "failed":
@@ -710,8 +771,8 @@ def _session_status(session: dict[str, Any]) -> dict[str, Any]:
         phase = "run"
     else:
         phase = "stopped"
-    s1 = stage1(lines, hc, alive)
-    s2 = stage2(lines, scans, alive)
+    s1 = stage1(attempt_lines, hc, alive)
+    s2 = stage2(attempt_lines, scans, alive)
     return {"id": session["id"], "name": session.get("name", ""), "rev": session.get("rev", ""), "mode": session.get("mode", "Full"),
             "when": session.get("when", ""), "phase": phase, "error": session.get("error", ""),
             "prep": {"progress": progress, "label": label}, "context": s2.get("context", ""),

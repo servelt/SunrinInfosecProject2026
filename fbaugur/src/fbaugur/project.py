@@ -64,6 +64,63 @@ def frame_messages(messages: list[bytes], delivery: str) -> bytes:
     return b"".join(messages)
 
 
+_NM_LINE = re.compile(r"^\S+\s+[tTwW]\s+(?P<name>\S+)(?:\t(?P<file>.+):(?P<line>\d+))?\s*$")
+
+
+def parse_nm_sites(text: str) -> dict[str, list[tuple[str, int]]]:
+    """`nm -l --defined-only` output -> {function name: [(file, line), ...]} (locations only)."""
+    sites: dict[str, list[tuple[str, int]]] = collections.defaultdict(list)
+    for line in text.splitlines():
+        match = _NM_LINE.match(line)
+        if match and match.group("file"):
+            sites[match.group("name")].append((match.group("file"), int(match.group("line"))))
+    return dict(sites)
+
+
+def defined_function_sites(binary: Path) -> dict[str, list[tuple[str, int]]]:
+    out = subprocess.run(["nm", "-l", "--defined-only", str(binary)], capture_output=True, text=True,
+                         check=False)
+    return parse_nm_sites(out.stdout)
+
+
+def _same_file(recorded: str, located: str) -> bool:
+    a, b = Path(recorded).as_posix().lstrip("./"), Path(located).as_posix()
+    return bool(a) and (b == a or b.endswith("/" + a))
+
+
+def resolve_active_targets(functions: dict[str, "FunctionInfo"], target_ids: list[str], compiled: set[str],
+                           sites: dict[str, list[tuple[str, int]]]) -> tuple[list[str], dict[str, str]]:
+    """Which target definitions the harness binary actually contains.
+
+    A function is identified by its id (file and line range), never by its name alone: one name can
+    name several definitions (opposite #ifdef branches, file-static helpers, other programs).  The
+    binary's debug locations decide; a definition none of them falls inside is not compiled.  When
+    the binary gives no location for a name that several definitions share, which one is compiled
+    is unknown: those definitions are kept and marked ambiguous, never resolved by name.
+    Returns (active ids, {id: why it is ambiguous}).
+    """
+    by_name: dict[str, list[FunctionInfo]] = collections.defaultdict(list)
+    for fn in functions.values():
+        by_name[fn.name].append(fn)
+    active: list[str] = []
+    ambiguous: dict[str, str] = {}
+    for fid in target_ids:
+        fn = functions.get(fid)
+        if fn is None or fn.name not in compiled:
+            continue
+        located = sites.get(fn.name) or []
+        if located:
+            if any(_same_file(fn.file, file) and fn.start_line <= line <= max(fn.end_line, fn.start_line)
+                   for file, line in located):
+                active.append(fid)
+            continue
+        active.append(fid)
+        if len(by_name[fn.name]) > 1:
+            ambiguous[fid] = (f"the binary has no debug location for `{fn.name}`, which names "
+                              f"{len(by_name[fn.name])} definitions")
+    return active, ambiguous
+
+
 def defined_functions(binary: Path) -> set[str]:
     out = subprocess.run(["nm", "--defined-only", str(binary)], capture_output=True, text=True, check=False)
     names = set()
@@ -74,18 +131,61 @@ def defined_functions(binary: Path) -> set[str]:
     return names
 
 
+# HarnessCreator's attempt statuses (contexts/measured_harness.py), best first.  None is
+# QUALIFIED: stage 1 never claims that, so stage 2 must not wait for it.
+_ATTEMPT_RANK = ("BUILT_SEED_EQUIVALENT_NOT_QUALIFIED", "BUILT_SEED_EQUIVALENT_REVIEW_FAILED",
+                 "BUILT_REPLAYED_NOT_QUALIFIED", "BUILT_SEED_MISMATCH")
+# A harness whose verified seeds did not replay cleanly changes or loses the input before the
+# program sees it (or faults by itself): fuzzing it measures the harness, not the program.
+_NOT_ANALYSED = frozenset({"BUILT_REPLAY_FAILED", "BUILD_FAILED", "GENERATION_BLOCKED"})
+
+
+def _admissible(row: dict[str, Any]) -> bool:
+    """The attempt's own receipt says it was built and every verified seed replayed cleanly."""
+    replayed, ok = int(row.get("seeds_replayed") or 0), int(row.get("seeds_replay_ok") or 0)
+    return (str(row.get("status") or "") in _ATTEMPT_RANK and row.get("built") is True
+            and replayed > 0 and ok == replayed)
+
+
 def pick_attempt(hc_run: Path, context_id: str, delivery: str) -> Path:
     base = hc_run / "context-harnesses" / f"{context_id}-{delivery}"
     attempts = sorted((p for p in base.glob("attempt-*") if (p / "build" / "hc-native-fuzzer").is_file()),
                       key=lambda p: int(p.name.split("-")[1]))
     if not attempts:
         raise FileNotFoundError(f"no built harness under {base}")
-    # Prefer the latest attempt whose seed-equivalence check found nothing missing.
+    status_path = base / "status.json"
+    if status_path.is_file():
+        receipts = {f"attempt-{row.get('attempt')}": row
+                    for row in json.loads(status_path.read_text(encoding="utf-8")).get("attempts") or []}
+        # A binary on disk is not a receipt: stage 1 may have stopped between the build and the
+        # replay, or written a status without these fields.  Only what it recorded counts.
+        usable = [a for a in attempts if _admissible(receipts.get(a.name) or {})]
+        if not usable:
+            raise FileNotFoundError(f"no built harness under {base} has a receipt of a clean seed replay: "
+                                    + ", ".join(f"{a.name}={(receipts.get(a.name) or {}).get('status') or 'none'}"
+                                                for a in attempts))
+        rank = {status: index for index, status in enumerate(_ATTEMPT_RANK)}
+        # Best recorded status, then the latest attempt among equals.
+        return min(usable, key=lambda a: (rank[str(receipts[a.name]["status"])], -int(a.name.split("-")[1])))
+    # Runs without status.json (older stage 1 output): the latest attempt whose seed-equivalence check
+    # found nothing missing.  It is analysed as UNVERIFIED (see attempt_status).
     for attempt in reversed(attempts):
         eq = attempt / "seed-equivalence.json"
         if eq.is_file() and not json.loads(eq.read_text(encoding="utf-8")).get("missing_in_harness"):
             return attempt
     return attempts[-1]
+
+
+def attempt_status(attempt: Path) -> str:
+    """The status stage 1 recorded for this attempt, or why it is unverified."""
+    path = attempt.parent / "status.json"
+    if not path.is_file():
+        return ("UNVERIFIED: no status.json, so the build, the seed replay and the equivalence check are "
+                "not on record for this attempt")
+    for row in json.loads(path.read_text(encoding="utf-8")).get("attempts") or []:
+        if f"attempt-{row.get('attempt')}" == attempt.name:
+            return str(row.get("status") or "")
+    return ""
 
 
 class Project:
@@ -118,6 +218,7 @@ class Project:
         self.context_id = context_id
         self.harnesses: dict[str, Harness] = {}
         compiled: set[str] = set()
+        sites: dict[str, list[tuple[str, int]]] = {}
         for delivery in deliveries:
             attempt = pick_attempt(self.hc_run, context_id, delivery)
             spec_path = self.hc_run / "seeds" / f"run-spec-{context_id}-{delivery}.json"
@@ -131,11 +232,14 @@ class Project:
                 trigger=self._trigger(context_id, delivery))
             self.harnesses[harness.harness_id] = harness
             compiled |= defined_functions(harness.binary)
+            for name, located in defined_function_sites(harness.binary).items():
+                sites.setdefault(name, []).extend(located)
         self.compiled = compiled
-        targets = {self.functions[f].name for f in self.context.get("target_function_ids", []) if f in self.functions}
         # FBv2 restricts a worker to functions its fuzzer reaches; here: reached from the
-        # context's interpreters AND present in the harness binary.
-        self.target_names = {n for n in targets if n in compiled}
+        # context's interpreters AND present in the harness binary -- by definition, not by name.
+        self.target_ids, self.ambiguous_ids = resolve_active_targets(
+            self.functions, list(self.context.get("target_function_ids", [])), compiled, sites)
+        self.target_names = {self.functions[f].name for f in self.target_ids}
         self.interpreter_names = [self.functions[f].name for f in self.context.get("interpreter_function_ids", [])
                                   if f in self.functions]
         self.entries = self.context.get("entries", [])
@@ -152,6 +256,11 @@ class Project:
                 continue
             self.executed_names |= set(raw.get("target_functions_beyond_baseline_whole_input")
                                        or raw.get("target_functions_beyond_baseline") or [])
+            # Everything the verified input executed, startup included: a function every run
+            # executes is executed by this input too.  "Beyond baseline" alone made files whose
+            # functions run only at startup look never executed (closed_files).
+            self.executed_names |= {self.functions[fid].name for fid in raw.get("covered_target_function_ids") or []
+                                    if fid in self.functions}
         self.blocked_names: set[str] = {
             row["target_function"] for row in self.frontier
             if row.get("target_function") and row.get("blocked_reason") in
@@ -164,9 +273,9 @@ class Project:
         # open (memcached: the proxy needs a startup option). Used to rank, and to warn the
         # invariant recorder, never to claim unreachability.
         by_file: dict[str, set[str]] = collections.defaultdict(set)
-        for fn in self.functions.values():
-            if fn.name in self.target_names:
-                by_file[fn.file].add(fn.name)
+        for fid in self.target_ids:
+            fn = self.functions[fid]
+            by_file[fn.file].add(fn.name)
         self.closed_files: set[str] = {file for file, names in by_file.items()
                                        if names and not (names & self.executed_names)}
 
@@ -195,12 +304,19 @@ class Project:
         return out
 
     # -- lookups ---------------------------------------------------------------
-    def function(self, name: str) -> FunctionInfo | None:
+    def function(self, name: str, function_id: str = "") -> FunctionInfo | None:
+        """The definition meant: by id when known, else the one active target definition of the name."""
+        if function_id and function_id in self.functions:
+            return self.functions[function_id]
         candidates = self.by_name.get(name) or []
         if not candidates:
             return None
-        in_target = [fn for fn in candidates if fn.name in self.target_names]
-        return (in_target or candidates)[0]
+        active = [fn for fn in candidates if fn.function_id in self.target_ids]
+        return (active or candidates)[0]
+
+    def active_ids(self, name: str) -> list[str]:
+        """Ids of this name's target definitions the harness binary contains (several for file-static twins)."""
+        return sorted(fid for fid in self.target_ids if self.functions[fid].name == name)
 
     def reachable_from(self, names: list[str], limit: int | None = None) -> list[str]:
         seen: list[str] = []

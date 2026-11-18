@@ -278,8 +278,9 @@ class InvariantBuilder:
         self.harnesscreator_src = harnesscreator_src
         self.python = python or sys.executable
         self.plan: dict[str, Any] = {}
-        if build_plan and build_plan.is_file():
-            self.plan = json.loads(build_plan.read_text(encoding="utf-8"))
+        self.build_plan = build_plan if build_plan and build_plan.is_file() else None
+        if self.build_plan:
+            self.plan = json.loads(self.build_plan.read_text(encoding="utf-8"))
         self.extra_cflags = extra_cflags
         self.sanitizer = sanitizer
         self.compile_database = compile_database
@@ -414,6 +415,9 @@ class InvariantBuilder:
         database = self._relocated_database(src, root)
         if database is not None:
             argv += ["--compile-database", str(database)]
+        if self.build_plan is not None and self.plan.get("source_root"):
+            # Link exactly what the harness build linked; the copy cannot re-derive that closure.
+            argv += ["--closure-plan", str(self.build_plan)]
         proc = subprocess.run(argv,
                               capture_output=True, text=True, env=env, timeout=1800)
         output = proc.stdout + proc.stderr

@@ -21,6 +21,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from fbaugur.config import codex_daybreak_args
+
 MODEL = "claude-haiku-5-5"
 _busy: set[str] = set()
 _lock = threading.Lock()
@@ -104,7 +106,7 @@ def _ask(prompt: str, provider: str) -> list[dict[str, Any]]:
         if provider == "codex":
             with tempfile.TemporaryDirectory(prefix="occulta-label-") as tmp:
                 out = Path(tmp) / "answer.txt"
-                subprocess.run(["codex", "exec", "--ignore-user-config", "-c", "daybreak=true", "--enable", "cli_daybreak",
+                subprocess.run(["codex", "exec", "--ignore-user-config", *codex_daybreak_args(model),
                                 "--skip-git-repo-check", "-m", model,
                                 "-s", "read-only", "-C", tmp, "-o", str(out), "-"],
                                input=prompt, capture_output=True, text=True, timeout=300)

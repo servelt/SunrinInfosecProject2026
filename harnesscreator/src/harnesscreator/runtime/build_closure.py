@@ -8,6 +8,7 @@ Make/Autotools and dynamically linked/whole-archive graphs remain unresolved.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shlex
 from dataclasses import dataclass
@@ -57,6 +58,13 @@ def _compiler_output(record: dict, directory: Path) -> Path | None:
             return _path(str(argv[i + 1]), directory)
         if token.startswith("-o") and len(token) > 2:
             return _path(str(token[2:]), directory)
+    # GCC/Clang write basename.o in the working directory for a single
+    # `-c source.c` command with no -o. Bear commonly omits `output` for it.
+    sources = [str(token) for token in argv if str(token).lower().endswith((".c", ".cc", ".cpp", ".cxx"))]
+    if argv.count("-c") == 1 and len(sources) == 1:
+        recorded_source = str(record.get("file") or "")
+        if _path(sources[0], directory) == _path(recorded_source, directory):
+            return directory / (Path(sources[0]).stem + ".o")
     return None
 
 
@@ -208,6 +216,96 @@ def resolve_cmake_target(
     return TargetClosure(
         target.name, tuple(sorted(sources)), tuple(dict.fromkeys(flags)),
         tuple(dict.fromkeys(evidence)), target.output, tuple(sorted(objects)),
+    )
+
+
+def resolve_recorded_link_target(
+    source_root: Path, database: Path, required_sources: set[Path],
+    *, target_binary: Path | None = None,
+) -> TargetClosure | None:
+    """Use one recorded linker invocation, bound to its binary and compiler DB.
+
+    Make projects often build several executables from one compile database.
+    A profile may preserve the *executed* link argv in link_commands.json next
+    to that database. Every linked object must map to one compiler record; an
+    incomplete or stale record is not a source-selection hint.
+    """
+    record_file = database.parent / "link_commands.json"
+    if not record_file.is_file():
+        return None
+    try:
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        records = json.loads(database.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not isinstance(records, list):
+        return None
+    directory_raw, argv = record.get("directory"), record.get("arguments")
+    if not isinstance(directory_raw, str) or not isinstance(argv, list) or not argv or not all(
+        isinstance(token, str) and token for token in argv
+    ):
+        return None
+    directory = Path(directory_raw).resolve()
+    root = source_root.resolve()
+    if directory != root and root not in directory.parents:
+        return None
+    if Path(argv[0]).name not in {"cc", "gcc", "clang", "clang++", "g++", "c++"}:
+        return None
+    if argv.count("-o") != 1 or argv.index("-o") + 1 >= len(argv):
+        return None
+    output = _path(argv[argv.index("-o") + 1], directory)
+    if target_binary is None or output != target_binary.resolve() or not output.is_file():
+        return None
+    if record.get("target_sha256") != hashlib.sha256(output.read_bytes()).hexdigest():
+        return None
+    if record.get("compile_database_sha256") != hashlib.sha256(database.read_bytes()).hexdigest():
+        return None
+    objects = tuple(_path(token, directory) for token in argv if token.endswith((".o", ".obj")))
+    if not objects or len(set(objects)) != len(objects) or any(
+        not obj.is_file() or root not in obj.parents for obj in objects
+    ):
+        return None
+    by_output: dict[Path, Path] = {}
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        compiler_dir = Path(str(item.get("directory") or database.parent)).resolve()
+        obj = _compiler_output(item, compiler_dir)
+        if obj not in objects:
+            continue
+        src = _path(str(item.get("file") or ""), compiler_dir)
+        if obj in by_output or not src.is_file() or root not in src.parents:
+            return None
+        by_output[obj] = src
+    if set(by_output) != set(objects):
+        return None
+    sources = set(by_output.values())
+    if required_sources and not required_sources.issubset(sources):
+        return None
+    flags: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-L", "-l"}:
+            if index + 1 >= len(argv):
+                return None
+            value = argv[index + 1]
+            flags.extend([token, str(_path(value, directory)) if token == "-L" else value])
+            index += 2
+            continue
+        if token.startswith("-L") and len(token) > 2:
+            flags.append("-L" + str(_path(token[2:], directory)))
+        elif token.startswith("-l") and len(token) > 2:
+            flags.append(token)
+        elif token in {"-pthread", "-fopenmp"}:
+            flags.append(token)
+        elif token.endswith((".a", ".so")):
+            # Local archive closure needs its own recorded object membership.
+            return None
+        index += 1
+    return TargetClosure(
+        output.name, tuple(sorted(sources)), tuple(flags), (record_file, database),
+        output, objects,
     )
 
 

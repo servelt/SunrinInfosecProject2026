@@ -109,6 +109,41 @@ def sanitizer_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+_SOURCE_ROOT: Path | None = None
+_RESOLVED: dict[str, str] = {}
+
+
+def set_source_root(root: Path | str | None) -> None:
+    """The program's source root, against which reported paths are made relative (per process)."""
+    global _SOURCE_ROOT
+    _SOURCE_ROOT = Path(root).resolve() if root else None
+    _RESOLVED.clear()
+
+
+def source_path(path: Any) -> str:
+    """A reported source path, relative to the source root when the file is found there.
+
+    Sanitizers print the path the compiler saw: the checkout, a build copy, or the copy an
+    invariant build compiles.  The longest trailing part that names a file under the source root
+    is used; a path that matches nothing is kept whole (normalised), never reduced to its file
+    name, so files of one name in two directories are never taken for each other."""
+    text = Path(str(path or "")).as_posix()
+    if not text or text in (".", "None"):
+        return "?"
+    if text in _RESOLVED:
+        return _RESOLVED[text]
+    resolved = text[2:] if text.startswith("./") else text
+    if _SOURCE_ROOT is not None:
+        parts = Path(text).parts
+        for index in range(len(parts)):
+            tail = Path(*parts[index:])
+            if not tail.is_absolute() and (_SOURCE_ROOT / tail).is_file():
+                resolved = tail.as_posix()
+                break
+    _RESOLVED[text] = resolved
+    return resolved
+
+
 @dataclasses.dataclass
 class RunResult:
     returncode: int | None
@@ -127,10 +162,14 @@ class RunResult:
     reach_order: list[int] = dataclasses.field(default_factory=list)
 
     def ub_sites(self) -> list[str]:
-        """`file:line` of every UBSan report, in order, without duplicates."""
+        """`path:line` of every UBSan report, in order, without duplicates.
+
+        The path is relative to the program's source root (see `source_path`), so two files of
+        one name in different directories stay apart, and the same file compiled from another
+        copy of the tree (an instrumented build) is still the same site."""
         seen: list[str] = []
         for item in self.ubsan:
-            site = f"{Path(str(item.get('file'))).name}:{item.get('line')}"
+            site = f"{source_path(item.get('file'))}:{item.get('line')}"
             if site not in seen:
                 seen.append(site)
         return seen
@@ -195,7 +234,16 @@ def new_ub_sites(result: RunResult, baseline: set[str] | None) -> list[str]:
     is the program's background noise and is not a finding; any other site is.
     """
     known = baseline or set()
-    return [site for site in result.ub_sites() if site not in known]
+    return [site for site in result.ub_sites()
+            if site not in known and _LEGACY_SITE + _basename_site(site) not in known]
+
+
+_LEGACY_SITE = "basename:"      # entries of a ub-baseline.json written before paths were kept
+
+
+def _basename_site(site: str) -> str:
+    path, _, line = site.rpartition(":")
+    return f"{Path(path).name}:{line}"
 
 
 def is_finding(result: RunResult, baseline: set[str] | None) -> bool:
@@ -210,7 +258,7 @@ def finding_type(result: RunResult, baseline: set[str] | None) -> str | None:
     if not sites:
         return None
     message = next((u.get("message", "") for u in result.ubsan
-                    if f"{Path(str(u.get('file'))).name}:{u.get('line')}" == sites[0]), "")
+                    if f"{source_path(u.get('file'))}:{u.get('line')}" == sites[0]), "")
     return f"undefined-behavior: {message}"[:160]
 
 
@@ -236,25 +284,34 @@ def program_frames(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept
 
 
+def _frame_site(frame: dict[str, Any]) -> str:
+    """`function@path:line`, or `function@?` when the report gave no location."""
+    if frame.get("file") and frame.get("line"):
+        return f"{frame['function']}@{source_path(frame['file'])}:{frame['line']}"
+    return f"{frame['function']}@?"
+
+
 def crash_signature(result: RunResult, baseline: set[str] | None = None, depth: int = 3) -> str:
-    """Top program frames (function, plus line when known); for a UB-only finding, its site."""
+    """Bug class and top program frames with their source location; for UB only, its site.
+
+    The class is part of it (a use-after-free and an overflow at one line are two bugs) and so
+    is the file (two static `parse` functions in two files are two places).  A frame without a
+    location is kept as `function@?`: such a signature is not used to merge findings."""
     if not result.crashed:
         sites = new_ub_sites(result, baseline)
         if sites:
             return "UB " + sites[0]
-    parts = []
-    for frame in program_frames(result.frames)[:depth]:
-        line = frame.get("line")
-        parts.append(f"{frame['function']}:{line}" if line else str(frame["function"]))
-    return " | ".join(parts) or (result.crash_type or "?")
+    parts = [_frame_site(frame) for frame in program_frames(result.frames)[:depth]]
+    kind = result.crash_type or "?"
+    return f"{kind} | " + " | ".join(parts) if parts else kind
 
 
 def fault_key(result: RunResult, baseline: set[str] | None = None) -> str:
-    """Bug class and the place it happens: `stack-buffer-overflow@writelogentry:435`.
+    """Bug class and the place it happens: `stack-buffer-overflow@writelogentry@src/x.c:435`.
 
     Two findings with the same fault key are one root cause reached by different paths -- the
     same strcat overflowed from two callers -- even though their full signatures differ.  Line
-    numbers are part of it, so two different defects in one function stay apart.
+    numbers and paths are part of it, so two different defects in one function stay apart.
     """
     if not result.crashed:
         sites = new_ub_sites(result, baseline)
@@ -262,8 +319,45 @@ def fault_key(result: RunResult, baseline: set[str] | None = None) -> str:
     frames = program_frames(result.frames)
     if not frames:
         return ""
-    top = frames[0]
-    return f"{result.crash_type}@{top['function']}:{top.get('line') or '?'}"
+    return f"{result.crash_type}@{_frame_site(frames[0])}"
+
+
+def finding_identities(result: RunResult, baseline: set[str] | None = None) -> list[tuple[str, str, str]]:
+    """Every distinct finding in one run: (identity, type, UB site or "").
+
+    A sanitizer fault is one; each new UBSan site is one more (UBSan does not halt here, so one
+    input can report several, and each may be a different defect)."""
+    out: list[tuple[str, str, str]] = []
+    if result.crashed:
+        out.append((fault_key(result, baseline) or (result.crash_type or "?"), result.crash_type or "?", ""))
+    for site in new_ub_sites(result, baseline):
+        message = next((u.get("message", "") for u in result.ubsan
+                        if f"{source_path(u.get('file'))}:{u.get('line')}" == site), "")
+        out.append((f"undefined-behavior@{site}", f"undefined-behavior: {message}"[:160], site))
+    return out
+
+
+def resolved(identity: str) -> bool:
+    """A signature or fault key whose locations are all known (it may be compared)."""
+    return bool(identity) and "@?" not in identity and not identity.startswith("?")
+
+
+def same_fault(a: RunResult, b: RunResult, baseline: set[str] | None = None, site: str = "") -> bool | None:
+    """Are two findings the same defect?  None when their locations do not allow saying so.
+
+    `site` is the UBSan site of a candidate made for that one site (one run can report several,
+    each its own candidate): then it is the same defect only when both runs report that site.
+    Comparing the fault keys would compare the runs' first new site, so a candidate for a second
+    site would be counted as reproduced by a run where only the first one appeared.
+    """
+    if site:
+        return site in a.ub_sites() and site in b.ub_sites()
+    if not (is_finding(a, baseline) and is_finding(b, baseline)):
+        return False
+    ka, kb = fault_key(a, baseline), fault_key(b, baseline)
+    if not (resolved(ka) and resolved(kb)):
+        return None
+    return ka == kb
 
 
 def find_duplicate(signature: str, key: str, earlier: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
@@ -272,11 +366,14 @@ def find_duplicate(signature: str, key: str, earlier: list[dict[str, Any]]) -> t
     FuzzingBrain V2 de-duplicates crashes by the SHA-1 of the input bytes, so two inputs reaching
     one bug are two findings.  Here the stack decides, in two steps: the same top program frames
     (the same bug by the same path), then the same fault key (the same bug by another path).
+    Identities with an unknown location never merge: the finding stays a separate candidate
+    until symbolization can tell.
     """
-    for row in earlier:
-        if row.get("signature") == signature:
-            return row, "same stack"
-    if key:
+    if resolved(signature):
+        for row in earlier:
+            if row.get("signature") == signature:
+                return row, "same stack"
+    if resolved(key):
         for row in earlier:
             if (row.get("details") or {}).get("fault_key") == key:
                 return row, "same fault site"
@@ -284,11 +381,21 @@ def find_duplicate(signature: str, key: str, earlier: list[dict[str, Any]]) -> t
 
 
 def load_ub_baseline(run_dir: Path) -> set[str]:
+    """Sites normal inputs reach.  Version 2 keeps paths; an older list kept file names only,
+    and its entries are marked so they still match by file name rather than not at all."""
     path = Path(run_dir) / "ub-baseline.json"
     try:
-        return set(json.loads(path.read_text(encoding="utf-8")))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return set()
+    if isinstance(raw, dict):
+        return set(raw.get("sites") or [])
+    return {_LEGACY_SITE + str(site) for site in raw}
+
+
+def write_ub_baseline(run_dir: Path, sites: set[str]) -> None:
+    (Path(run_dir) / "ub-baseline.json").write_text(
+        json.dumps({"version": 2, "sites": sorted(sites)}), encoding="utf-8")
 
 
 def run_input(binary: Path, data: bytes, *, timeout: int = 10, env_extra: dict[str, str] | None = None,
@@ -385,6 +492,7 @@ class DaemonReplay:
     result: RunResult | None       # the program's own sanitizer report, parsed
     sent: int
     note: str
+    closed_mid_input: str = ""     # the program closed or reset the connection before all bytes were sent
 
 
 _ALLOCATOR_ERROR = re.compile(r"(free\(\)|malloc\(\)|realloc\(\)|munmap_chunk\(\)|malloc_consolidate\(\)|"
@@ -511,4 +619,4 @@ def _daemon_replay_once(command: str, data: bytes, *, port: int, delivery: str, 
         return DaemonReplay(False, None, 0, out.get("error", "did not start"))
     parsed = parse_report(out.get("stderr", ""), out.get("returncode"), False)
     note = "the program crashed" if out.get("crashed_on_its_own") else "the program kept running"
-    return DaemonReplay(True, parsed, int(out.get("sent", 0)), note)
+    return DaemonReplay(True, parsed, int(out.get("sent", 0)), note, str(out.get("closed_mid_input") or ""))

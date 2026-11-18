@@ -27,7 +27,8 @@ But try to analyze with provided info first to save iterations.
 After analyzing:
 - If you find a suspicious pattern → call `create_suspicious_point()`
 - If you're uncertain but something looks off → call `create_suspicious_point()` with lower score
-- If you're confident the function is safe → explain why briefly
+- If you're confident the function is safe → explain why briefly and end your reply with the line `NO_SUSPICIOUS_POINT`.
+- Saying you will report something records nothing: only the `create_suspicious_point()` call does.
 
 ## Scoring Guide
 

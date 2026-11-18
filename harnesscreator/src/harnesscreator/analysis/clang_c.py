@@ -158,6 +158,37 @@ def _indirect_array_declaration(node: dict[str, Any]) -> dict[str, Any] | None:
     return declaration if declaration.get('kind') == 'VarDecl' else None
 
 
+def _indirect_global_member(node: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
+    """Identify an indirect call through a member of one named global object.
+
+    A member reached through a parameter or another struct is deliberately
+    excluded: the initializer of a similarly named global does not identify
+    that object's runtime value.
+    """
+    while node.get('kind') in {'ImplicitCastExpr', 'ParenExpr', 'CStyleCastExpr'}:
+        children = list(_children(node))
+        if len(children) != 1:
+            return None
+        node = children[0]
+    if node.get('kind') != 'MemberExpr' or node.get('isArrow'):
+        return None
+    children = list(_children(node))
+    if len(children) != 1:
+        return None
+    base = children[0]
+    while base.get('kind') in {'ImplicitCastExpr', 'ParenExpr'}:
+        operands = list(_children(base))
+        if len(operands) != 1:
+            return None
+        base = operands[0]
+    if base.get('kind') != 'DeclRefExpr':
+        return None
+    declaration = base.get('referencedDecl') or {}
+    if declaration.get('kind') != 'VarDecl':
+        return None
+    return declaration, str(node.get('name') or '')
+
+
 def _children(node: dict[str, Any]):
     for child in node.get('inner') or ():
         if isinstance(child, dict):
@@ -742,6 +773,12 @@ def augment_c_ast(
     edge_keys = {(e.caller_id, e.callee_id, e.line, e.kind): e for e in bundle.edges}
     parsed = failed = added_functions = added_calls = added_refs = seen_functions = 0
     pending_function_references: list[tuple[str, str, str, int]] = []
+    # A call through global_object.member may reach the function placed in
+    # that member by an active, compiler-parsed struct initializer. Collect
+    # both ends across translation units; lexical name matching alone would
+    # mistake unrelated objects and inactive #ifdef fields for proof.
+    global_member_initializers: dict[tuple[str, str, str], list[tuple[str, str, str]]] = {}
+    pending_global_member_calls: list[tuple[str, str, str, str, int]] = []
     exhausted = False
     diagnostics: list[dict[str, str]] = []
     for path in paths:
@@ -797,6 +834,17 @@ def augment_c_ast(
         global_declarations: dict[str, dict[str, Any]] = {}
         global_initializers: dict[str, dict[str, Any]] = {}
         global_initializer_nodes: dict[str, dict[str, Any]] = {}
+        active_struct_fields: dict[str, list[dict[str, Any]]] = {}
+        for declaration in _children(ast):
+            if (declaration.get('kind') != 'RecordDecl'
+                or declaration.get('tagUsed') != 'struct'
+                or not declaration.get('completeDefinition')
+                or not declaration.get('name')):
+                continue
+            fields = [child for child in _children(declaration)
+                      if child.get('kind') == 'FieldDecl']
+            if fields:
+                active_struct_fields[f"struct {declaration['name']}"] = fields
         local_includes: dict[Path, list[Path]] | None = None
         declaration_source_cache: dict[Path, str | None] = {path: src_text}
         declaration_path_cache: dict[str, Path] = {str(path): path}
@@ -1065,6 +1113,34 @@ def augment_c_ast(
                 and function.linkage_type == qual_type
             ]
             return typed[0] if len(typed) == 1 else None
+        for declaration_id, initializer in global_initializer_nodes.items():
+            if initializer.get('storageClass') == 'static':
+                continue  # a same-named global in another TU is not this object
+            type_name = str((initializer.get('type') or {}).get('qualType') or '')
+            fields = active_struct_fields.get(type_name)
+            values = list(_children(initializer))
+            if not fields or len(values) != 1 or values[0].get('kind') != 'InitListExpr':
+                continue
+            members = list(_children(values[0]))
+            if len(members) != len(fields):
+                continue  # no positional inference from an incomplete initializer
+            object_name = global_initializers[declaration_id]['name']
+            for field, value in zip(fields, members):
+                field_type = ''.join(str((field.get('type') or {}).get('qualType') or '').split())
+                if '(*' not in field_type:
+                    continue
+                refs = [item.get('referencedDecl') or {} for item in _walk(value)
+                        if item.get('kind') == 'DeclRefExpr'
+                        and (item.get('referencedDecl') or {}).get('kind') == 'FunctionDecl']
+                if len(refs) != 1:
+                    continue
+                ref = refs[0]
+                target = local_id.get(str(ref.get('id'))) or unique_typed_target(ref)
+                candidate = (target.function_id if target else '',
+                             str(ref.get('name') or ''),
+                             str((ref.get('type') or {}).get('qualType') or ''))
+                key = (object_name, type_name, str(field.get('name') or ''))
+                global_member_initializers.setdefault(key, []).append(candidate)
         macro_source_cache: dict[Path, str] = {}
         # Clang repeats the same spelling/expansion file path on many AST
         # nodes. Resolving each occurrence performs filesystem lookups even
@@ -1168,6 +1244,17 @@ def augment_c_ast(
                     continue
                 ref = _callee_decl(subnodes[0])
                 if ref is None:
+                    member = _indirect_global_member(subnodes[0])
+                    if member is not None:
+                        object_ref, slot = member
+                        if object_ref.get('storageClass') != 'static' and slot:
+                            pending_global_member_calls.append((
+                                caller.function_id,
+                                str(object_ref.get('name') or ''),
+                                str((object_ref.get('type') or {}).get('qualType') or ''),
+                                slot,
+                                _line((item.get('range') or {}).get('begin') or {}, src_text),
+                            ))
                     table = _indirect_array_declaration(subnodes[0])
                     table_id = str((table or {}).get('id') or '')
                     declaration = global_initializers.get(table_id)
@@ -1342,6 +1429,32 @@ def augment_c_ast(
         ))
         final_edge_keys.add(key)
         added_refs += 1
+    for caller_id, object_name, type_name, slot, line in pending_global_member_calls:
+        candidates = global_member_initializers.get((object_name, type_name, slot), [])
+        if len(candidates) != 1:
+            continue  # no initializer, or ambiguous definitions
+        target_id, target_name, target_type = candidates[0]
+        if not target_id:
+            matches = [function for function in bundle.functions.values()
+                       if function.linkage_external
+                       and function.linkage_symbol == target_name
+                       and function.linkage_type == target_type]
+            if len(matches) != 1:
+                continue
+            target_id = matches[0].function_id
+        if target_id == caller_id or target_id not in bundle.functions:
+            continue
+        key = (caller_id, target_id, line, 'indirect_possible')
+        if key in final_edge_keys:
+            continue
+        bundle.edges.append(CallEdge(
+            edge_id=stable_id('clang-ast-global-member', *key),
+            caller_id=caller_id, callee_id=target_id,
+            line=line, kind='indirect_possible', confidence=0.5,
+            providers=['clang-ast-c'],
+        ))
+        final_edge_keys.add(key)
+        added_calls += 1
     if added_functions or added_calls or added_refs:
         _populate_adjacency(bundle)
     return AstResult(

@@ -148,8 +148,13 @@ def _handler(sessions: Sessions):
                     if provider not in ("claude", "codex", "ollama"):
                         return self._error(400, "provider 는 claude, codex, ollama 중 하나")
                     models = {str(k): str(v).strip() for k, v in (body.get("models") or {}).items() if str(v).strip()}
+                    try:
+                        fuzz_minutes = max(0.0, float(body.get("fuzz_after_drain_minutes") or 0))
+                    except (TypeError, ValueError):
+                        return self._error(400, "fuzz_after_drain_minutes 는 0 이상의 숫자")
                     s = sessions.start(body["repo"], str(body.get("branch") or ""), body.get("mode", "full"),
-                                       body.get("commit", ""), int(hours), provider=provider, models=models)
+                                       body.get("commit", ""), int(hours), provider=provider, models=models,
+                                       fuzz_minutes=fuzz_minutes)
                     return self._json({"id": s["id"]})
                 if url.path == "/api/update":
                     out = subprocess.run(["bash", str(APP_ROOT / "bin" / "occulta-update")], capture_output=True, text=True,

@@ -15,6 +15,7 @@ class RunObservation:
     responses: list[bytes] = field(default_factory=list)
     exit_status: str = ""      # exited:<code> | signalled:<n> | killed_after_timeout | not_started
     error: str = ""
+    peer_contact: bool | None = None   # peer_stream: the program connected to the peer listener
 
     @property
     def ok(self) -> bool:
@@ -198,8 +199,10 @@ class ProgramRunner:
                 # No peer bytes (the run with no input): behave like a stream client that sends nothing.
                 observation.responses.append(await self._read_available(client_reader) if client_reader else b"")
                 return
+            observation.peer_contact = False
             try:
                 reader, writer = await asyncio.wait_for(accepted.get(), timeout=spec.startup_timeout)
+                observation.peer_contact = True
             except asyncio.TimeoutError:
                 raise RuntimeError("the program did not connect to the peer listener "
                                    f"{spec.host}:{peer_port} after the trigger") from None

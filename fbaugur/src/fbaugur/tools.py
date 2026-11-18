@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import RunConfig
+from .config import RunConfig, codex_daybreak_args
 from .store import Store, new_id
 
 # --------------------------------------------------------------------------------------
@@ -186,8 +186,8 @@ def sp_duplicate_of(new_description: str, existing: list[dict[str, Any]], cfg: R
         if cfg.provider == "codex":
             with tempfile.TemporaryDirectory(prefix="fba-dedup-") as tmp:
                 out = Path(tmp) / "answer.txt"
-                subprocess.run([cfg.codex_executable, "exec", "--ignore-user-config", "-c", "daybreak=true", "--enable",
-                                "cli_daybreak", "--skip-git-repo-check", "-m", model,
+                subprocess.run([cfg.codex_executable, "exec", "--ignore-user-config", *codex_daybreak_args(model),
+                                "--skip-git-repo-check", "-m", model,
                                 "-s", "read-only",
                                 "-C", tmp, "-o", str(out), "-"], input=SP_DEDUP_SYSTEM + "\n\n" + prompt,
                                capture_output=True, text=True, timeout=300)
@@ -209,6 +209,15 @@ def sp_duplicate_of(new_description: str, existing: list[dict[str, Any]], cfg: R
     return parse_sp_dedup(text or "", compare)
 
 
+def _site_in(definition: dict[str, Any], file: str, line: int) -> bool:
+    """Is file:line inside this definition?  Paths match on whole components from the end."""
+    recorded = Path(str(definition.get("file") or "")).as_posix().lstrip("./")
+    located = Path(file).as_posix()
+    same = bool(recorded) and (located == recorded or located.endswith("/" + recorded)
+                               or recorded.endswith("/" + located))
+    return same and int(definition.get("start") or 0) <= line <= int(definition.get("end") or 0)
+
+
 class ToolError(Exception):
     pass
 
@@ -216,14 +225,17 @@ class ToolError(Exception):
 class Toolbox:
     def __init__(self, run_dir: Path, *, role: str, worker: str = "", harness: str = "", sp: str = "",
                  phi: int | None = None, violation: str = "", direction: str = "", function: str = "",
-                 crash: str = "", agent_run: str = ""):
+                 crash: str = "", agent_run: str = "", function_id: str = ""):
         self.run_dir = Path(run_dir)
         self.cfg = RunConfig.load(self.run_dir)
         self.store = Store(self.run_dir / "state.db")
         self.index = json.loads((self.run_dir / "index.json").read_text(encoding="utf-8"))
         self.source_root = Path(self.index["source_root"])
+        from .runner import set_source_root
+        set_source_root(self.source_root)            # this tool server's own process
         self.role, self.worker, self.harness_id, self.sp_id = role, worker, harness, sp
         self.phi, self.violation_id, self.direction_id, self.function = phi, violation, direction, function
+        self.function_id = function_id
         self.crash_id, self.agent_run = crash, agent_run
         self.harness = self.index["harnesses"].get(harness, {})
         self.targets = set(self.index["targets"])
@@ -360,7 +372,29 @@ class Toolbox:
     # ----------------------------------------------------------------------------- code tools
     def _functions(self, name: str) -> list[dict[str, Any]]:
         found = self.index["functions"].get(name) or []
-        return sorted(found, key=lambda f: (name not in self.targets, f["file"]))
+        # The definition compiled into the harness first (by id), then the others with this name.
+        return sorted(found, key=lambda f: (not f.get("active", name in self.targets), f["file"], f["start"]))
+
+    def _definition(self, function_id: str | None) -> dict[str, Any] | None:
+        if not function_id:
+            return None
+        for items in self.index["functions"].values():
+            for item in items:
+                if item.get("function_id") == function_id:
+                    return item
+        return None
+
+    def _resolve_function_id(self, function_name: str) -> str | None:
+        """The definition an SP filed under this name is about, or None when that is not determined.
+
+        The function the generator is analysing keeps its id.  Another name is resolved only when
+        exactly one of its definitions is compiled into the harness (or exactly one exists)."""
+        if function_name == self.function and self.function_id:
+            return self.function_id
+        found = self.index["functions"].get(function_name) or []
+        active = [f for f in found if f.get("active")]
+        chosen = active if active else found
+        return chosen[0].get("function_id") if len(chosen) == 1 else None
 
     def get_function_source(self, function_name: str) -> str:
         found = self._functions(function_name)
@@ -372,7 +406,7 @@ class Toolbox:
             body = fn["source"].splitlines()
             numbered = "\n".join(f"{fn['start'] + i:6d}  {line}" for i, line in enumerate(body))
             parts.append(f"File: {fn['file']}  Lines: {fn['start']}-{fn['end']}"
-                         f"{'  (reachable from the harness)' if function_name in self.targets else ''}\n{numbered}")
+                         f"{'  (compiled into the harness)' if fn.get('active') else ''}\n{numbered}")
         if len(found) > 3:
             parts.append(f"... {len(found) - 3} more definitions with this name")
         return "\n\n".join(parts)
@@ -537,9 +571,10 @@ class Toolbox:
         # FBv2 core/sp_dedup.py: a model compares the new description with the SPs already recorded for
         # the same function and merges only an exact same bug.  Scope is this worker's SPs: an SP here
         # belongs to one sanitizer worker's binary (FBv2 instead adds the harness/sanitizer as a source).
+        function_id = self._resolve_function_id(function_name)
         existing = self.store.rows("SELECT sp_id, vuln_type, description, score FROM sps WHERE worker_id=? AND "
-                                   "function_name=? AND merged_into IS NULL ORDER BY created_at",
-                                   self.worker, function_name)
+                                   "function_name=? AND function_id IS ? AND merged_into IS NULL ORDER BY created_at",
+                                   self.worker, function_name, function_id)
         duplicate = sp_duplicate_of(description, existing, self.cfg) if existing else None
         if duplicate:
             now = time.time()
@@ -547,6 +582,7 @@ class Toolbox:
                                       "direction_id": self.direction_id, "function_name": function_name,
                                       "vuln_type": vuln_type, "description": description, "score": score,
                                       "important_controlflow": important_controlflow or [], "status": "duplicate",
+                                      "function_id": function_id,
                                       "merged_into": duplicate, "origin": "generator", "origin_ref": self.agent_run,
                                       "created_at": now, "updated_at": now})
             return json.dumps({"created": False, "merged": True, "suspicious_point_id": duplicate,
@@ -557,10 +593,12 @@ class Toolbox:
                                   "direction_id": self.direction_id, "function_name": function_name,
                                   "vuln_type": vuln_type, "description": description, "score": score,
                                   "important_controlflow": important_controlflow or [], "status": "pending_verify",
+                                  "function_id": function_id,
                                   "origin": "generator", "origin_ref": self.agent_run, "created_at": now,
                                   "updated_at": now})
         self.store.conn.execute("UPDATE pool SET sp_count=sp_count+1 WHERE worker_id=? AND direction_id=? AND "
-                                "function_name=?", (self.worker, self.direction_id, self.function))
+                                "function_name=? AND function_id=?",
+                                (self.worker, self.direction_id, self.function, self.function_id or ""))
         return json.dumps({"created": True, "suspicious_point_id": sp_id})
 
     def get_suspicious_point(self, suspicious_point_id: str) -> str:
@@ -592,6 +630,11 @@ class Toolbox:
             if key in values:
                 values[key] = 1 if values[key] else 0
         values["updated_at"] = time.time()
+        if "is_important" in values:
+            # is_important is the verdict (pass to PoV / false positive).  A call that only adds a
+            # score or notes records no verdict, so the orchestrator must not read the column's
+            # default 0 as a rejection.
+            values["verdict_at"] = values["updated_at"]
         self.store.update("sps", "sp_id", self.sp_id, values)
         return "suspicious point updated"
 
@@ -616,12 +659,28 @@ class Toolbox:
         target = str(sp.get("function_name") or "")
         if not target:
             return True
+        definitions = self.index["functions"].get(target, [])
+        meant = self._definition(sp.get("function_id"))
+        if meant is None and len(definitions) == 1:
+            meant = definitions[0]          # one definition only: the name identifies it
         if result.crashed:
-            return any(str(f.get("function")) == target for f in program_frames(result.frames))
-        spans = [(Path(fn["file"]).name, fn["start"], fn["end"]) for fn in self.index["functions"].get(target, [])]
+            for frame in program_frames(result.frames):
+                if str(frame.get("function")) != target:
+                    continue
+                if frame.get("file") and frame.get("line") and meant is not None:
+                    if _site_in(meant, str(frame["file"]), int(frame["line"])):
+                        return True
+                    continue                # same name, another definition
+                if len(definitions) == 1:
+                    return True             # no location, but the name has one definition
+                # A frame without file/line for a name with several definitions: which one crashed
+                # is not determined, so this SP is not credited (the crash itself stays recorded).
+            return False
+        if meant is None:
+            return False
         for site in new_ub_sites(result, self._ub_baseline()):
-            name, _, line = site.rpartition(":")
-            if line.isdigit() and any(name == f and s <= int(line) <= e for f, s, e in spans):
+            path, _, line = site.rpartition(":")
+            if line.isdigit() and _site_in(meant, path, int(line)):
                 return True
         return False
 
@@ -1032,7 +1091,8 @@ class Toolbox:
             # triage already carry source evidence), PoV generation is not.
             self.store.insert("sps", {
                 "sp_id": created, "worker_id": self.worker, "harness_id": self.harness_id,
-                "function_name": downstream_function, "vuln_type": vuln_type,
+                "function_name": downstream_function, "function_id": self._resolve_function_id(downstream_function),
+                "vuln_type": vuln_type,
                 "description": description + f"\n\n[from invariant phi {row['phi_num']} "
                                f"({invariant['expression']} at {invariant['file']}:{invariant['line']}) "
                                f"falsified by a fuzzer input]\n{explanation}",

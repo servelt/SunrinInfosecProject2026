@@ -594,13 +594,18 @@ class FindingTests(unittest.TestCase):
 
     def test_undefined_behaviour_normal_inputs_already_trigger_is_not(self):
         from fbaugur.runner import is_finding
-        self.assertFalse(is_finding(parse_report(PORT_UB, 0, False), {"ftpserv.c:551"}))
+        # The baseline is what ub_sites() gives for the normal inputs (paths are kept, not file names).
+        normal = set(parse_report(PORT_UB, 0, False).ub_sites())
+        self.assertFalse(is_finding(parse_report(PORT_UB, 0, False), normal))
 
     def test_signature_uses_program_frames_even_without_files(self):
         from fbaugur.runner import RunResult, crash_signature
         result = RunResult(1, False, True, "AddressSanitizer", "stack-buffer-overflow",
                            LIGHTFTP_FRAMES, [], [], [], "")
-        self.assertEqual(crash_signature(result), "writelogentry | ftp_client_thread")
+        # Program frames are used without files; the bug class leads and `@?` marks the unknown place
+        # (such a signature is kept, but never used to merge two findings).
+        self.assertEqual(crash_signature(result),
+                         "stack-buffer-overflow | writelogentry@? | ftp_client_thread@?")
 
     def test_two_different_bugs_get_different_signatures(self):
         from fbaugur.runner import RunResult, crash_signature
@@ -612,7 +617,8 @@ class FindingTests(unittest.TestCase):
 
     def test_ub_only_signature_is_its_site(self):
         from fbaugur.runner import crash_signature
-        self.assertEqual(crash_signature(parse_report(PORT_UB, 0, False), set()), "UB ftpserv.c:551")
+        # The site keeps its path (no source root is set here, so the reported path is kept whole).
+        self.assertEqual(crash_signature(parse_report(PORT_UB, 0, False), set()), "UB /src/ftpserv.c:551")
 
     def test_harness_fault_is_recognised_by_function_name(self):
         from fbaugur.runner import in_harness
@@ -697,7 +703,8 @@ class MemorySanitizerTests(unittest.TestCase):
         self.assertTrue(result.crashed)
         self.assertEqual((result.kind, result.crash_type), ("MemorySanitizer", "use-of-uninitialized-value"))
         # the origin stack after it (malloc) is not part of the signature
-        self.assertEqual(crash_signature(result), "ParseConfig:76 | ftpPASS:1060 | ftp_client_thread:1816")
+        self.assertEqual(crash_signature(result), "use-of-uninitialized-value | ParseConfig@/src/cfgparse.c:76 | "
+                                                  "ftpPASS@/src/ftpserv.c:1060 | ftp_client_thread@/src/ftpserv.c:1816")
 
     def test_sanitizer_env_sets_msan_options_and_a_symbolizer_when_one_exists(self):
         from fbaugur.runner import find_symbolizer, sanitizer_env
@@ -937,7 +944,7 @@ class DuplicateTests(unittest.TestCase):
 
     def test_ub_findings_are_keyed_by_their_site(self):
         from fbaugur.runner import fault_key
-        self.assertEqual(fault_key(parse_report(PORT_UB, 0, False), set()), "undefined-behavior@ftpserv.c:551")
+        self.assertEqual(fault_key(parse_report(PORT_UB, 0, False), set()), "undefined-behavior@/src/ftpserv.c:551")
 
 
 class RebuildFlagsTests(unittest.TestCase):
@@ -1006,7 +1013,9 @@ class PipelineDedupAndDrainTests(unittest.TestCase):
             run.emitted = []
             run.emit = run.emitted.append
             run.draining = False
-            run.deadline = time.time() - 5
+            # deadline is a property over these (it can be extended at run time)
+            run.started_at, run._fixed_deadline = time.time() - 10, time.time() - 5
+            run.workers = []
             run.stop = asyncio.Event()
             run.stop.set()
             self._crash(run.store, "late", "pending")
@@ -1025,7 +1034,7 @@ class PipelineDedupAndDrainTests(unittest.TestCase):
             self.assertFalse(run.draining)
             self.assertTrue(run.validation_closed())
             self.assertEqual(run.store.scalar("SELECT status FROM crashes WHERE crash_id='done'"), "confirmed")
-            self.assertTrue(any("final drain: 3 crash" in m for m in run.emitted))
+            self.assertTrue(any("final drain:" in m and "'crashes': 3" in m for m in run.emitted))
 
 
 class InsertionPlacementTests(unittest.TestCase):

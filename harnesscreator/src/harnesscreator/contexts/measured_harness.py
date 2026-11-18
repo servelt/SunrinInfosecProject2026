@@ -34,7 +34,7 @@ from ..llm.base import close_llm_session
 from ..runtime.runner import SANITIZER_MARKERS
 from ..storage import ArtifactStore
 from . import harness as bridge
-from .builder import CallGraph
+from .builder import CallGraph, entry_supports_delivery
 
 STATUS_EQUIVALENT = "BUILT_SEED_EQUIVALENT_NOT_QUALIFIED"
 STATUS_EQUIVALENT_REVIEW_FAILED = "BUILT_SEED_EQUIVALENT_REVIEW_FAILED"
@@ -52,13 +52,17 @@ CHECKS = {
     "HC03": "The harness leaves no state of its own that changes how a later input is processed; program state that "
             "persists between inputs is named in the explanation.",
     "HC04": "The fuzz bytes (Data, Size) reach the program through this context's delivery so that the Entry acquires "
-            "exactly those bytes; nothing else is injected into that channel.",
+            "exactly those bytes; nothing else is injected into that channel. Every byte is offered: sending stops "
+            "before Size only when the program itself closed or reset the connection (its decision about the input, "
+            "as for any external peer), never because of a harness deadline or a send error the harness caused.",
     "HC05": "Harness code reads and writes only inside its own buffers.",
     "HC06": "Size 0 and large Size are handled; every length passed to a call is the real length.",
     "HC07": "Harness code has no undefined behaviour (uninitialized values, bad casts, data races it introduces).",
     "HC08": "The original program code does the acquisition, parsing and dispatch; the harness re-implements none of it.",
     "HC09": "The program is initialized the way it initializes itself (its real startup with a realistic configuration), once.",
-    "HC10": "The harness fabricates no protocol content: bytes not taken from Data are limited to transport setup.",
+    "HC10": "The harness fabricates no protocol content: bytes not taken from Data are limited to transport setup "
+            "and, for the peer_stream delivery, the context's fixed trigger (with {PEER_HOST}/{PEER_PORT} filled in), "
+            "which the contract requires.",
     "HC11": "Order matches a real peer: connect, deliver, let the program finish processing, close; the harness waits "
             "for processing to finish before it returns. For a stream that means waiting for the program to close "
             "the connection after the write side is shut down; returning after a silence window FAILS this check "
@@ -95,6 +99,23 @@ _WRITE_SCHEMA = {
     "required": ["code", "shape", "explanation", "persisting_program_state", "self_audit", "blockers"],
     "additionalProperties": False,
 }
+def review_problems(review: dict[str, Any]) -> list[str]:
+    """Why a review does not cover HC01..HC16 exactly once each ([] when it does)."""
+    ids = [str(check.get("check_id", "")) for check in review.get("checks") or []]
+    expected = set(CHECKS)
+    problems = []
+    missing = sorted(expected - set(ids))
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    unknown = sorted(set(ids) - expected)
+    if missing:
+        problems.append("missing " + ", ".join(missing))
+    if repeated:
+        problems.append("repeated " + ", ".join(repeated))
+    if unknown:
+        problems.append("unknown " + ", ".join(unknown))
+    return problems
+
+
 _REVIEW_SCHEMA = {
     "type": "object",
     "properties": {"checks": _AUDIT, "summary": {"type": "string"}},
@@ -116,8 +137,15 @@ _SHAPES = (
     "(in_process_server) Start the original program once inside the fuzzing process by calling "
     "hc_native_original_main on a background thread with the given command-line arguments, wait until it accepts "
     "input, then for every fuzz input act as one external peer on the real channel: for a stream, connect, send "
-    "Data, shut down the sending side, read replies until the program closes the connection or stays silent for a "
-    "short bounded time, close; for datagrams, send Data as one datagram and read replies for a short bounded "
+    "all Size bytes of Data (keep writing until every byte is sent; stop early only when the program itself "
+    "closes or resets the connection, which is its own decision about the input) while also reading whatever "
+    "the program sends in the meantime (wait for writable and readable together, e.g. one poll on both), so a "
+    "program that answers a request before it reads the next one is never blocked on a full reply buffer; then "
+    "shut down the sending side, "
+    "read replies until the program closes the connection, close. Do not put a wall-clock deadline or a silence "
+    "window on sending or on waiting for the close: a program that never finishes is a hang that the fuzzer's own "
+    "per-input timeout reports, while a harness that gives up first would truncate inputs or return before the "
+    "program processed them. For datagrams, send Data as one datagram and read replies for a short bounded "
     "time. Use this when the acquisition and processing functions are static or need the program's full startup.\n"
     "(wrapped_io) Create the program's own connection object through its real non-static constructor on a "
     "socketpair or pipe, write Data to the other end, and run the program's own processing loop until the input "
@@ -128,8 +156,10 @@ _SHAPES = (
     "address with an ephemeral port. For every input: connect to the program's endpoint, send the fixed trigger "
     "with {PEER_HOST} and {PEER_PORT} replaced by that listener's address and port (send nothing when the trigger "
     "is empty), accept the connection the program opens to the listener (bounded wait), write Data on it, shut "
-    "down its sending side, read on it until the program closes it, then read the trigger connection until the "
-    "program closes it, and close both."
+    "down its sending side, read on it until the program closes it, then shut down the sending side of the "
+    "trigger connection too (the client has nothing more to say; a program that reads further client input on "
+    "an error path otherwise waits for its own timeout, which the fuzzer records as a hang), read the trigger "
+    "connection until the program closes it, and close both."
 )
 
 _PEER_FRAMING = (
@@ -198,8 +228,9 @@ class MeasuredHarnessGenerator:
         executed = sorted({name for seed in seeds for name in seed.functions_beyond_baseline})
         return {
             "context_id": context["context_id"], "resource_kind": context.get("resource_kind"), "delivery": delivery,
-            "entries": [{k: e.get(k) for k in ("entry_function", "entry_file", "entry_line", "source_api", "channel_kind")}
-                        for e in context.get("entries", []) if e.get("delivery") == delivery],
+            "entries": [{k: e.get(k) for k in ("entry_function", "entry_file", "entry_line", "source_api",
+                                                "channel_kind", "delivery_candidates", "delivery_basis")}
+                        for e in context.get("entries", []) if entry_supports_delivery(context, e, delivery)],
             "driver_function": context.get("driver_function"),
             "interpreter_functions": context.get("interpreter_functions"),
             "original_program_arguments": server_args,
@@ -208,7 +239,8 @@ class MeasuredHarnessGenerator:
                              if delivery == "peer_stream" else
                              "The fuzz input is the byte stream itself, delivered unchanged.",
             **({"peer_trigger": first.messages[0].decode("latin-1") if first.messages else "",
-                "peer": [e.get("channel_kind") for e in context.get("entries", []) if e.get("delivery") == delivery]}
+                "peer": [e.get("channel_kind") for e in context.get("entries", [])
+                         if entry_supports_delivery(context, e, delivery)]}
                if delivery == "peer_stream" else {}),
             "verified_seed_count": len(seeds),
             "example_seed": {"messages": [m[:400].decode("latin-1") for m in first.messages][:8],
@@ -258,25 +290,26 @@ class MeasuredHarnessGenerator:
             f"Write the complete {language} source of the harness now. " + _CONTRACT + " " + _SHAPES + " "
             "Requirements: the fuzz input is the whole input one external peer sends on this channel (it may hold "
             "several requests); deliver it unchanged and add no protocol content of your own. Initialize once. For "
-            "in_process_server use the given original_program_arguments and endpoint, ignore SIGPIPE, bound every "
-            "wait so one input cannot hang, and return only after the program has finished processing the input. "
+            "in_process_server use the given original_program_arguments and endpoint, ignore SIGPIPE, bound the "
+            "startup and connection waits, and return only after the program has finished processing the input; "
+            "a program that never finishes an input is reported by the fuzzer's own per-input timeout. "
             "Do not add a fixed pause after an input to let background threads or timers of the program do work: "
             "a harness is executed many thousands of times, and only the processing of the delivered bytes has to "
             "be reproduced. Wait on an observable condition, never on a long constant. For a stream connection the "
             "condition is the program closing it: shut down the write side once the input is sent, then read "
-            "until recv() returns 0 (bounded by the overall deadline). A program that reads until the peer's "
+            "until recv() returns 0, with no deadline of the harness's own. A program that reads until the peer's "
             "end of input closes its side only after it has handled every request, so that is the one sign "
             "processing is finished. A silence window is NOT a completion condition: a program that writes a "
             "log line or a file per request can pause longer than any short window, the harness then returns "
             "while the program is still working, and a fault it hits afterwards is charged to the next input. "
-            "Measured on LightFTP: a 100 ms silence window let 598 inputs that overflow a stack buffer into the "
+            "Measured on one daemon: a 100 ms silence window let 598 inputs that fault the program into the "
             "corpus as non-crashing, and the fuzzer died on them at every restart (285 restarts in 2.5 h). Use "
             "silence only for a program that keeps the connection open after the peer's end of input, and say "
             "so in persisting_program_state. This waiting rule is for delivering an input only. A readiness "
             "check at startup needs nothing but an accepted connection (and the greeting, if the program sends "
             "one): close it at once. A server that greets and then waits for a command never closes that probe "
             "connection, so waiting there for the close costs the whole deadline on every start -- measured on "
-            "LightFTP: 10.0 s per start instead of 0.006 s, paid again by every fuzzer restart and every "
+            "one daemon: 10.0 s per start instead of 0.006 s, paid again by every fuzzer restart and every "
             "single-input replay. "
             "Name in persisting_program_state any program state that survives from one input to the next. Fill "
             "self_audit with one entry for each of HC01..HC16 as described in checks. Return code even when you "
@@ -416,6 +449,20 @@ def covering_seeds(seeds: list[Any]) -> list[Any]:
     return chosen
 
 
+EQUIVALENCE_SEED_LIMIT = 40
+
+
+def equivalence_seeds(seeds: list[Any], limit: int = EQUIVALENCE_SEED_LIMIT) -> list[Any]:
+    """The seeds whose function equivalence is measured: every verified seed, up to `limit`.
+
+    The covering seeds come first.  Covering function names alone kept one seed of several that
+    executed the same functions along different lines (LightFTP: 1 of 4), and the others were
+    never compared with the original; seeds left out by the limit are counted, not hidden."""
+    chosen = covering_seeds(seeds)
+    chosen += [seed for seed in seeds if seed not in chosen][:max(0, limit - len(chosen))]
+    return chosen
+
+
 def equivalence(binary: Path, seeds: list[Any]) -> list[dict[str, Any]]:
     previous = os.environ.get("ASAN_OPTIONS")
     os.environ["ASAN_OPTIONS"] = "detect_leaks=0"
@@ -444,7 +491,15 @@ async def _unit(context: dict[str, Any], delivery: str, *, settings: Any, store:
         "resource_kind": context.get("resource_kind"), "generated": False, "review_passed": False, "built": False,
         "seeds_available": len(seeds), "seeds_replayed": 0, "seeds_replay_ok": 0, "status": STATUS_NO_CODE,
         "reason": "", "qualified": False, "attempt": None, "attempts": [], "notes": list(skipped)}
-    entries = [e for e in context.get("entries", []) if e.get("delivery") == delivery]
+    entries = [e for e in context.get("entries", []) if entry_supports_delivery(context, e, delivery)]
+    # A delivery taken from an Entry's open candidates is a measured trial, not
+    # an established fact about the Entry; the row says which one it was.
+    row["entry_deliveries"] = [
+        {"entry_function": e.get("entry_function"), "recorded_delivery": e.get("delivery"),
+         "delivery_candidates": e.get("delivery_candidates") or [e.get("delivery")],
+         "delivery_basis": e.get("delivery_basis", ""),
+         "established": e.get("delivery") == delivery and len(e.get("delivery_candidates") or [1]) <= 1}
+        for e in entries]
     if not seeds or not entries:
         row["reason"] = ("no verified seed exists for this context and delivery" if not seeds
                          else "the context has no Entry with this delivery")
@@ -464,11 +519,19 @@ async def _unit(context: dict[str, Any], delivery: str, *, settings: Any, store:
     brief = generator._brief(context, delivery, seeds, server_args, host, port)
     store.write_json(unit_dir / "brief.json", brief)
     session = f"harness_generator:measured:{name}"
-    measured = covering_seeds(seeds)
+    measured = equivalence_seeds(seeds)
     feedback: list[str] = []
     previous_missing: list[str] | None = None
     try:
-        opened = await generator.read(session, brief, queue)
+        try:
+            opened = await generator.read(session, brief, queue)
+        except Exception as exc:
+            # A refused or lost source-reading session (measured on 3proxy: a provider
+            # content filter on the first turn) must leave a status row like any other
+            # blocked unit, not abort every later context of the stage.
+            row["reason"] = f"harness generator source reading raised {type(exc).__name__}: {exc}"
+            store.write_json(unit_dir / "status.json", row)
+            return row
         store.write_json(unit_dir / "opened-functions.json", [functions[f].name for f in opened])
         for number in range(1, settings.attempts + 1):
             attempt = unit_dir / f"attempt-{number}"
@@ -492,15 +555,26 @@ async def _unit(context: dict[str, Any], delivery: str, *, settings: Any, store:
             record["generated"] = True
             record["shape"] = draft.get("shape")
 
-            try:
-                review = await generator.review(f"harness_verifier:measured:{name}:{number}", brief, code, draft)
-            except Exception as exc:
-                review = {"checks": [], "summary": f"review raised {type(exc).__name__}: {exc}"}
+            review, incomplete = {}, ["no review"]
+            for turn in ("", ":retry"):           # an incomplete review is asked once more
+                try:
+                    review = await generator.review(f"harness_verifier:measured:{name}:{number}{turn}", brief, code,
+                                                    draft)
+                except Exception as exc:
+                    review = {"checks": [], "summary": f"review raised {type(exc).__name__}: {exc}"}
+                incomplete = review_problems(review)
+                if not incomplete:
+                    break
             store.write_json(attempt / "independent-review.json", review)
             failed_checks = [c for c in review.get("checks", []) if c.get("status") == "FAIL"]
-            record["review_passed"] = bool(review.get("checks")) and not failed_checks
-            record["review_failed_checks"] = [c.get("check_id") for c in failed_checks]
             review_feedback = [f"Independent review {c.get('check_id')} FAIL: {c.get('evidence')}" for c in failed_checks]
+            if incomplete:
+                # Not a pass: a review that skipped, repeated or invented checks did not examine the draft.
+                record["review_incomplete"] = incomplete
+                failed_checks = failed_checks + [{"check_id": "REVIEW_INCOMPLETE", "status": "FAIL",
+                                                  "evidence": "; ".join(incomplete)}]
+            record["review_passed"] = not failed_checks
+            record["review_failed_checks"] = [c.get("check_id") for c in failed_checks]
 
             if not settings.build:
                 record["status"] = bridge.STATUS_GENERATED_NOT_BUILT
@@ -557,11 +631,17 @@ async def _unit(context: dict[str, Any], delivery: str, *, settings: Any, store:
             usable = [item for item in measured_results if item["measured"]]
             missing = sorted({name for item in usable for name in item["missing"]})
             expected = {name for seed in measured for name in seed.functions_beyond_baseline}
+            with_functions = [seed for seed in seeds if seed.functions_beyond_baseline]
             store.write_json(attempt / "seed-equivalence.json", {
+                "seeds_verified": len(seeds), "seeds_with_functions_beyond_baseline": len(with_functions),
                 "seeds_measured": len(usable), "seeds_selected": len(measured),
+                "seeds_not_measured": len(with_functions) - len(usable),
                 "original_functions": len(expected), "missing_in_harness": missing, "results": measured_results,
-                "note": "seeds chosen to cover every function any verified seed executed on the original"})
+                "note": (f"every verified seed up to {EQUIVALENCE_SEED_LIMIT}, the covering seeds first; each result "
+                         "compares that seed's own functions beyond the run with no input. Function names are "
+                         "compared, so two static functions of one name in different files are not told apart.")})
             record["seed_equivalence"] = {"seeds_measured": len(usable), "original_functions": len(expected),
+                                          "seeds_not_measured": len(with_functions) - len(usable),
                                           "missing_in_harness": len(missing)}
             if not usable:
                 record["status"] = STATUS_REPLAYED
