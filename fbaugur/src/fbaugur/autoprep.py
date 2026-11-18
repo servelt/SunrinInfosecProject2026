@@ -42,7 +42,8 @@ You cannot use sudo; if a system package is missing, say exactly which in your f
 Deliver two files, written by you:
 
 1. {work}/profile/prepare.sh -- a bash script that, run with `bash prepare.sh` from {work} with
-   environment WORK={work}, PROFILE={work}/profile, HC=<HarnessCreator root>, PY=<python>, builds
+   environment WORK={work}, PROFILE={work}/profile, HC=<HarnessCreator root>, PY=<python>,
+   MSAN_LIBS=<shared MemorySanitizer library cache>, MSAN_CC=<clang for MSan>, builds
    everything below from the clean source and prints a line "[prep] <short Korean step name>" before
    each step (they become the progress bar). `set -eu`, idempotent (it may run again on the same WORK),
    build output into log files, not the terminal. It must produce:
@@ -64,6 +65,18 @@ Deliver two files, written by you:
    d. $WORK/daemon-asan/: clang -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined, linked -no-pie.
    e. $WORK/daemon-msan/: the newest clang-NN >= 18 found (clang-20, ...) with -fsanitize=memory
       -fsanitize-memory-track-origins=2 (optional: skip if no such clang or the build cannot do it).
+      MemorySanitizer only sees memory written by instrumented code: EVERY library the program links,
+      other than the C runtime (libc, libm, libdl, libpthread, librt, ld-linux, libgcc_s), must also be
+      built with -fsanitize=memory, or each value it returns is reported as uninitialised (a system
+      libcrypto.so fails at startup). Bundled libraries: build them with the same flags. System
+      libraries (OpenSSL, libyang, libxml2, zlib, ...): build each from its upstream source at the
+      version installed on this machine, with $MSAN_CC -fsanitize=memory (and its no-assembly option,
+      e.g. OpenSSL `no-asm enable-msan`; assembly is invisible to MemorySanitizer), installed into the
+      shared cache $MSAN_LIBS/<library>-<version>/ (include/, lib/), static libraries preferred. Reuse a
+      cache directory that already exists; other targets share it. Write a file
+      $MSAN_LIBS/<library>-<version>/BUILT with the configure command when a build finished. Link the
+      MSan daemon and build_harness.sh (when SANITIZER=memory) against the cached libraries, never the
+      system ones. If a dependency cannot be built this way, skip the MSan variant and say which.
    f. $WORK/daemon-plain/: gcc -O2, no sanitizers.
    g. $WORK/run/: whatever the program needs to start as a server on the loopback: a minimal
       configuration file (listen on 127.0.0.1, a fixed TCP port that nothing else uses, foreground /
@@ -85,7 +98,8 @@ Deliver two files, written by you:
         - compile the file that defines the program's main() with $MAIN_RENAME added;
         - compile HARNESS with $CC $CFLAGS and the program's include flags, and link it with all the
           program's objects and libraries (system libraries such as -lssl included) as
-          `$CXX $CFLAGS <objects> <libraries> $LIB_FUZZING_ENGINE -o OUT`;
+          `$CC $CFLAGS <objects> <libraries> $LIB_FUZZING_ENGINE -o OUT` ($CXX instead only for a
+          C++ program; it adds libstdc++, which MemorySanitizer cannot see into);
         - write nothing outside $BUILD_DIR and OUT, and print the build output (errors must be visible).
       Occulta checks it with a harness that does nothing; the result must run.
 
@@ -115,7 +129,7 @@ The program's main network input is what will be fuzzed: choose the listener a r
 use "--channel", "stdin" or "file" (with {{input_file}} in the commands) and no --port/--daemon-* args.
 
 Work method: read the build files and docs first, then write prepare.sh, run it (`cd {work} && WORK={work}
-PROFILE={work}/profile HC={hc} PY={py} bash profile/prepare.sh`), fix what fails, and run it again until
+PROFILE={work}/profile HC={hc} PY={py} MSAN_LIBS={msan_libs} MSAN_CC={msan_cc} bash profile/prepare.sh`), fix what fails, and run it again until
 it passes. Then start the coverage build with its command, check the port accepts a connection, stop it
 with SIGTERM and check .gcda files appeared under $WORK/cov. When everything works, end with a short
 summary: build system, binary, port, configuration, anything you skipped and why.
@@ -257,10 +271,54 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
         for key in ("--daemon-command", "--daemon-plain-command", "--daemon-msan-command",
                     "--thread-trace-command"):
             if key in opt:
+                if key == "--daemon-msan-command":
+                    problems += _uninstrumented_libraries(Path(shlex.split(opt[key])[0]), "the MSan daemon")
                 r = _start_and_stop(opt[key], opt.get("--daemon-cwd", str(work)), port, key=session_key)
                 if not r["listening"]:
                     problems.append(f"{key} did not accept a connection on port {port}: {r['output'][-600:]}")
     return problems
+
+
+_C_RUNTIME = re.compile(r"^(linux-vdso|libc|libm|libdl|libpthread|librt|libutil|libresolv|ld-linux[^ ]*|libgcc_s)"
+                        r"\.so")
+
+
+def msan_cc() -> str:
+    """The newest clang-NN >= 18 on PATH (older ones cannot start MSan on this kernel)."""
+    for n in range(30, 17, -1):
+        if shutil.which(f"clang-{n}"):
+            return f"clang-{n}"
+    return "clang"
+
+
+def msan_libs_dir() -> Path:
+    """Shared cache of libraries built with MemorySanitizer, for every target."""
+    return Path(os.environ.get("OCCULTA_HOME", Path.home() / ".occulta")) / "msan-libs"
+
+
+def _uninstrumented_libraries(binary: Path, what: str, allow: tuple[str, ...] = ()) -> list[str]:
+    """A MemorySanitizer binary must load no shared library built without it, other than the C
+    runtime the sanitizer intercepts: values such a library writes look uninitialised (goahead: the
+    system libcrypto.so.3 in BIO_new_file, before any input).  Libraries resolved from the shared
+    MSan cache are instrumented by construction."""
+    try:
+        out = subprocess.run(["ldd", str(binary)], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"cannot list the shared libraries of {binary}: {exc}"]
+    cache = str(msan_libs_dir().resolve())
+    bad = []
+    for line in out.splitlines():
+        line = line.strip()
+        name = line.split()[0] if line else ""
+        if not name or _C_RUNTIME.match(Path(name).name) or Path(name).name.startswith(allow or ("\0",)):
+            continue
+        path = line.split("=>")[1].split("(")[0].strip() if "=>" in line else name
+        if not str(Path(path).resolve()).startswith(cache + "/"):
+            bad.append(f"{name} ({path})")
+    if not bad:
+        return []
+    return [f"{what} loads shared libraries not built with MemorySanitizer: {', '.join(bad)}. Build them "
+            f"with -fsanitize=memory into {cache}/<library>-<version>/ and link those (static preferred)"]
 
 
 _EMPTY_HARNESS = (
@@ -292,6 +350,11 @@ def check_harness_script(work: Path, env: dict[str, str], opt: dict[str, str]) -
             problems.append(f"build_harness.sh did not build a {sanitizer} harness: "
                             f"{(run.stdout + run.stderr).strip()[-2000:]}")
             continue
+        if sanitizer == "memory":
+            # libFuzzer's own runtime links libstdc++ into every harness (also of a C program); it
+            # does not touch program data.  A C++ program's libstdc++ is caught on its MSan daemon.
+            problems += _uninstrumented_libraries(binary, "the memory harness built by build_harness.sh",
+                                                  allow=("libstdc++.so",))
         ran = subprocess.run([str(binary), "-runs=10"], capture_output=True, text=True, timeout=300,
                              stdin=subprocess.DEVNULL)
         if ran.returncode != 0:
@@ -318,10 +381,11 @@ class AutoPrep:
     @property
     def env(self) -> dict[str, str]:
         return dict(os.environ, WORK=str(self.work), PROFILE=str(self.work / "profile"), HC=str(self.hc),
-                    PY=self.python)
+                    PY=self.python, MSAN_LIBS=str(msan_libs_dir()), MSAN_CC=msan_cc())
 
     def task(self) -> str:
         return TASK.format(work=self.work, repo=self.repo, name=self.name, hc=self.hc, py=self.python,
+                           msan_libs=msan_libs_dir(), msan_cc=msan_cc(),
                            ref_profile=_read(REFERENCE / "profile.json"),
                            ref_prepare=_read(REFERENCE / "prepare.sh"), ref_build=_read(REFERENCE / "build.sh"))
 

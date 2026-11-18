@@ -336,6 +336,8 @@ def run_harness_script(
     env = dict(os.environ, CC=cc, CXX=cxx, CFLAGS=flags, CXXFLAGS=flags,
                LIB_FUZZING_ENGINE=shlex.join(engine), SANITIZER=sanitizer, BUILD_DIR=str(build_dir),
                MAIN_RENAME="-Dmain=hc_native_original_main")
+    # Libraries built with MemorySanitizer, shared by every target (see fbaugur.autoprep).
+    env.setdefault("MSAN_LIBS", str(Path(os.environ.get("OCCULTA_HOME", Path.home() / ".occulta")) / "msan-libs"))
     argv = ["bash", str(script), str(source), str(harness), str(binary)]
     if plan is not None and plan_file is not None:
         plan.update(builder="profile-harness-script", harness_build_script=str(script), link_command=argv,

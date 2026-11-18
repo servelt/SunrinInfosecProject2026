@@ -455,7 +455,9 @@ class Sessions:
                 found = self._auto_prepare(sid, session, work, hc_root)
                 prepared = True       # the check already ran prepare.sh on this WORK
             profile_dir, profile = found
-            env = dict(os.environ, WORK=str(work), PROFILE=str(profile_dir), PY=self.python, HC=str(hc_root))
+            from ..autoprep import msan_cc, msan_libs_dir
+            env = dict(os.environ, WORK=str(work), PROFILE=str(profile_dir), PY=self.python, HC=str(hc_root),
+                       MSAN_LIBS=str(msan_libs_dir()), MSAN_CC=msan_cc())
             if not prepared:
                 proc = proctrack.spawn(sid, ["bash", str(profile_dir / profile["prepare"])], cwd=str(work), env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
