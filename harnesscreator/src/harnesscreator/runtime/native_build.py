@@ -93,6 +93,29 @@ def _relative(path: Path, root: Path | None) -> str | None:
         return None
 
 
+_RUNTIME_LIBS = re.compile(r"^(libc|libm|libdl|libpthread|librt|libutil|ld-linux.*|libgcc_s|libstdc\+\+)\.so")
+
+
+def _needed_libraries(target_binary: Path, build_tree: Path) -> list[str]:
+    """Link flags for the shared libraries named in the binary's DT_NEEDED entries. A library
+    built inside the project's tree is linked by path with an rpath; a system one by -l:name."""
+    try:
+        out = subprocess.run(["readelf", "-d", str(target_binary)], capture_output=True,
+                             text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    flags: list[str] = []
+    for name in re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", out):
+        if _RUNTIME_LIBS.match(name):
+            continue
+        local = next(iter(sorted(build_tree.rglob(name), key=lambda p: len(p.parts))), None)
+        if local is not None:
+            flags += [str(local), f"-Wl,-rpath,{local.parent}"]
+        else:
+            flags.append(f"-l:{name}")
+    return flags
+
+
 def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[SourceUnit], Path | None]:
     """Translation units the executable was linked from, read from its DWARF compile units.
 
@@ -367,6 +390,9 @@ def build_native(
             archives.setdefault(archive.name, archive)
         if archives:
             extra_link_flags = ["-Wl,--start-group", *(str(a) for a in archives.values()), "-Wl,--end-group"]
+        # Shared libraries the target loads (OpenSSL, libyang, ...) are recorded in its DT_NEEDED
+        # entries, not in any compile unit; link the same ones so their symbols resolve.
+        extra_link_flags += _needed_libraries(target_binary, build_tree)
     elif selected_target is not None:
         # CMake may compile the SAME source for several executable targets
         # with different macros, include directories, and ABI flags. Selecting
