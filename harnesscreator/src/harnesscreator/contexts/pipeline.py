@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import time
 from pathlib import Path
@@ -67,6 +68,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                        help="the program as the project's own build linked it, compiled with -g.  Its debug "
                             "information names the translation units it was linked from; the harness is built "
                             "from exactly those (needed when the compile database holds several programs)")
+    group.add_argument("--harness-build-script", type=Path, default=None, metavar="PATH",
+                       help="the profile's harness build recipe; sets HARNESSCREATOR_HARNESS_BUILD_SCRIPT")
     group.add_argument("--harness-attempts", type=int, default=3,
                        help="harness generation attempts per context and channel (default: 3)")
 
@@ -239,6 +242,8 @@ async def run_after_entries(args: argparse.Namespace, run_dir: Path, entry_count
             stages._log(f"[WORKFLOW] 3.{index} harness for {context_id} over {channel}: skipped, no verified input")
             save()
             continue
+        if getattr(args, "harness_build_script", None):
+            os.environ["HARNESSCREATOR_HARNESS_BUILD_SCRIPT"] = str(Path(args.harness_build_script).resolve())
         code, error = await stage(f"3.{index} harness for {context_id} over {channel} ({index}/{len(units)})",
                                   stages._harness(argparse.Namespace(
             run_dir=run_dir, context=[context_id], delivery=delivery, source=None, compile_database=None,

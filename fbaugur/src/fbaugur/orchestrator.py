@@ -787,7 +787,8 @@ class Run:
                 continue
             mapping = line_map.get(str(path))
             if mapping is None:                      # the report may print a relative path
-                mapping = next((m for key, m in line_map.items() if key.endswith(str(path))), None)
+                mapping = next((m for key, m in line_map.items() if key.endswith(str(path))
+                                or str(path).endswith("/" + key)), None)
             if mapping is None:
                 continue
             num = mapping.get(int(line)) or mapping.get(str(int(line)))

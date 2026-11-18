@@ -70,6 +70,25 @@ Deliver two files, written by you:
       no daemonizing, no privilege drop, logs and pid files under $WORK/run, no authentication
       unless the program cannot run without it). Generate it from a template in $PROFILE if needed.
 
+   h. {work}/profile/build_harness.sh -- the recipe that builds a libFuzzer harness against the
+      program, used for every harness build later (OSS-Fuzz's build.sh contract). It is called as
+      `bash build_harness.sh SRC HARNESS OUT` with environment CC, CXX, CFLAGS, CXXFLAGS (sanitizer and
+      -fsanitize=fuzzer-no-link already in them), LIB_FUZZING_ENGINE (the final link flags),
+      MAIN_RENAME (`-Dmain=hc_native_original_main`), BUILD_DIR (an empty scratch directory) and
+      SANITIZER (address+undefined or memory). SRC is a tree laid out like $WORK/analysis (possibly a
+      copy with some .c files edited): treat it as read-only and build under $BUILD_DIR (copy SRC there
+      first if the build system writes into its tree). It must:
+        - build the server program from SRC exactly as the analysis build does (same configure options,
+          same defines, same bundled libraries), but with $CC/$CXX and $CFLAGS for EVERY object,
+          including bundled libraries (a MemorySanitizer binary with one uninstrumented library reports
+          false errors), and with a fresh configure/build directory (never reuse objects of other builds);
+        - compile the file that defines the program's main() with $MAIN_RENAME added;
+        - compile HARNESS with $CC $CFLAGS and the program's include flags, and link it with all the
+          program's objects and libraries (system libraries such as -lssl included) as
+          `$CXX $CFLAGS <objects> <libraries> $LIB_FUZZING_ENGINE -o OUT`;
+        - write nothing outside $BUILD_DIR and OUT, and print the build output (errors must be visible).
+      Occulta checks it with a harness that does nothing; the result must run.
+
 2. {work}/profile/profile.json -- exactly this shape (paths written with {{WORK}}, replaced later):
 {{
   "name": "{name}",
@@ -83,6 +102,7 @@ Deliver two files, written by you:
     "--thread-trace-command", "{{WORK}}/trace/<binary> <same args>",          (omit both if no trace build)
     "--analysis-compile-database", "{{WORK}}/analysis/compile_commands.json",
     "--harness-link-binary", "{{WORK}}/analysis/<path to the server binary the analysis build made>",
+    "--harness-build-script", "{{PROFILE}}/build_harness.sh",
     "--port", "<port>", "--channel", "tcp",
     "--daemon-command", "{{WORK}}/daemon-asan/<binary> <args>",
     "--daemon-msan-command", "{{WORK}}/daemon-msan/<binary> <args>",          (omit both if no msan build)
@@ -180,10 +200,11 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
             return [f"prepare.sh failed (exit {run.returncode}): {(run.stdout + run.stderr).strip()[-1500:]}"]
         if not re.search(r"^\[prep\] ", run.stdout, re.M):
             problems.append("prepare.sh printed no '[prep] ...' step lines")
-    args = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
+    args = [a.replace("{WORK}", str(work)).replace("{PROFILE}", str(work / "profile"))
+            for a in profile.get("pipeline_args", [])]
     opt = {args[i]: args[i + 1] for i in range(len(args) - 1) if args[i].startswith("--")}
     for key in ("--coverage-root", "--coverage-command", "--analysis-compile-database", "--channel",
-                "--harness-link-binary"):
+                "--harness-link-binary", "--harness-build-script"):
         if key not in opt:
             problems.append(f"pipeline_args has no {key}")
     if problems:
@@ -195,6 +216,8 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
         sections = subprocess.run(["readelf", "-S", str(link)], capture_output=True, text=True).stdout
         if ".debug_info" not in sections:
             problems.append(f"--harness-link-binary {link} has no debug information; build it with -g")
+    if not problems:
+        problems += check_harness_script(work, env, opt)
     try:
         entries = json.loads(Path(opt["--analysis-compile-database"]).read_text(encoding="utf-8"))
         if not entries:
@@ -237,6 +260,43 @@ def check_profile(work: Path, env: dict[str, str], *, rebuild: bool = True,
                 r = _start_and_stop(opt[key], opt.get("--daemon-cwd", str(work)), port, key=session_key)
                 if not r["listening"]:
                     problems.append(f"{key} did not accept a connection on port {port}: {r['output'][-600:]}")
+    return problems
+
+
+_EMPTY_HARNESS = (
+    "#include <stddef.h>\n#include <stdint.h>\n"
+    "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { (void)data; (void)size; return 0; }\n")
+
+
+def check_harness_script(work: Path, env: dict[str, str], opt: dict[str, str]) -> list[str]:
+    """Build a harness that does nothing through the profile's recipe, the way every later harness
+    is built, once per sanitizer the scan uses, and run it once."""
+    problems: list[str] = []
+    sanitizers = ["address+undefined"] + (["memory"] if "--daemon-msan-command" in opt else [])
+    scratch = work / "harness-check"
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True)
+    harness = scratch / "empty_harness.c"
+    harness.write_text(_EMPTY_HARNESS, encoding="utf-8")
+    for sanitizer in sanitizers:
+        out = scratch / sanitizer.replace("+", "-")
+        argv = [env.get("PY") or "python3", "-m", "harnesscreator.runtime.native_build",
+                "--source-root", str(work / "source"), "--harness", str(harness), "--output", str(out),
+                "--compile-database", opt["--analysis-compile-database"],
+                "--target-binary", opt["--harness-link-binary"], "--build-script", opt["--harness-build-script"]]
+        run = subprocess.run(argv, env=dict(env, PYTHONPATH=str(Path(env.get("HC", ".")) / "src"),
+                                            HARNESSCREATOR_NATIVE_SANITIZER=sanitizer),
+                             capture_output=True, text=True, timeout=7200)
+        binary = out / "hc-native-fuzzer"
+        if run.returncode != 0 or not binary.is_file():
+            problems.append(f"build_harness.sh did not build a {sanitizer} harness: "
+                            f"{(run.stdout + run.stderr).strip()[-2000:]}")
+            continue
+        ran = subprocess.run([str(binary), "-runs=10"], capture_output=True, text=True, timeout=300,
+                             stdin=subprocess.DEVNULL)
+        if ran.returncode != 0:
+            problems.append(f"the {sanitizer} harness built by build_harness.sh does not run "
+                            f"(exit {ran.returncode}): {ran.stderr[-1500:]}")
     return problems
 
 

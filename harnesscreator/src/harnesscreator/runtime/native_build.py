@@ -322,10 +322,47 @@ def _compilers(sanitizer: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def run_harness_script(
+    script: Path, source: Path, harness: Path, binary: Path, *, cc: str, cxx: str, cflags: list[str],
+    engine: list[str], sanitizer: str, plan: dict | None = None, plan_file: Path | None = None,
+) -> None:
+    """Run the profile's harness build recipe: `script SRC HARNESS OUT` with the OSS-Fuzz style
+    environment (CC, CXX, CFLAGS, CXXFLAGS, LIB_FUZZING_ENGINE).  SRC is read-only to it; it builds
+    under BUILD_DIR.  The recipe was written by whoever prepared the profile, who knows how the
+    program builds and links; nothing here guesses at libraries, archives or link order."""
+    build_dir = binary.parent / ".harness-build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    flags = shlex.join(cflags)
+    env = dict(os.environ, CC=cc, CXX=cxx, CFLAGS=flags, CXXFLAGS=flags,
+               LIB_FUZZING_ENGINE=shlex.join(engine), SANITIZER=sanitizer, BUILD_DIR=str(build_dir),
+               MAIN_RENAME="-Dmain=hc_native_original_main")
+    argv = ["bash", str(script), str(source), str(harness), str(binary)]
+    if plan is not None and plan_file is not None:
+        plan.update(builder="profile-harness-script", harness_build_script=str(script), link_command=argv,
+                    build_environment={k: env[k] for k in ("CC", "CXX", "CFLAGS", "LIB_FUZZING_ENGINE", "SANITIZER",
+                                                           "BUILD_DIR", "MAIN_RENAME")})
+        plan_file.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    binary.unlink(missing_ok=True)
+    try:
+        result = subprocess.run(argv, cwd=build_dir, env=env, text=True, capture_output=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NativeBuildUnresolved(f"harness build script failed to run: {exc}") from exc
+    output = (result.stdout + result.stderr)[-14000:]
+    (build_dir / "build.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode == 0 and binary.is_file():
+        return
+    # Errors inside the generated harness can be fixed by another draft; others are the recipe's.
+    if re.search(rf"{re.escape(str(harness))}:\d+:\d+: error", output):
+        raise NativeBuildUnresolved(f"compilation failed for {harness} (exit {result.returncode}):\n{output}")
+    if "undefined reference" in output or "undefined symbol" in output:
+        raise NativeBuildUnresolved(f"link failed (exit {result.returncode}) in {script}:\n{output}")
+    raise NativeBuildUnresolved(f"harness build script {script} failed (exit {result.returncode}):\n{output}")
+
+
 def build_native(
     source_root: Path, harness: Path, output: Path,
     *, compile_database: Path | None = None, target_binary: Path | None = None,
-    archive_root: Path | None = None,
+    archive_root: Path | None = None, build_script: Path | None = None,
 ) -> Path:
     """`archive_root`: where the static archives of libraries built without -g are taken from
     (default: the build tree the compile database records).  A sanitizer build must take them from
@@ -544,6 +581,23 @@ def build_native(
         "compile_commands": [],
     }
     plan_file = scratch / "build-plan.json"
+    script = build_script or (Path(os.environ["HARNESSCREATOR_HARNESS_BUILD_SCRIPT"])
+                              if os.environ.get("HARNESSCREATOR_HARNESS_BUILD_SCRIPT") else None)
+    if script is not None:
+        # The project's own recipe (written and checked when the profile was prepared) builds the
+        # harness; the plan above only records which sources and flags the program compiles with.
+        for unit in units:
+            argv = [cc if unit.source.suffix.lower() == ".c" else (cxx or cc), *compile_prefix]
+            for include_dir in source_include_dirs:
+                argv.extend(["-I", include_dir])
+            argv.extend([*unit.flags, "-c", str(unit.source), "-o", "/dev/null"])
+            plan["compile_commands"].append(argv)
+        engine = [f"-fsanitize={link_sanitizer}", *sanitizer_flags]
+        if sanitizer != "memory" and sys.platform == "linux" and "microsoft" in os.uname().release.casefold():
+            engine.append("-no-pie")
+        run_harness_script(Path(script), root, harness, binary, cc=cc, cxx=cxx or cc,
+                           cflags=compile_prefix, engine=engine, sanitizer=sanitizer, plan=plan, plan_file=plan_file)
+        return binary
     for idx, unit in enumerate(inputs):
         obj = scratch / f"source-{idx}.o"
         compiler = cxx if unit.source.suffix.lower() != ".c" else cc
@@ -603,6 +657,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-binary", type=Path)
     parser.add_argument("--archive-root", type=Path,
                         help="take static archives of libraries built without -g from this build tree")
+    parser.add_argument("--build-script", type=Path,
+                        help="the profile's harness build recipe (overrides HARNESSCREATOR_HARNESS_BUILD_SCRIPT)")
     args = parser.parse_args(argv)
     try:
         path = build_native(
@@ -610,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
             compile_database=args.compile_database,
             target_binary=args.target_binary,
             archive_root=args.archive_root,
+            build_script=args.build_script,
         )
     except (OSError, NativeBuildUnresolved) as exc:
         print(f"NATIVE_BUILD_UNRESOLVED: {exc}", file=sys.stderr)

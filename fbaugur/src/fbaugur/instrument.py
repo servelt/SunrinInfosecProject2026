@@ -480,6 +480,9 @@ class InvariantBuilder:
         binary = root / "out" / "hc-native-fuzzer"
         # Keyed by the absolute path the compiler and the sanitizers print.
         absolute_maps = {str(src / rel): mapping for rel, mapping in line_maps.items()}
+        # A profile's harness recipe may compile a copy of SRC; its reports then name the file by
+        # a different prefix, and the relative key still matches (see _blame_instrumentation).
+        absolute_maps.update(line_maps)
         (root / "line-map.json").write_text(
             json.dumps({path: {str(k): v for k, v in mapping.items()}
                         for path, mapping in absolute_maps.items()}, indent=2), encoding="utf-8")
@@ -487,8 +490,8 @@ class InvariantBuilder:
             return BuildResult(True, binary, "", [], absolute_maps)
         failing = set()
         for rel, mapping in line_maps.items():
-            name = re.escape(str((src / rel)))
-            for match in re.finditer(rf"{name}:(\d+):\d+: error", output):
+            name = re.escape(rel)
+            for match in re.finditer(rf"(?:^|/){name}:(\d+):\d+: error", output, re.M):
                 line = int(match.group(1))
                 if line in mapping:
                     failing.add(mapping[line])

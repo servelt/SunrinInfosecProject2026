@@ -383,7 +383,8 @@ class Sessions:
         # The scan's time limit governs stage 1 (half of it); a stage-1 cap written into a profile
         # (earlier auto-prepared profiles copied "--harness-max-minutes 55" from the example) would
         # cut harness generation off whatever limit the scan was started with.
-        extra = [a.replace("{WORK}", str(work)) for a in profile.get("pipeline_args", [])]
+        extra = [a.replace("{WORK}", str(work)).replace("{PROFILE}", str(profile_dir))
+                 for a in profile.get("pipeline_args", [])]
         for i, a in enumerate(extra):
             if a == "--harness-max-minutes":
                 del extra[i:i + 2]

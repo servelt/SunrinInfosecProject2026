@@ -49,6 +49,10 @@ def add_arguments(parser) -> None:
     harness.add_argument("--harness-link-binary", type=Path,
                          help="the program as its own build linked it (with -g); the harness is built from "
                               "the translation units its debug information names")
+    harness.add_argument("--harness-build-script", type=Path,
+                         help="the profile's harness build recipe (SRC HARNESS OUT, OSS-Fuzz style CC/CFLAGS/"
+                              "LIB_FUZZING_ENGINE); every harness, invariant and MSan build runs it instead of "
+                              "reconstructing the program's link")
     harness.add_argument("--require-fuzz-introspector", action="store_true",
                          help="require Fuzz Introspector (default: allow source indexing, which is "
                               "enough for a small program)")
@@ -241,6 +245,9 @@ def report_stage1(run_dir: Path, emit) -> list[tuple[str, str]]:
 
 
 async def run(args, emit) -> int:
+    if getattr(args, "harness_build_script", None):
+        # Read by harnesscreator's native builder in stage 1 and in every stage-2 rebuild.
+        os.environ["HARNESSCREATOR_HARNESS_BUILD_SCRIPT"] = str(args.harness_build_script.resolve())
     from .config import PROVIDER_MODELS, RunConfig
     from .orchestrator import Run
 
