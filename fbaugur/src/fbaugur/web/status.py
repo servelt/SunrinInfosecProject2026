@@ -530,9 +530,10 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
         if delta:
             # A delta scan has no Direction step: the diff takes its place (changed functions in batches).
             st["dr"] = state(False, bool(delta_changes))
-            st["spg"] = state("delta_sp_generator" in roles,
-                              bool(sps) or (bool(delta_runs) and "delta_sp_generator" not in roles and
-                                            (drained or finished)))
+            pool_done = _q(conn, "SELECT COUNT(*) AS n FROM pool WHERE status NOT IN ('pending','analysing')")
+            st["spg"] = state(bool({"sp_generator", "delta_sp_generator"} & roles.keys()) or (live and open_pool),
+                              bool(sps) or (not open_pool and bool(pool_done and pool_done[0]["n"]) or
+                                            (bool(delta_runs) and (drained or finished))))
         else:
             st["dr"] = state("direction" in roles, bool(directions))
             st["spg"] = state(bool({"sp_generator", "delta_sp_generator"} & roles.keys()) or (live and open_pool and not drained), bool(sps))
@@ -570,11 +571,10 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
             per_file: dict[str, int] = {}
             for c in changes:
                 per_file[c.get("file", "")] = per_file.get(c.get("file", ""), 0) + 1
-            batches = max((int(m.group(2)) for r in delta_runs
-                           for m in [re.search(r"delta (\d+)/(\d+)", r["subject"] or "")] if m), default=0)
-            done_runs = sum(1 for r in delta_runs if r["status"] != "running")
+            pool_all = _q(conn, "SELECT status FROM pool WHERE direction_id='delta'")
+            analysed = sum(1 for r in pool_all if r["status"] not in ("pending", "analysing"))
             details["dr"] = {"summary": f"바뀐 함수 {len(changes)}개 · 파일 {len(per_file)}개"
-                                        + (f" · 분석 {done_runs}/{batches}" if batches else ""),
+                                        + (f" · 함수별 분석 {analysed}/{len(pool_all)}" if pool_all else ""),
                              "now": "diff에서 바뀐 함수를 찾는 중", "layout": "groups",
                              "rows": [row(f, f"바뀐 함수 {n}개", "", "") for f, n in
                                       sorted(per_file.items(), key=lambda kv: -kv[1])]}

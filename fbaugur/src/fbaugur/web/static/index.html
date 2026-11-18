@@ -154,7 +154,7 @@ const NAMES = {eg:'Entry Generator',ev:'Entry Verifier',cg:'Context Grouping',ig
   tm:'Threat Model',dr:'Direction',spg:'SP Generator',spv:'SP Verifier',pov:'PoV',inv:'Invariant 삽입',fz:'Fuzzing',ct:'Crash Triage',val:'Validation',adv:'Advisory'};
 // A delta scan has no Direction step: the diff's changed functions take its place, and the SP
 // generator works through them file by file.
-const DELTA_NAMES = {dr:'Diff 분석', spg:'Delta SP Generator'};
+const DELTA_NAMES = {dr:'Diff 분석', spg:'SP Generator (바뀐 함수별)'};
 const nameOf = (id, st) => ((st && st.mode === 'Delta' && DELTA_NAMES[id]) || NAMES[id]);
 const HC = ['eg','ev','cg','ig','hg','hv'];
 const VR = ['tm','dr','spg','spv','pov','inv','fz','ct','val','adv'];

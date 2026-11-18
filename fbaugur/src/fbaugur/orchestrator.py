@@ -350,7 +350,46 @@ class Run:
             self.emit(f"[delta] changed files with no function definitions in this program: {report['unmatched_files']}")
         if not changes:
             self.emit("[delta] the diff changes no function of this program; nothing to analyse")
+        self._fill_delta_pools()
         return bool(changes)
+
+    def _fill_delta_pools(self) -> None:
+        """One SP-generator session per changed function (FBv2 FullSPGenerator, per function).
+
+        FBv2's delta mode gives one DeltaSPGenerator session the whole diff.  On a large change
+        (redis 81d653f5d: 286 functions, 456 kB) that session read a few functions and stopped, three
+        runs in a row.  Here each changed function is its own session with its source and its part of
+        the diff, as FBv2's full scan analyses functions.  Functions in files the harness does not
+        link (test modules, other programs) are left out."""
+        now = time.time()
+        self._delta_excerpt = {}
+        for worker in self.workers:
+            linked = None
+            plan_file = self.harness(worker).build_plan
+            if plan_file and Path(plan_file).is_file():
+                plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
+                sources = plan.get("original_sources") or []
+                linked = {s for s in sources}
+            queued, left_out = 0, []
+            order = sorted(self.delta_changes, key=lambda c: (not c["static_reachable"],
+                                                               -len(c.get("changed_lines") or [])))
+            for change in order:
+                name = change["function"]
+                if linked is not None and not any(src.endswith("/" + change["file"]) for src in linked):
+                    left_out.append(name)
+                    continue
+                if self.store.row("SELECT 1 FROM pool WHERE worker_id=? AND function_name=?",
+                                  worker.worker_id, name):
+                    continue
+                self._delta_excerpt[name] = change.get("excerpt") or ""
+                self.store.insert("pool", {
+                    "worker_id": worker.worker_id, "direction_id": "delta", "function_name": name,
+                    "pool": "core", "phase": 1 if change["static_reachable"] else 2, "status": "pending",
+                    "updated_at": now})
+                queued += 1
+            self.emit(f"[delta] {worker.worker_id}: {queued} changed function(s) queued, one session each"
+                      + (f"; {len(left_out)} left out (file not linked into the harness): "
+                         + ", ".join(sorted(set(left_out))[:12]) if left_out else ""))
 
     async def delta_sp_agent(self, worker: Worker) -> None:
         """FBv2 DeltaSPGenerator: one agent reads the diff and analyses every changed function."""
@@ -476,6 +515,11 @@ class Run:
                        f"## Callers\n{callers or '(none recorded)'}\n\n## Callees\n{callees or '(none recorded)'}\n\n"
                        "If you find issues, call create_suspicious_point for each. If the function is safe, "
                        "say briefly why. Be concise.")
+            excerpt = getattr(self, "_delta_excerpt", {}).get(name) if item["direction_id"] == "delta" else None
+            if excerpt:
+                # Delta scan: the change is what is under review; the function is shown as it reads now.
+                message += (f"\n\n## What this change did to `{name}` (unified diff, new side)\n"
+                            f"```diff\n{excerpt[:20000]}\n```\nFocus on what the change introduced.")
             try:
                 result = await self._agent("sp_generator", worker.harness_id, message, subject=name,
                                            worker=worker.worker_id, direction=item["direction_id"],
@@ -1359,12 +1403,10 @@ class Run:
 
         for worker in self.workers:
             spawn(f"fuzz:{worker.worker_id}", self.fuzzing_lane(worker))
-            if self.delta:
-                self._delta_running.add(worker.worker_id)
-                spawn(f"delta-spgen:{worker.worker_id}", self.delta_sp_agent(worker))
-            else:
-                for slot in range(self.cfg.sp_generator_agents):
-                    spawn(f"spgen{slot}:{worker.worker_id}", self.sp_generator_agent(worker, slot))
+            # Full and delta scans both analyse one function per session; a delta scan's pool holds
+            # the changed functions (see _fill_delta_pools).
+            for slot in range(self.cfg.sp_generator_agents):
+                spawn(f"spgen{slot}:{worker.worker_id}", self.sp_generator_agent(worker, slot))
             for slot in range(self.cfg.verifier_agents):
                 spawn(f"verify{slot}:{worker.worker_id}", self.verifier_agent(worker, slot))
             for slot in range(self.cfg.pov_agents):
