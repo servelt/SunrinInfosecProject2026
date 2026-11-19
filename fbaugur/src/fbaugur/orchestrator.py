@@ -289,6 +289,7 @@ class Run:
         (self.run_dir / "ub-baseline.json").write_text(json.dumps(sorted(baseline)), encoding="utf-8")
         self.emit(f"undefined-behaviour baseline: {len(baseline)} site(s) reached by normal inputs"
                   + (f" {sorted(baseline)[:5]}" if baseline else ""))
+        self._take_over_failed_povs()
         if self.cfg.msan:
             await self._add_msan_workers()
         if not self.cfg.skip_threat_model and not self.store.row(
@@ -585,6 +586,50 @@ class Run:
                               vuln_type=sp.get("vuln_type") or "", description=sp.get("description") or "",
                               fuzzer=worker.harness_id, fuzzer_source="(call get_fuzzer_info)"),
                           subject=f"fp:{sp['sp_id']}", worker=worker.worker_id)
+
+    def _take_over_failed_povs(self) -> None:
+        """Suspicious points whose PoV failed in an earlier context get another PoV here.
+
+        A PoV runs through its own context's harness, which feeds one input path.  An SP is
+        about a code path, and that path may be fed by a different context of the same program:
+        on LightFTP 954454b the STOR data-connection context found the writelogentry overflow
+        (verified, score 0.75), but its harness sends the input as file contents, so three
+        control-command PoVs never reached the log code and the SP ended pov_failed.  The
+        control-connection context, whose harness does reach it, is analysed after; it now
+        retries those SPs with its own harness.
+        """
+        worker = self.analysis_workers[0] if self.analysis_workers else None
+        if worker is None:
+            return
+        taken = 0
+        for scan in self.cfg.prior_scans:
+            db = Path(scan) / "state.db"
+            if not db.is_file():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT * FROM sps WHERE status='pov_failed' AND is_real=0 ORDER BY score DESC")]
+                conn.close()
+            except sqlite3.Error:
+                continue
+            for row in rows:
+                new_id = f"{row['sp_id']}-{worker.harness_id}"
+                if self.store.scalar("SELECT COUNT(*) FROM sps WHERE sp_id=?", new_id):
+                    continue
+                row.update(sp_id=new_id, worker_id=worker.worker_id, harness_id=worker.harness_id,
+                           status="pending_pov", claimed_by=None, pov_attempts=0, merged_into=None,
+                           witness_path=None, origin="handoff", origin_ref=f"{scan}:{row['sp_id']}",
+                           verification_notes=(row.get("verification_notes") or "")
+                           + f"\n\nPoV failed through the harness of {Path(scan).name}; that harness may "
+                             "feed a different input path. Build the PoV for THIS harness's input path.",
+                           created_at=time.time(), updated_at=time.time())
+                self.store.insert("sps", row)
+                taken += 1
+        if taken:
+            self.emit(f"[pov] {taken} suspicious point(s) whose PoV failed in an earlier context get a PoV "
+                      f"through this context's harness")
 
     async def pov_agent(self, worker: Worker, slot: int) -> None:
         while not self.out_of_time():
