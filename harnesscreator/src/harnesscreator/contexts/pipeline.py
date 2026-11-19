@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from . import cli as stages
-from .coverage import GcovCoverage
+from .coverage import CoverageUnavailable, GcovCoverage
+from .execution import ProgramRunner, ProgramSpec
 
 _CHANNEL_DELIVERY = stages._CHANNEL_DELIVERY
 _DELIVERY_CHANNEL = {delivery: channel for channel, delivery in _CHANNEL_DELIVERY.items()}
@@ -114,6 +115,62 @@ def _llm_fields(args: argparse.Namespace) -> dict[str, Any]:
             "claude": args.claude, "codex": args.codex, "ollama_url": args.ollama_url}
 
 
+async def probe_tcp_entries(args: argparse.Namespace, run_dir: Path,
+                            contexts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Which network Entries the program really reads a TCP connection through, measured.
+
+    The socket type of an Entry is often not in its source (a helper that receives a
+    descriptor parameter), and naming it from the API -- recvfrom means datagram -- was wrong
+    on 3proxy: it reads every TCP client through def_recvfrom, so its contexts were filed as
+    datagram and skipped, and the selected def_recv contexts named a function that never runs
+    on Linux (148 proxy requests answered 502 and all were rejected for missing it).  One
+    connection to the coverage build settles it: an Entry function that ran is read over TCP,
+    whatever it was classified as, and goes first; a network Entry that did not run goes last.
+    """
+    port = _port(args)
+    if "tcp" not in args.channel or not port or not args.coverage_root or not args.coverage_command:
+        return {}
+    coverage = GcovCoverage(args.coverage_root)
+    coverage.reset()
+    spec = ProgramSpec(command=shlex.split(args.coverage_command),
+                       cwd=Path(args.coverage_cwd or args.coverage_root), delivery="stream",
+                       host=_host(args), port=port)
+    observation = await ProgramRunner(spec).run([b"\r\n\r\n"])
+    try:
+        executed = {name for _, name in coverage.collect().functions}
+    except CoverageUnavailable as exc:
+        stages._log(f"[WORKFLOW] TCP probe: no coverage ({exc}); classification kept")
+        return {"error": str(exc)}
+    finally:
+        coverage.reset()
+    ran, idle = [], []
+    for ctx in contexts:
+        if ctx.get("resource_kind") not in ("network", "unknown"):
+            continue
+        names = {e.get("entry_function") for e in ctx.get("entries", []) if isinstance(e, dict)} - {None, ""}
+        names |= {ctx.get("driver_function")} - {None, ""}
+        if not names:
+            continue
+        if names & executed:
+            ctx["tcp_probe"] = "executed"
+            if "stream" not in ctx.get("deliveries", []):
+                ctx.setdefault("notes", []).append(
+                    f"filed as {ctx.get('deliveries')}; its Entry ran on a TCP connection to port {port}")
+                ctx["deliveries"] = ["stream"] + [d for d in ctx.get("deliveries", []) if d not in ("datagram", "unknown")]
+            ctx["resource_kind"] = "network"
+            ran.append(ctx["context_id"])
+        else:
+            ctx["tcp_probe"] = "not_executed"
+            idle.append(ctx["context_id"])
+    order = {"executed": 0, None: 1, "not_executed": 2}
+    contexts.sort(key=lambda ctx: order.get(ctx.get("tcp_probe"), 1))
+    path = run_dir / "contexts" / "contexts.jsonl"
+    path.write_text("".join(json.dumps(ctx, ensure_ascii=False) + "\n" for ctx in contexts), encoding="utf-8")
+    stages._log(f"[WORKFLOW] TCP probe on port {port} ({observation.exit_status or 'ran'}): Entry ran in "
+                f"{ran or 'none'}; did not run in {idle or 'none'}")
+    return {"executed": ran, "not_executed": idle}
+
+
 def select_units(contexts: list[dict[str, Any]], channels: list[str], *,
                  per_channel: int = 0) -> list[tuple[dict[str, Any], str]]:
     """Pick (context, channel) pairs, in priority order, every context of each channel.
@@ -205,6 +262,7 @@ async def run_after_entries(args: argparse.Namespace, run_dir: Path, entry_count
     contexts = stages._load_contexts(run_dir)
     if args.include_unresolved_entries:
         stages._log("[WORKFLOW] unresolved Entries are grouped too (--include-unresolved-entries)")
+    report["tcp_probe"] = await probe_tcp_entries(args, run_dir, contexts)
     units = select_units(contexts, list(args.channel), per_channel=args.contexts_per_channel)
     chosen = {context["context_id"] for context, _ in units}
     report["contexts"].update({
