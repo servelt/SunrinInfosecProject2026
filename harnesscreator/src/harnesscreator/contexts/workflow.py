@@ -111,6 +111,24 @@ class SeedWorkflow:
         for function_id, line in self.target_map.instrumented_lines(self.snapshot):
             if function_id in self.targets:
                 self.instrumented_lines[function_id].add(line)
+        if self.delivery in ("stream", "datagram", "peer_stream") and self.targets <= functions:
+            # Every target already runs without input (or none is in this build): the targets are only
+            # the receive wrapper the Entry sits in, and no input can run more of them, so every seed
+            # was rejected however well it was formed (pgbouncer safe_recv, 3proxy def_recvfrom: valid
+            # client requests, all REJECTED_NO_TARGET, no client-side harness).  The program code the
+            # bytes reach is then the measure: any function or line beyond the run without input.
+            self.target_map = TargetMap(
+                (dataclasses.asdict(function) for function in self.graph.bundle.functions.values()),
+                (function.function_id for function in self.graph.bundle.functions.values()))
+            self.targets = self.all_targets = self.target_map.compiled_functions(self.snapshot)
+            functions = self.target_map.covered_functions(self.snapshot)
+            lines = self.target_map.covered_lines(self.snapshot)
+            self.instrumented_lines.clear()
+            for function_id, line in self.target_map.instrumented_lines(self.snapshot):
+                self.instrumented_lines[function_id].add(line)
+            self.skip_frontier = True     # one frontier session per program function is not affordable
+            self.emit(f"[SEED] {self.key} every target already runs without input; seeds are measured against "
+                      f"the whole program ({len(self.targets)} functions), frontier exploration off")
         self.baseline_functions, self.baseline_lines = functions, lines
         self.covered_functions, self.covered_lines = set(functions), set(lines)
         self.emit(f"[SEED] {self.key} baseline: {len(functions)}/{len(self.targets)} target functions run without input "
