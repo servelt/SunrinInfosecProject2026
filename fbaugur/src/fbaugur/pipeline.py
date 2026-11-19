@@ -244,9 +244,6 @@ def report_stage1(run_dir: Path, emit) -> list[tuple[str, str]]:
     return harnesses
 
 
-FIRST_PASS_FUZZ_MINUTES = 60.0   # fuzzing after analysis for every context but the last
-
-
 async def run(args, emit) -> int:
     if getattr(args, "harness_build_script", None):
         # Read by harnesscreator's native builder in stage 1 and in every stage-2 rebuild.
@@ -288,8 +285,7 @@ async def run(args, emit) -> int:
     # distinct contexts -- on LightFTP the tcp/stream contexts were the control connection
     # and the two data-connection readers -- and each is a separate input path, so analysing
     # only the first would throw away harnesses stage 1 just spent its budget building.
-    # One Run handles one context, so they go one after another, each with an equal share of
-    # what is left.  A context that finishes early hands the rest to the ones still to come.
+    # One Run handles one context; the Runs go in parallel (below).
     grouped: list[tuple[str, list[str]]] = []
     for context, delivery in harnesses:
         for existing, deliveries in grouped:
@@ -302,33 +298,32 @@ async def run(args, emit) -> int:
          + ", ".join(f"{ctx}{sorted(d)}" for ctx, d in grouped))
     summaries: list[dict[str, Any]] = []
     exit_code = 1
-    analysed: list[str] = []         # scan dirs already done: findings there are not new
+    # Every context is analysed at the same time, each with the whole remaining budget, the way
+    # FuzzingBrain-V2 dispatches one worker per fuzzer: each harness reads the whole program (or
+    # the whole diff) through its own input path and proves what it finds through its own
+    # harness.  Running them one after another let the first context hold the budget while the
+    # context that reaches the bug waited (LightFTP 954454b: the STOR data connection found
+    # writelogentry, its file-contents harness could not reach it, and the control connection
+    # never got its turn).  Program runs are isolated in their own network namespace (runner.NETNS),
+    # so concurrent scans do not collide on the port.  The model concurrency is split between them.
+    deadline = live.read(deadline_file, deadline)
+    remaining = deadline - time.time()
+    if remaining < 120:
+        emit("the whole budget is spent; no context analysed")
+        return 3
+    per_scan = max(1, args.concurrency // max(1, len(grouped)))
+    scans: list[tuple[str, Any]] = []
     for index, (context, deliveries) in enumerate(grouped):
-        deadline = live.read(deadline_file, deadline)
-        remaining = deadline - time.time()
-        if remaining < 120:
-            emit(f"the whole budget is spent; {len(grouped) - index} context(s) not analysed. "
-                 f"The harnesses are in place -- run `fbaugur scan` on them when ready")
-            break
-        share = remaining / (len(grouped) - index)
-        # Analysis (SPs, PoVs, invariants) of every context comes before long fuzzing of any one:
-        # an equal share let the first context fuzz for days after its analysis ended while the
-        # context that held the bug waited (LightFTP 954454b: 10 days on the STOR data
-        # connection before the control connection, where writelogentry overflows, was analysed).
-        drain = args.fuzz_after_drain_minutes
-        if not drain and index < len(grouped) - 1:
-            drain = min(FIRST_PASS_FUZZ_MINUTES, share / 60)
         emit(f"[stage 2] scan {index + 1}/{len(grouped)}: {context} {sorted(deliveries)}, "
-             f"{share / 60:.0f} min of the {remaining / 60:.0f} min left"
-             + (f"; fuzzing after analysis capped at {drain:.0f} min so the next context is analysed"
-                if drain and not args.fuzz_after_drain_minutes else ""))
+             f"{remaining / 60:.0f} min, in parallel with the other {len(grouped) - 1}, "
+             f"{per_scan} model session(s)")
         scan_dir = run_root / ("scan" if len(grouped) == 1 else f"scan-{context}")
         scan_dir.mkdir(parents=True, exist_ok=True)
         cfg = RunConfig(
             run_dir=str(scan_dir), hc_run=str(hc_run), context_id=context, deliveries=sorted(deliveries),
             sanitizer=args.sanitizer, python=args.python, claude_executable=args.claude,
-            max_hours=share / 3600, fuzz_after_drain_minutes=drain,
-            claude_concurrency=args.concurrency, sp_generator_agents=args.sp_agents,
+            max_hours=remaining / 3600, fuzz_after_drain_minutes=args.fuzz_after_drain_minutes,
+            claude_concurrency=per_scan, sp_generator_agents=args.sp_agents,
             verifier_agents=args.verify_agents, pov_agents=args.pov_agents,
             max_function_analyses=args.max_functions, sp_fuzz_seconds=args.sp_fuzz_seconds,
             rebuild_min_interval_seconds=args.rebuild_interval, skip_threat_model=args.skip_threat_model,
@@ -337,8 +332,8 @@ async def run(args, emit) -> int:
             daemon_command=args.daemon_command or "", daemon_msan_command=args.daemon_msan_command or "",
             daemon_plain_command=args.daemon_plain_command or "",
             daemon_cwd=args.daemon_cwd, daemon_port=args.daemon_port, product_version=args.product_version,
-            prior_scans=list(analysed))
-        cfg.deadline_file, cfg.contexts_after = str(deadline_file), len(grouped) - index - 1
+            prior_scans=[])
+        cfg.deadline_file, cfg.contexts_after = str(deadline_file), 0
         cfg.provider, cfg.codex_executable, cfg.ollama_url = args.provider, args.codex, args.ollama_url
         cfg.models = dict(PROVIDER_MODELS[args.provider])
         for tier, value in (("1", args.model_t1), ("2", args.model_t2), ("3", args.model_t3)):
@@ -348,18 +343,31 @@ async def run(args, emit) -> int:
             role, _, number = item.partition("=")
             cfg.max_turns[role] = int(number)
         cfg.save()
-        scan = Run(scan_dir, cfg, harnesscreator_src=(args.harnesscreator / "src").resolve(), emit=emit)
-        summary = await scan.execute()
+        scans.append((context, Run(scan_dir, cfg, harnesscreator_src=(args.harnesscreator / "src").resolve(),
+                                   emit=emit)))
+
+    async def one(context: str, scan: Any) -> dict[str, Any] | None:
+        try:
+            summary = await scan.execute()
+        except Exception as exc:          # one context failing must not stop the others
+            emit(f"[stage 2] {context} failed: {type(exc).__name__}: {exc}")
+            return None
         summary["context_id"] = context
-        summaries.append(summary)
-        analysed.append(str(scan_dir))
         confirmed = sum(summary["crashes"].get(k, 0) for k in ("confirmed", "validated", "reported", "needs_review"))
-        if summary["terminal_error"]:
-            exit_code = 3
-        elif confirmed or summary["suspicious_points"]:
-            exit_code = min(exit_code, 0)
         emit(f"[stage 2] {context} done: {confirmed} reported crash(es), "
              f"{sum(summary['suspicious_points'].values())} suspicious point(s)")
+        return summary
+
+    for summary in await asyncio.gather(*(one(context, scan) for context, scan in scans)):
+        if summary is None:
+            exit_code = min(exit_code, 3) if exit_code != 0 else 0
+            continue
+        summaries.append(summary)
+        confirmed = sum(summary["crashes"].get(k, 0) for k in ("confirmed", "validated", "reported", "needs_review"))
+        if summary["terminal_error"]:
+            exit_code = 3 if exit_code != 0 else 0
+        elif confirmed or summary["suspicious_points"]:
+            exit_code = 0
     if not summaries:
         return 3
     report = {"harnesscreator_run": str(hc_run), "pipeline_dir": str(run_root), "scans": summaries}
