@@ -244,6 +244,9 @@ def report_stage1(run_dir: Path, emit) -> list[tuple[str, str]]:
     return harnesses
 
 
+FIRST_PASS_FUZZ_MINUTES = 60.0   # fuzzing after analysis for every context but the last
+
+
 async def run(args, emit) -> int:
     if getattr(args, "harness_build_script", None):
         # Read by harnesscreator's native builder in stage 1 and in every stage-2 rebuild.
@@ -308,14 +311,23 @@ async def run(args, emit) -> int:
                  f"The harnesses are in place -- run `fbaugur scan` on them when ready")
             break
         share = remaining / (len(grouped) - index)
+        # Analysis (SPs, PoVs, invariants) of every context comes before long fuzzing of any one:
+        # an equal share let the first context fuzz for days after its analysis ended while the
+        # context that held the bug waited (LightFTP 954454b: 10 days on the STOR data
+        # connection before the control connection, where writelogentry overflows, was analysed).
+        drain = args.fuzz_after_drain_minutes
+        if not drain and index < len(grouped) - 1:
+            drain = min(FIRST_PASS_FUZZ_MINUTES, share / 60)
         emit(f"[stage 2] scan {index + 1}/{len(grouped)}: {context} {sorted(deliveries)}, "
-             f"{share / 60:.0f} min of the {remaining / 60:.0f} min left")
+             f"{share / 60:.0f} min of the {remaining / 60:.0f} min left"
+             + (f"; fuzzing after analysis capped at {drain:.0f} min so the next context is analysed"
+                if drain and not args.fuzz_after_drain_minutes else ""))
         scan_dir = run_root / ("scan" if len(grouped) == 1 else f"scan-{context}")
         scan_dir.mkdir(parents=True, exist_ok=True)
         cfg = RunConfig(
             run_dir=str(scan_dir), hc_run=str(hc_run), context_id=context, deliveries=sorted(deliveries),
             sanitizer=args.sanitizer, python=args.python, claude_executable=args.claude,
-            max_hours=share / 3600, fuzz_after_drain_minutes=args.fuzz_after_drain_minutes,
+            max_hours=share / 3600, fuzz_after_drain_minutes=drain,
             claude_concurrency=args.concurrency, sp_generator_agents=args.sp_agents,
             verifier_agents=args.verify_agents, pov_agents=args.pov_agents,
             max_function_analyses=args.max_functions, sp_fuzz_seconds=args.sp_fuzz_seconds,
