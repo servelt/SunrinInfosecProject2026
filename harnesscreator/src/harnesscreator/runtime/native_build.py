@@ -151,7 +151,13 @@ def _binary_closure(target_binary: Path, db: Path, root: Path) -> tuple[list[Sou
         directory = Path(str(record.get("directory") or db.parent)).resolve()
         src = Path(str(record.get("file") or ""))
         src = (src if src.is_absolute() else directory / src).resolve()
-        if (src in linked or _relative(src, root) in linked_relative) and _inside(src, root) \
+        # A copy of the build tree (an instrumented rebuild) names the same file by a different
+        # prefix: it is the same unit when its path inside the copy ends the linked path.  The
+        # common directory of the linked files is not the tree root when they all sit in one
+        # subdirectory (LightFTP: Source/Other/*.c), so relative-to-common alone matched nothing.
+        inside = _relative(src, root)
+        if (src in linked or inside in linked_relative
+                or (inside and any(str(p).endswith("/" + inside) for p in linked))) and _inside(src, root) \
                 and src.suffix.lower() in _SOURCE_EXTENSIONS:
             units[src] = SourceUnit(src, _flags_from_compile_record(record, directory))
     main_source = None
