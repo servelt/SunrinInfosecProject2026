@@ -24,6 +24,8 @@ import hashlib
 import json
 import sqlite3
 import time
+
+REACH_PROBE_CAP_SECONDS = 180.0
 import traceback
 from pathlib import Path
 from typing import Any
@@ -796,7 +798,15 @@ class Run:
             self.store.update("invariants", "phi_num", row["phi_num"],
                               {"status": "lead" if row["status"] == "lead" else "built",
                                "build_version": version, "updated_at": time.time()})
-        await self._measure_reach(worker, result.binary, invariants, result.line_map)
+        # The probe must not hold the build lane: on tinyproxy 1.11.1 it never returned after v5
+        # and 19 invariants waited at pending_build until the scan ended.  Past the cap the build
+        # is fuzzed unprobed (an unsafe assertion then shows as a harness fault and is repaired).
+        try:
+            await asyncio.wait_for(self._measure_reach(worker, result.binary, invariants, result.line_map),
+                                   timeout=REACH_PROBE_CAP_SECONDS)
+        except asyncio.TimeoutError:
+            self.emit(f"[build] {harness_id} v{version}: reach probe still running after "
+                      f"{REACH_PROBE_CAP_SECONDS:.0f}s; fuzzing the build without it")
         triaged = [r["phi_num"] for r in active if r["status"] == "lead"]
         fuzzer = self.fuzzers.get(harness_id)
         if fuzzer is not None:

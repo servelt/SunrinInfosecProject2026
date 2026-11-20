@@ -619,17 +619,32 @@ def stage2(lines: list[str], scans: list[Path], alive: bool) -> dict[str, Any]:
         blocked = [i for i in invs if i["status"] == "build_blocked"]
         latest = builds[-1]["version"] if builds else None
 
+        # Violations: an assertion the fuzzer made fire, and what triage decided about it.
+        verdict_ko = {"REAL_ISSUE": "진짜 문제", "TOO_STRONG": "조건이 너무 강함", "NOISE": "잡음"}
+        viol: dict[int, list[str]] = {}
+        for v in _q(conn, "SELECT phi_num, verdict, status FROM violations ORDER BY created_at"):
+            viol.setdefault(v["phi_num"], []).append(v["verdict"] or v["status"] or "")
+
         def inv_row(i: dict[str, Any], state: str, tag: str) -> dict[str, str]:
             got = slab.get(labels.item_key("inv", str(i["phi_num"])), {})
             text = got.get("description") or "설명 만드는 중…"
             if state != "활성":
                 text = got.get("reason") or text
-            return row(got.get("name") or i["expression"][:60], text, state, tag)
+            hits = viol.get(i["phi_num"])
+            if hits:
+                real = sum(1 for h in hits if h == "REAL_ISSUE")
+                kinds = ", ".join(sorted({verdict_ko.get(h, h or "판정 중") for h in hits}))
+                text = f"퍼저가 이 조건을 {len(hits)}번 깨뜨림 → 판정: {kinds}. " + text
+                state, tag = (f"위반 {len(hits)} · 진짜 문제", "hi") if real else (f"위반 {len(hits)}", "warn")
+            return row(f"φ{i['phi_num']} " + (got.get("name") or i["expression"][:60]), text, state, tag)
 
-        details["inv"] = {"summary": f"활성 {len(active)} · 빌드 막힘 {len(blocked)} · 철회 {len(withdrawn)} · 빌드 {len(builds)}회",
+        real_total = sum(1 for hs in viol.values() for h in hs if h == "REAL_ISSUE")
+        details["inv"] = {"summary": f"활성 {len(active)} · 위반 {sum(len(h) for h in viol.values())} (진짜 문제 {real_total})"
+                                     f" · 빌드 막힘 {len(blocked)} · 철회 {len(withdrawn)} · 빌드 {len(builds)}회",
                           "now": (f"빌드 v{building[-1]['version']} 만드는 중" if building else f"빌드 v{latest} 위에서 퍼징 중" if latest else "조건을 기록하는 중"),
                           "layout": "groups",
-                          "rows": [inv_row(i, "활성", "ok") for i in active[::-1]]
+                          "rows": sorted([inv_row(i, "활성", "ok") for i in active[::-1]],
+                                         key=lambda r: 0 if r.get("t") == "hi" else 1 if r.get("t") == "warn" else 2)
                                   + [inv_row(i, "빌드 막힘", "warn") for i in blocked[::-1]]
                                   + [inv_row(i, "철회", "no") for i in withdrawn[::-1]]}
         fz_rows = []
